@@ -31,6 +31,7 @@ for filename in os.listdir(input_dir):
             "--template", template_path
         ]
 
+        print(f" cmd : {cmd}" )
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode == 0:
