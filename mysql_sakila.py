@@ -15,6 +15,9 @@ DATETIME_TYPES = {
     "date", "datetime", "timestamp", "time"
 }
 
+CHAR_TYPES = {"char", "varchar"}
+TEXT_TYPES = {"text", "blob"}
+YEAR = {"year"}
 
 def char_varchar_appendage(ddl_line):
     m = re.search(r"\b(char|varchar)\s*\(\s*(\d+)\s*\)", ddl_line, re.IGNORECASE)
@@ -22,6 +25,10 @@ def char_varchar_appendage(ddl_line):
         return ""
     length = m.group(2)
     return f"/*{{{{ rand.regex('[a-zA-Z ]{{{length}}}') }}}}*/"
+
+
+def text_appendage():
+    return "/*{{ rand.regex('[a-zA-Z ]{100}') }}*/"
 
 
 def histogram_to_case(hist, ddl_line):
@@ -33,7 +40,6 @@ def histogram_to_case(hist, ddl_line):
     if not buckets:
         return ""
 
-    # Ensure numeric histogram
     try:
         float(buckets[0][0])
     except (ValueError, TypeError, IndexError):
@@ -158,17 +164,32 @@ def annotate_table_with_histogram(host, user, password, database, table):
             col_type = column_types.get(col)
             synthetic = ""
 
-            # CHAR / VARCHAR
-            if col_type in {"char", "varchar"}:
+            # 1️⃣ AUTO_INCREMENT → {{rownum}}
+            if re.search(r"\bauto_increment\b", line, re.IGNORECASE):
+                synthetic = "{{rownum}}"
+
+            # 2️⃣ CHAR / VARCHAR
+            elif col_type in CHAR_TYPES:
                 synthetic = char_varchar_appendage(line)
 
-            # DATETIME / TIMESTAMP
+            # 3️⃣ TEXT
+            elif col_type in TEXT_TYPES:
+                synthetic = text_appendage()
+
+            # 4️⃣ DATETIME / TIMESTAMP
             elif col_type in DATETIME_TYPES:
                 synthetic = "{{rand.u31_timestamp()}}"
+            
+            elif col_type in YEAR:
+                synthetic = "{{rand.range(1975,2025)}}" 
 
-            # NUMERIC HISTOGRAM
-            elif col_type in NUMERIC_TYPES and col in histograms:
-                synthetic = histogram_to_case(histograms[col], line)
+            # 5️⃣ NUMERIC HISTOGRAM
+            elif col_type in NUMERIC_TYPES:
+                if col in histograms:
+                    synthetic = histogram_to_case(histograms[col], line)
+                else:
+                    # Since there is no histogram just choose some random numbers
+                    synthetic = "{{rand.range(0,5)}}"
 
             if synthetic:
                 if line.rstrip().endswith(","):
@@ -180,8 +201,8 @@ def annotate_table_with_histogram(host, user, password, database, table):
 
         final_ddl = "\n".join(new_lines)
 
-        print("\n📜 Generated Synthetic DDL:\n")
-        print(final_ddl)
+        #print("\n📜 Generated Synthetic DDL:\n")
+        #print(final_ddl)
         return final_ddl
 
     except Error as e:
