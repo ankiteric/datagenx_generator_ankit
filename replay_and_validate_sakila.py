@@ -12,9 +12,9 @@ from pathlib import Path
 # Utilities
 # ------------------------------------------------------------
 
-def normalize_ddl(ddl: str) -> str:
-    ddl = re.sub(r"`sakila_[^`]+`\.", "", ddl)
-    ddl = re.sub(r"`sakila`\.", "", ddl)
+def normalize_ddl(ddl: str, src_schema: str) -> str:
+    ddl = re.sub(rf"`{src_schema}_[^`]+`\.", "", ddl)
+    ddl = re.sub(rf"`{src_schema}`\.", "", ddl)
     ddl = re.sub(r"\s+", " ", ddl)
     return ddl.strip().lower()
 
@@ -57,7 +57,7 @@ def load_histograms(cursor, schema, table):
         if hist is not None
     }
 
-# Keep histograms updated. 
+
 def clone_histograms(cursor, src_schema, tgt_schema, table):
     cursor.execute("""
         SELECT COLUMN_NAME
@@ -78,16 +78,12 @@ def clone_histograms(cursor, src_schema, tgt_schema, table):
         WITH 100 BUCKETS
         """
     )
-    cursor.fetchall()  # IMPORTANT
+    cursor.fetchall()
+
 
 def histogram_difference(h1, h2):
-    """
-    Compute Total Variation Distance between two MySQL histograms.
-    Returns a float in [0.0, 1.0].
-    """
-
     if not h1 or not h2:
-        return 1.0  # maximal difference if one is missing
+        return 1.0
 
     b1 = h1.get("buckets", [])
     b2 = h2.get("buckets", [])
@@ -98,7 +94,6 @@ def histogram_difference(h1, h2):
     def probs(hist):
         buckets = hist["buckets"]
         hist_type = hist["histogram-type"]
-
         p = []
         prev = 0.0
         for b in buckets:
@@ -117,21 +112,19 @@ def histogram_difference(h1, h2):
     return 0.5 * sum(abs(p1[i] - p2[i]) for i in range(n))
 
 
-
 def compare_histograms(h1, h2):
     mismatches = []
-
     all_cols = set(h1.keys()) | set(h2.keys())
+
     for col in sorted(all_cols):
         if col not in h1:
             mismatches.append((col, "missing in source"))
         elif col not in h2:
             mismatches.append((col, "missing in target"))
-        elif h1[col] != h2[col]:
+        else:
             diff = histogram_difference(h1[col], h2[col])
-            mismatches.append((col, f"histogram diff = {diff:.5f}" ))
-            #print(f"Histogram difference for {col} = {diff:.4f}")
-    
+            if diff > 0:
+                mismatches.append((col, f"histogram diff = {diff:.5f}"))
     return mismatches
 
 
@@ -214,22 +207,21 @@ def main():
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--user", required=True)
     parser.add_argument("--password", required=True)
+    parser.add_argument("--source-schema", required=True)
     parser.add_argument("--ddl-file", required=True)
     parser.add_argument("--insert-file", required=True)
     args = parser.parse_args()
+
+    src_schema = args.source_schema
 
     ddl_sql = Path(args.ddl_file).read_text()
     insert_sql = Path(args.insert_file).read_text()
 
     table = extract_table_name(ddl_sql)
     ts = int(time.time())
-    new_schema = f"sakila_{ts}"
+    new_schema = f"{src_schema}_{ts}"
 
-    ddl_ok = True
-    rows_ok = True
-    hist_ok = True
-
-    conn = cursor = None
+    ddl_ok = rows_ok = hist_ok = True
 
     try:
         conn = mysql.connector.connect(
@@ -239,23 +231,20 @@ def main():
             autocommit=True
         )
         cursor = conn.cursor()
-        
-        # Disable foreign key checks. Might enable it later. 
+
         cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+        cursor.execute("SET time_zone = '+00:00'")
 
-        # Set timezone to UTC to avoid problems with DST
-        cursor.execute("SET time_zone = '+00:00' ")
-
-        # Source row count
-        cursor.execute(f"SELECT COUNT(*) FROM sakila.`{table}`")
+        cursor.execute(f"SELECT COUNT(*) FROM `{src_schema}`.`{table}`")
         src_rows = cursor.fetchone()[0]
 
-        # Create schema + table
         cursor.execute(f"CREATE SCHEMA `{new_schema}`")
-        ddl_new = ddl_sql.replace(f"`{table}`", f"`{new_schema}`.`{table}`", 1)
+
+        ddl_new = ddl_sql.replace(
+            f"`{table}`", f"`{new_schema}`.`{table}`", 1
+        )
         cursor.execute(ddl_new)
 
-        # Inserts
         insert_new = re.sub(
             rf"(insert\s+into\s+)`?{table}`?",
             rf"\1`{new_schema}`.`{table}`",
@@ -264,7 +253,6 @@ def main():
         )
         execute_statements(cursor, insert_new)
 
-        # Target row count
         cursor.execute(f"SELECT COUNT(*) FROM `{new_schema}`.`{table}`")
         tgt_rows = cursor.fetchone()[0]
 
@@ -272,28 +260,23 @@ def main():
             rows_ok = False
             report_rowcount_mismatch(src_rows, tgt_rows)
 
-        # Refresh stats
-        cursor.execute(f"ANALYZE TABLE sakila.`{table}`")
-        cursor.fetchall()   # consume result
-        
+        cursor.execute(f"ANALYZE TABLE `{src_schema}`.`{table}`")
+        cursor.fetchall()
         cursor.execute(f"ANALYZE TABLE `{new_schema}`.`{table}`")
-        cursor.fetchall()   # consume result
+        cursor.fetchall()
 
-        clone_histograms(cursor, "sakila", new_schema, table)
+        clone_histograms(cursor, src_schema, new_schema, table)
 
-
-        # DDL compare
-        cursor.execute(f"SHOW CREATE TABLE sakila.`{table}`")
+        cursor.execute(f"SHOW CREATE TABLE `{src_schema}`.`{table}`")
         src_ddl = cursor.fetchone()[1]
         cursor.execute(f"SHOW CREATE TABLE `{new_schema}`.`{table}`")
         tgt_ddl = cursor.fetchone()[1]
 
-        if normalize_ddl(src_ddl) != normalize_ddl(tgt_ddl):
+        if normalize_ddl(src_ddl, src_schema) != normalize_ddl(tgt_ddl, src_schema):
             ddl_ok = False
             report_ddl_mismatch(src_ddl, tgt_ddl)
 
-        # Histogram compare
-        src_hist = load_histograms(cursor, "sakila", table)
+        src_hist = load_histograms(cursor, src_schema, table)
         tgt_hist = load_histograms(cursor, new_schema, table)
         hist_diff = compare_histograms(src_hist, tgt_hist)
 
@@ -301,15 +284,13 @@ def main():
             hist_ok = False
             report_histogram_mismatch(hist_diff)
 
-        # Table stats
         report_table_stats(
-            load_table_stats(cursor, "sakila", table),
+            load_table_stats(cursor, src_schema, table),
             load_table_stats(cursor, new_schema, table)
         )
 
-        # Index stats
         report_index_stats(
-            load_index_stats(cursor, "sakila", table),
+            load_index_stats(cursor, src_schema, table),
             load_index_stats(cursor, new_schema, table)
         )
 
@@ -334,7 +315,6 @@ def main():
         if conn and conn.is_connected():
             cursor.close()
             conn.close()
-
 
 if __name__ == "__main__":
     main()

@@ -19,6 +19,7 @@ CHAR_TYPES = {"char", "varchar"}
 TEXT_TYPES = {"text", "blob"}
 YEAR = {"year"}
 
+
 def char_varchar_appendage(ddl_line):
     m = re.search(r"\b(char|varchar)\s*\(\s*(\d+)\s*\)", ddl_line, re.IGNORECASE)
     if not m:
@@ -32,10 +33,6 @@ def text_appendage():
 
 
 def histogram_to_case(hist, ddl_line):
-    """
-    Convert numeric histogram to weighted CASE expression.
-    Safe against empty or non-numeric histograms.
-    """
     buckets = hist.get("buckets", [])
     if not buckets:
         return ""
@@ -54,49 +51,40 @@ def histogram_to_case(hist, ddl_line):
     )
     scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
 
-    weights = []
-    ranges = []
-
+    weights, ranges = [], []
     prev = 0.0
+
     for b in buckets:
         cumulative = b[-2] if hist_type == "equi-height" else b[1]
-        weight = cumulative - prev
+        weights.append(round(cumulative - prev, 5))
         prev = cumulative
-        weights.append(round(weight, 5))
 
     for b in buckets:
         if hist_type == "singleton":
-            v = float(b[0])
-            iv = int(round(v * scale))
-            ranges.append((iv, iv))
+            v = int(round(float(b[0]) * scale))
+            ranges.append((v, v))
         else:
-            low = float(b[0])
-            high = float(b[1])
-            ranges.append(
-                (int(round(low * scale)), int(round(high * scale)))
-            )
+            ranges.append((
+                int(round(float(b[0]) * scale)),
+                int(round(float(b[1]) * scale))
+            ))
 
     case_lines = []
-    for i, (low_i, high_i) in enumerate(ranges, start=1):
-        if low_i == high_i:
-            case_lines.append(f"when {i} then {low_i / scale}")
+    for i, (lo, hi) in enumerate(ranges, start=1):
+        if lo == hi:
+            case_lines.append(f"when {i} then {lo / scale}")
         else:
-            span = high_i - low_i
+            span = hi - lo
             if scale == 1:
-                case_lines.append(
-                    f"when {i} then rand.range(0,{span})+{low_i}"
-                )
+                case_lines.append(f"when {i} then rand.range(0,{span})+{lo}")
             else:
                 case_lines.append(
-                    f"when {i} then rand.range(0,{span})/{scale}+{low_i/scale}"
+                    f"when {i} then rand.range(0,{span})/{scale}+{lo/scale}"
                 )
 
-    weights_str = ",".join(str(w) for w in weights)
-    case_body = "\n".join(case_lines)
-
     return f"""{{{{
-    case rand.weighted(array[{weights_str}])
-    {case_body}
+    case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
     end
 }}}}"""
 
@@ -104,54 +92,47 @@ def histogram_to_case(hist, ddl_line):
 def annotate_table_with_histogram(host, user, password, database, table):
     try:
         conn = mysql.connector.connect(
-            host=host,
-            user=user,
-            password=password,
-            database=database
+            host=host, user=user, password=password, database=database
         )
         cursor = conn.cursor()
 
-        # ------------------------------------------------------------
-        # Get CREATE TABLE
-        # ------------------------------------------------------------
-        cursor.execute(f"SHOW CREATE TABLE `{database}`.`{table}`;")
+        # CREATE TABLE
+        cursor.execute(f"SHOW CREATE TABLE `{database}`.`{table}`")
         ddl = cursor.fetchone()[1]
 
-        # ------------------------------------------------------------
         # Column types
-        # ------------------------------------------------------------
         cursor.execute("""
             SELECT COLUMN_NAME, DATA_TYPE
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
-            ORDER BY ORDINAL_POSITION;
+            ORDER BY ORDINAL_POSITION
         """, (database, table))
-
         column_types = {c: t.lower() for c, t in cursor.fetchall()}
 
-        # ------------------------------------------------------------
-        # Update numeric histograms only
-        # ------------------------------------------------------------
+        # PRIMARY KEY columns
+        cursor.execute("""
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+              AND CONSTRAINT_NAME = 'PRIMARY'
+        """, (database, table))
+        primary_key_columns = {r[0] for r in cursor.fetchall()}
+
         analyze_and_update_histograms(cursor, database, table)
 
-        # ------------------------------------------------------------
-        # Load histograms
-        # ------------------------------------------------------------
+        # Histograms
         cursor.execute("""
             SELECT COLUMN_NAME, HISTOGRAM
             FROM information_schema.column_statistics
-            WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s;
+            WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s
         """, (database, table))
-
         histograms = {
             col: json.loads(hist)
             for col, hist in cursor.fetchall()
             if hist
         }
 
-        # ------------------------------------------------------------
-        # Rewrite DDL
-        # ------------------------------------------------------------
         new_lines = []
 
         for line in ddl.splitlines():
@@ -164,31 +145,29 @@ def annotate_table_with_histogram(host, user, password, database, table):
             col_type = column_types.get(col)
             synthetic = ""
 
-            # 1️⃣ AUTO_INCREMENT → {{rownum}}
-            if re.search(r"\bauto_increment\b", line, re.IGNORECASE):
+            # 🔴 PRIMARY KEY or AUTO_INCREMENT → {{rownum}}
+            if (
+                re.search(r"\bauto_increment\b", line, re.IGNORECASE)
+                or col in primary_key_columns
+            ):
                 synthetic = "{{rownum}}"
 
-            # 2️⃣ CHAR / VARCHAR
             elif col_type in CHAR_TYPES:
                 synthetic = char_varchar_appendage(line)
 
-            # 3️⃣ TEXT
             elif col_type in TEXT_TYPES:
                 synthetic = text_appendage()
 
-            # 4️⃣ DATETIME / TIMESTAMP
             elif col_type in DATETIME_TYPES:
                 synthetic = "{{rand.u31_timestamp()}}"
-            
-            elif col_type in YEAR:
-                synthetic = "{{rand.range(1975,2025)}}" 
 
-            # 5️⃣ NUMERIC HISTOGRAM
+            elif col_type in YEAR:
+                synthetic = "{{rand.range(1975,2025)}}"
+
             elif col_type in NUMERIC_TYPES:
                 if col in histograms:
                     synthetic = histogram_to_case(histograms[col], line)
                 else:
-                    # Since there is no histogram just choose some random numbers
                     synthetic = "{{rand.range(0,5)}}"
 
             if synthetic:
@@ -199,11 +178,7 @@ def annotate_table_with_histogram(host, user, password, database, table):
 
             new_lines.append(line)
 
-        final_ddl = "\n".join(new_lines)
-
-        #print("\n📜 Generated Synthetic DDL:\n")
-        #print(final_ddl)
-        return final_ddl
+        return "\n".join(new_lines)
 
     except Error as e:
         print("❌ Error:", e)
@@ -215,31 +190,30 @@ def annotate_table_with_histogram(host, user, password, database, table):
 
 
 def analyze_and_update_histograms(cursor, database, table):
-    cursor.execute(f"ANALYZE TABLE `{database}`.`{table}`;")
+    cursor.execute(f"ANALYZE TABLE `{database}`.`{table}`")
     cursor.fetchall()
 
     cursor.execute("""
         SELECT COLUMN_NAME
         FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s
-          AND TABLE_NAME = %s
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
           AND DATA_TYPE IN (
               'tinyint','smallint','mediumint','int','bigint',
               'decimal','numeric','float','double'
-          );
+          )
     """, (database, table))
 
     cols = [c[0] for c in cursor.fetchall()]
     if not cols:
         return
 
-    col_list = ", ".join(f"`{c}`" for c in cols)
-
-    cursor.execute(f"""
+    cursor.execute(
+        f"""
         ANALYZE TABLE `{database}`.`{table}`
-        UPDATE HISTOGRAM ON {col_list}
-        WITH 100 BUCKETS;
-    """)
+        UPDATE HISTOGRAM ON {','.join(f'`{c}`' for c in cols)}
+        WITH 100 BUCKETS
+        """
+    )
     cursor.fetchall()
 
 
@@ -247,7 +221,7 @@ if __name__ == "__main__":
     host = "localhost"
     user = "root"
     password = "newpassword"
-    database = "sakila"
+    database = "tpch"
 
     conn = mysql.connector.connect(
         host=host, user=user, password=password, database=database
@@ -257,15 +231,13 @@ if __name__ == "__main__":
     cursor.execute("""
         SELECT TABLE_NAME
         FROM INFORMATION_SCHEMA.TABLES
-        WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE';
+        WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE'
     """, (database,))
-
     tables = [t[0] for t in cursor.fetchall()]
     cursor.close()
     conn.close()
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = f"dbgen_output_{ts}"
+    out_dir = f"dbgen_output_{datetime.now():%Y%m%d_%H%M%S}"
     os.makedirs(out_dir, exist_ok=True)
 
     for table in tables:
