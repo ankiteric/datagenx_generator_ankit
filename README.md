@@ -36,4 +36,24 @@ city.1.sql			film_text.1.sql			staff.1.sql
 country-schema.sql		inventory-schema.sql		store-schema.sql
 country.1.sql			inventory.1.sql			store.1.sql
 
+
+3)replay_and_validate_sakila.py
+
+This script does the following:
+1) Create the table present in orders-schema.sql
+2) Populate the new table with orders.1.sql.
+3) Compare stats for original table and new table.
+4) Drop the newly created table 
+
+python replay_and_validate_sakila.py \
+  --user root \
+  --password newpassword \
+  --source-schema=tpch \
+  --ddl-file orders-schema.sql \
+  --insert-file orders.1.sql  
+
+
+
+
+
 Check the contents of each of these files. The 1.sql files should contain INSERT statements. 
