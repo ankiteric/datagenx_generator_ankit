@@ -54,11 +54,18 @@ python replay_and_validate_sakila.py \
 
 
 <img width="1750" height="903" alt="CreateTablesAndCompare" src="https://github.com/user-attachments/assets/c314602f-18b4-4553-989d-dbe18284d01d" /><img width="1439" height="533" alt="CreateDbgenFiles" src="https://github.com/user-attachments/assets/457442dd-ef84-4fc7-8efe-b1b10a0cfdc7" />
-<img width="1595" height="385" alt="DbGenFiles" src="https://github.com/user-attachments/assets/725726c8-67a3-4f34-ab8b-5e4ea41d388a" />
-<img width="1920" height="883" alt="CreateInsertFiles" src="https://github.com/user-attachments/assets/8a926494-b5b9-4521-b1ca-fa307c865a4b" />
-<img width="1357" height="632" alt="InsetFiles" src="https://github.com/user-attachments/assets/fd53210d-3bc2-4a2c-b025-aeafea60d154" />
-![Uploading CreateTablesAndCompare.png…]()
 
+<img width="1595" height="385" alt="DbGenFiles" src="https://github.com/user-attachments/assets/725726c8-67a3-4f34-ab8b-5e4ea41d388a" />
+
+
+<img width="1920" height="883" alt="CreateInsertFiles" src="https://github.com/user-attachments/assets/8a926494-b5b9-4521-b1ca-fa307c865a4b" />
+
+
+<img width="1357" height="632" alt="InsetFiles" src="https://github.com/user-attachments/assets/fd53210d-3bc2-4a2c-b025-aeafea60d154" />
+
+
+
+<img width="1750" height="903" alt="CreateTablesAndCompare" src="https://github.com/user-attachments/assets/81177cdd-a67c-4e55-9f21-0c6d23bb9b2d" />
 
 
 
