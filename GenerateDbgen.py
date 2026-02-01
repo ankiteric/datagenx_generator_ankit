@@ -343,8 +343,6 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Order: {' -> '.join(sorted_tables)}\n")
 
-    all_ddls = []
-
     for table in sorted_tables:
         deps = dependencies.get(table, [])
         if deps:
@@ -356,12 +354,6 @@ if __name__ == "__main__":
             host, user, password, database, table
         )
         if ddl:
-            all_ddls.append(ddl)
+            with open(os.path.join(out_dir, f"{table}.dbgen"), "w") as f:
+                f.write(ddl)
             print("   ✅ Done")
-
-    # Write all DDLs to a single file
-    output_file = os.path.join(out_dir, f"{database}.dbgen")
-    with open(output_file, "w") as f:
-        f.write("\n\n".join(all_ddls))
-
-    print(f"\n📝 All DDLs written to: {output_file}")
