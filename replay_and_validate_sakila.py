@@ -147,6 +147,33 @@ def load_index_stats(cursor, schema, table):
     return cursor.fetchall()
 
 
+def load_distinct_counts(cursor, schema, table):
+    cursor.execute("""
+        SELECT COLUMN_NAME, COLUMN_TYPE
+        FROM information_schema.columns
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+        ORDER BY ORDINAL_POSITION
+    """, (schema, table))
+
+    columns = cursor.fetchall()
+    distinct_counts = {}
+
+    for col, col_type in columns:
+        try:
+            cursor.execute(f"SELECT COUNT(DISTINCT `{col}`) FROM `{schema}`.`{table}`")
+            distinct_counts[col] = {
+                'count': cursor.fetchone()[0],
+                'type': col_type
+            }
+        except Error as e:
+            distinct_counts[col] = {
+                'count': None,
+                'type': col_type
+            }
+
+    return distinct_counts
+
+
 # ------------------------------------------------------------
 # Reporting
 # ------------------------------------------------------------
@@ -198,6 +225,40 @@ def report_index_stats(orig, new):
         print(f"{key}: diff={diff:.2%} → {status}")
 
 
+def report_distinct_counts(orig, new):
+    print("\n📊 DISTINCT VALUE COUNTS COMPARISON")
+
+    all_cols = set(orig.keys()) | set(new.keys())
+    mismatches = []
+
+    for col in sorted(all_cols):
+        if col not in orig:
+            col_type = new[col]['type'] if col in new else 'unknown'
+            print(f"`{col}` ({col_type}): missing in source")
+            mismatches.append(col)
+        elif col not in new:
+            col_type = orig[col]['type'] if col in orig else 'unknown'
+            print(f"`{col}` ({col_type}): missing in target")
+            mismatches.append(col)
+        else:
+            oc = orig[col]['count']
+            nc = new[col]['count']
+            col_type = orig[col]['type']
+
+            if oc is None or nc is None:
+                print(f"`{col}` ({col_type}): could not compute (NULL)")
+                continue
+
+            diff = pct_diff(oc, nc)
+            status = "OK" if diff < 0.05 else "DIVERGED"
+            print(f"`{col}` ({col_type}): orig={oc}, replay={nc}, diff={diff:.2%} → {status}")
+
+            if diff >= 0.05:
+                mismatches.append(col)
+
+    return mismatches
+
+
 # ------------------------------------------------------------
 # Main
 # ------------------------------------------------------------
@@ -210,6 +271,8 @@ def main():
     parser.add_argument("--source-schema", required=True)
     parser.add_argument("--ddl-file", required=True)
     parser.add_argument("--insert-file", required=True)
+    parser.add_argument("--keep-schema", action="store_true",
+                        help="Keep the replayed schema instead of dropping it")
     args = parser.parse_args()
 
     src_schema = args.source_schema
@@ -221,7 +284,7 @@ def main():
     ts = int(time.time())
     new_schema = f"{src_schema}_{ts}"
 
-    ddl_ok = rows_ok = hist_ok = True
+    ddl_ok = rows_ok = hist_ok = distinct_ok = True
 
     try:
         conn = mysql.connector.connect(
@@ -294,13 +357,21 @@ def main():
             load_index_stats(cursor, new_schema, table)
         )
 
+        src_distinct = load_distinct_counts(cursor, src_schema, table)
+        tgt_distinct = load_distinct_counts(cursor, new_schema, table)
+        distinct_mismatches = report_distinct_counts(src_distinct, tgt_distinct)
+
+        if distinct_mismatches:
+            distinct_ok = False
+
         print("\n================ FINAL SUMMARY ================")
-        print(f"DDL match        : {'✅' if ddl_ok else '❌'}")
-        print(f"Row count match  : {'✅' if rows_ok else '❌'}")
-        print(f"Histograms match : {'✅' if hist_ok else '❌'}")
+        print(f"DDL match            : {'✅' if ddl_ok else '❌'}")
+        print(f"Row count match      : {'✅' if rows_ok else '❌'}")
+        print(f"Histograms match     : {'✅' if hist_ok else '❌'}")
+        print(f"Distinct counts match: {'✅' if distinct_ok else '❌'}")
         print("==============================================")
 
-        if not (ddl_ok and rows_ok and hist_ok):
+        if not (ddl_ok and rows_ok and hist_ok and distinct_ok):
             sys.exit(2)
 
     except Error as e:
@@ -309,8 +380,11 @@ def main():
 
     finally:
         if cursor:
-            print(f"\n🧹 Dropping schema `{new_schema}`")
-            cursor.execute(f"DROP SCHEMA IF EXISTS `{new_schema}`")
+            if args.keep_schema:
+                print(f"\n💾 Keeping schema `{new_schema}`")
+            else:
+                print(f"\n🧹 Dropping schema `{new_schema}`")
+                cursor.execute(f"DROP SCHEMA IF EXISTS `{new_schema}`")
             cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
         if conn and conn.is_connected():
             cursor.close()

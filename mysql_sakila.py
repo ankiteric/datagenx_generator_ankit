@@ -25,11 +25,11 @@ def char_varchar_appendage(ddl_line):
     if not m:
         return ""
     length = m.group(2)
-    return f"/*{{{{ rand.regex('[a-zA-Z ]{{{length}}}') }}}}*/"
+    return f"rand.regex('[a-zA-Z ]{{{length}}}')"
 
 
 def text_appendage():
-    return "/*{{ rand.regex('[a-zA-Z ]{100}') }}*/"
+    return "rand.regex('[a-zA-Z ]{100}')"
 
 
 def histogram_to_case(hist, ddl_line):
@@ -82,14 +82,15 @@ def histogram_to_case(hist, ddl_line):
                     f"when {i} then rand.range(0,{span})/{scale}+{lo/scale}"
                 )
 
-    return f"""{{{{
-    case rand.weighted(array[{','.join(map(str, weights))}])
+    return f"""case rand.weighted(array[{','.join(map(str, weights))}])
     {' '.join(case_lines)}
-    end
-}}}}"""
+    end"""
 
 
-def annotate_table_with_histogram(host, user, password, database, table):
+def annotate_table_with_histogram(host, user, password, database, table, generated_appendages=None):
+    if generated_appendages is None:
+        generated_appendages = {}
+
     try:
         conn = mysql.connector.connect(
             host=host, user=user, password=password, database=database
@@ -119,6 +120,19 @@ def annotate_table_with_histogram(host, user, password, database, table):
         """, (database, table))
         primary_key_columns = {r[0] for r in cursor.fetchall()}
 
+        # FOREIGN KEY mappings: column -> (referenced_table, referenced_column)
+        cursor.execute("""
+            SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+            FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+              AND REFERENCED_TABLE_NAME IS NOT NULL
+        """, (database, table))
+        foreign_keys = {
+            col: (ref_table, ref_col)
+            for col, ref_table, ref_col in cursor.fetchall()
+        }
+
         analyze_and_update_histograms(cursor, database, table)
 
         # Histograms
@@ -145,12 +159,21 @@ def annotate_table_with_histogram(host, user, password, database, table):
             col_type = column_types.get(col)
             synthetic = ""
 
-            # 🔴 PRIMARY KEY or AUTO_INCREMENT → {{rownum}}
-            if (
+            # 🔴 FOREIGN KEY → reference the source column
+            if col in foreign_keys:
+                ref_table, ref_col = foreign_keys[col]
+                comment = f"/*{{{{ @{ref_col} }}}}*/"
+                if line.rstrip().endswith(","):
+                    line = line.rstrip()[:-1] + f" {comment},"
+                else:
+                    line = line + f" {comment}"
+
+            # 🔴 PRIMARY KEY or AUTO_INCREMENT → rownum
+            elif (
                 re.search(r"\bauto_increment\b", line, re.IGNORECASE)
                 or col in primary_key_columns
             ):
-                synthetic = "{{rownum}}"
+                synthetic = "rownum"
 
             elif col_type in CHAR_TYPES:
                 synthetic = char_varchar_appendage(line)
@@ -159,22 +182,26 @@ def annotate_table_with_histogram(host, user, password, database, table):
                 synthetic = text_appendage()
 
             elif col_type in DATETIME_TYPES:
-                synthetic = "{{rand.u31_timestamp()}}"
+                synthetic = "rand.u31_timestamp()"
 
             elif col_type in YEAR:
-                synthetic = "{{rand.range(1975,2025)}}"
+                synthetic = "rand.range(1975,2025)"
 
             elif col_type in NUMERIC_TYPES:
                 if col in histograms:
                     synthetic = histogram_to_case(histograms[col], line)
                 else:
-                    synthetic = "{{rand.range(0,5)}}"
+                    synthetic = "rand.range(0,5)"
+
+            else:
+                synthetic = ""
 
             if synthetic:
+                comment = f"/*{{{{ @{col} := {synthetic} }}}}*/"
                 if line.rstrip().endswith(","):
-                    line = line.rstrip()[:-1] + f" {synthetic},"
+                    line = line.rstrip()[:-1] + f" {comment},"
                 else:
-                    line = line + f" {synthetic}"
+                    line = line + f" {comment}"
 
             new_lines.append(line)
 
@@ -217,6 +244,46 @@ def analyze_and_update_histograms(cursor, database, table):
     cursor.fetchall()
 
 
+def topological_sort(tables, dependencies):
+    """
+    Sort tables in dependency order using topological sort.
+    dependencies is a dict: {table: [list of tables it depends on]}
+    """
+    # Build in-degree map and adjacency list
+    in_degree = {table: 0 for table in tables}
+    graph = {table: [] for table in tables}
+
+    for table in tables:
+        for dep in dependencies.get(table, []):
+            if dep in graph:  # Only consider dependencies within our table set
+                graph[dep].append(table)
+                in_degree[table] += 1
+
+    # Find all tables with no dependencies
+    queue = [table for table in tables if in_degree[table] == 0]
+    result = []
+
+    while queue:
+        # Sort queue for deterministic output
+        queue.sort()
+        current = queue.pop(0)
+        result.append(current)
+
+        # Reduce in-degree for dependent tables
+        for dependent in graph[current]:
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+
+    # Check for circular dependencies
+    if len(result) != len(tables):
+        # Add remaining tables (circular dependencies) at the end
+        remaining = [t for t in tables if t not in result]
+        result.extend(sorted(remaining))
+
+    return result
+
+
 if __name__ == "__main__":
     host = "localhost"
     user = "root"
@@ -228,20 +295,50 @@ if __name__ == "__main__":
     )
     cursor = conn.cursor()
 
+    # Get all tables
     cursor.execute("""
         SELECT TABLE_NAME
         FROM INFORMATION_SCHEMA.TABLES
         WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE'
     """, (database,))
-    tables = [t[0] for t in cursor.fetchall()]
+    all_tables = [t[0] for t in cursor.fetchall()]
+
+    # Build dependency map: table -> [tables it depends on]
+    cursor.execute("""
+        SELECT TABLE_NAME, REFERENCED_TABLE_NAME
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = %s
+          AND REFERENCED_TABLE_NAME IS NOT NULL
+    """, (database,))
+
+    dependencies = {}
+    for table, referenced_table in cursor.fetchall():
+        if table not in dependencies:
+            dependencies[table] = []
+        if referenced_table and referenced_table != table:  # Avoid self-references
+            dependencies[table].append(referenced_table)
+
     cursor.close()
     conn.close()
+
+    # Sort tables in dependency order
+    sorted_tables = topological_sort(all_tables, dependencies)
 
     out_dir = f"dbgen_output_{datetime.now():%Y%m%d_%H%M%S}"
     os.makedirs(out_dir, exist_ok=True)
 
-    for table in tables:
-        print(f"⚙️ Processing table: {table}")
+    print("=" * 60)
+    print("PROCESSING TABLES IN DEPENDENCY ORDER")
+    print("=" * 60)
+    print(f"Order: {' -> '.join(sorted_tables)}\n")
+
+    for table in sorted_tables:
+        deps = dependencies.get(table, [])
+        if deps:
+            print(f"⚙️ Processing table: {table} (depends on: {', '.join(deps)})")
+        else:
+            print(f"⚙️ Processing table: {table} (no dependencies)")
+
         ddl = annotate_table_with_histogram(
             host, user, password, database, table
         )
