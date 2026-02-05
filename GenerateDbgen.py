@@ -159,14 +159,13 @@ def annotate_table_with_histogram(host, user, password, database, table, generat
             col_type = column_types.get(col)
             synthetic = ""
 
-            # 🔴 FOREIGN KEY → reference the source column
+            # 🔴 FOREIGN KEY → use generated appendage if available, else @ref_col
             if col in foreign_keys:
-                ref_table, ref_col = foreign_keys[col]
-                comment = f"/*{{{{ @{col} := @{ref_col} }}}}*/"
-                if line.rstrip().endswith(","):
-                    line = line.rstrip()[:-1] + f" {comment},"
+                if col in generated_appendages:
+                    synthetic = generated_appendages[col]
                 else:
-                    line = line + f" {comment}"
+                    ref_table, ref_col = foreign_keys[col]
+                    synthetic = f"@{ref_col}"
 
             # 🔴 PRIMARY KEY or AUTO_INCREMENT → rownum
             elif (
