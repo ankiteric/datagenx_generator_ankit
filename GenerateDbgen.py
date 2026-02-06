@@ -19,8 +19,13 @@ CHAR_TYPES = {"char", "varchar"}
 TEXT_TYPES = {"text", "blob"}
 YEAR = {"year"}
 
+# Maximum distinct values to fetch for string columns.
+# Above this threshold, fall back to random string generation.
+STRING_CARDINALITY_THRESHOLD = 1000
+
 
 def char_varchar_appendage(ddl_line):
+    """Fallback: generate random alphabetic string of the column's length."""
     m = re.search(r"\b(char|varchar)\s*\(\s*(\d+)\s*\)", ddl_line, re.IGNORECASE)
     if not m:
         return ""
@@ -30,6 +35,112 @@ def char_varchar_appendage(ddl_line):
 
 def text_appendage():
     return "rand.regex('[a-zA-Z ]{100}')"
+
+
+def get_string_column_values(cursor, database, table, column):
+    """Query distinct values and their frequencies for a string column.
+
+    Returns a list of (value, count) tuples sorted by count descending,
+    or None if cardinality exceeds STRING_CARDINALITY_THRESHOLD.
+    """
+    # First check cardinality
+    cursor.execute(
+        f"SELECT COUNT(DISTINCT `{column}`) FROM `{database}`.`{table}`"
+    )
+    cardinality = cursor.fetchone()[0]
+
+    if cardinality > STRING_CARDINALITY_THRESHOLD:
+        return None
+
+    # Fetch actual values and frequencies
+    cursor.execute(f"""
+        SELECT `{column}`, COUNT(*) as cnt
+        FROM `{database}`.`{table}`
+        WHERE `{column}` IS NOT NULL
+        GROUP BY `{column}`
+        ORDER BY cnt DESC
+    """)
+    return cursor.fetchall()
+
+
+def string_values_to_case(values_with_counts):
+    """Generate a weighted CASE expression for string values.
+
+    values_with_counts: list of (value, count) tuples
+    Returns a dbgen expression like:
+        case rand.weighted(array[0.25,0.50,0.25])
+        when 1 then 'A' when 2 then 'N' when 3 then 'R'
+        end
+    """
+    if not values_with_counts:
+        return ""
+
+    total = sum(cnt for _, cnt in values_with_counts)
+    if total == 0:
+        return ""
+
+    weights = [round(cnt / total, 6) for _, cnt in values_with_counts]
+
+    case_lines = []
+    for i, (value, _) in enumerate(values_with_counts, start=1):
+        # Escape single quotes in the value
+        escaped = value.replace("'", "''") if value else ""
+        case_lines.append(f"when {i} then '{escaped}'")
+
+    return f"""case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
+    end"""
+
+
+def get_date_range_expression(cursor, database, table, column, col_type):
+    """Query min/max values for a DATE/DATETIME/TIMESTAMP column and generate
+    a dbgen expression that produces random values within that range.
+
+    The base date and day span are derived by querying:
+        SELECT MIN(column), MAX(column) FROM database.table
+
+    For DATE columns, generates:
+        TIMESTAMP 'YYYY-MM-DD' + INTERVAL rand.range(0, day_span) DAY
+
+    For DATETIME/TIMESTAMP columns, generates:
+        TIMESTAMP 'YYYY-MM-DD HH:MM:SS' + INTERVAL rand.range(0, second_span) SECOND
+
+    Returns None if the column has no data or only NULL values.
+    """
+    cursor.execute(
+        f"SELECT MIN(`{column}`), MAX(`{column}`) FROM `{database}`.`{table}`"
+    )
+    result = cursor.fetchone()
+    min_val, max_val = result
+
+    if min_val is None or max_val is None:
+        return None
+
+    if col_type == "date":
+        # For DATE: use day-based offset
+        # min_val and max_val are datetime.date objects
+        # dbgen requires full timestamp format (YYYY-MM-DD HH:MM:SS)
+        base_date = min_val.strftime("%Y-%m-%d 00:00:00")
+        day_span = (max_val - min_val).days
+        return f"TIMESTAMP '{base_date}' + INTERVAL rand.range(0, {day_span}) DAY"
+
+    elif col_type in ("datetime", "timestamp"):
+        # For DATETIME/TIMESTAMP: use second-based offset for finer granularity
+        # min_val and max_val are datetime.datetime objects
+        base_ts = min_val.strftime("%Y-%m-%d %H:%M:%S")
+        second_span = int((max_val - min_val).total_seconds())
+        return f"TIMESTAMP '{base_ts}' + INTERVAL rand.range(0, {second_span}) SECOND"
+
+    elif col_type == "time":
+        # TIME columns: generate random time within the observed range
+        # min_val and max_val are datetime.timedelta objects
+        min_secs = int(min_val.total_seconds())
+        max_secs = int(max_val.total_seconds())
+        span = max_secs - min_secs
+        # dbgen doesn't have TIME literal, use interval from midnight
+        return f"INTERVAL rand.range({min_secs}, {max_secs}) SECOND"
+
+    return None
 
 
 def histogram_to_case(hist, ddl_line):
@@ -175,13 +286,27 @@ def annotate_table_with_histogram(host, user, password, database, table, generat
                 synthetic = "rownum"
 
             elif col_type in CHAR_TYPES:
-                synthetic = char_varchar_appendage(line)
+                # Try to get actual distinct values from the source table
+                values = get_string_column_values(cursor, database, table, col)
+                if values:
+                    synthetic = string_values_to_case(values)
+                else:
+                    # High cardinality or empty — fall back to random strings
+                    synthetic = char_varchar_appendage(line)
 
             elif col_type in TEXT_TYPES:
                 synthetic = text_appendage()
 
             elif col_type in DATETIME_TYPES:
-                synthetic = "rand.u31_timestamp()"
+                # Query min/max from source to generate dates within actual range
+                date_expr = get_date_range_expression(
+                    cursor, database, table, col, col_type
+                )
+                if date_expr:
+                    synthetic = date_expr
+                else:
+                    # Fallback if column is empty or all NULL
+                    synthetic = "rand.u31_timestamp()"
 
             elif col_type in YEAR:
                 synthetic = "rand.range(1975,2025)"
