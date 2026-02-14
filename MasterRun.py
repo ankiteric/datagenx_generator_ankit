@@ -3,7 +3,7 @@
 MasterRun.py — End-to-end tpch data generation and validation.
 
 Orchestrates GenerateDbgen, dbgen binary, and PopulateNewTableAndValidate
-for every table in `tpch`, writing results into `tpch_harsha`.
+for every table in `tpch`, writing results into `dbgenx`.
 """
 
 import os
