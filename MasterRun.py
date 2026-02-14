@@ -413,7 +413,7 @@ def main():
     sorted_tables = topological_sort(all_tables, dependencies)
 
     print("=" * 60)
-    print("MASTER RUN — tpch -> tpch_harsha")
+    print("MASTER RUN — tpch -> ankit")
     print("=" * 60)
     print(f"Tables ({len(sorted_tables)}): {' -> '.join(sorted_tables)}")
     print()
