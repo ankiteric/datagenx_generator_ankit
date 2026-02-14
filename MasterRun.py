@@ -42,7 +42,7 @@ PASSWORD = "your password"
 SOURCE_SCHEMA = "tpch"
 TARGET_SCHEMA = "dbgenx"
 
-DBGEN_BINARY = "//Users/ankit/Documents/tpch/tpch-dbgen/dbgen"
+DBGEN_BINARY = "/Users/ankit/Documents/tpch/tpch-dbgen/dbgen"
 DBGEN_FILES_DIR = "dbgen_files"
 DBGEN_TMP_OUT_DIR = "dbgen_tmp_out"
 
