@@ -33,6 +33,23 @@ def char_varchar_appendage(ddl_line):
     return f"rand.regex('[a-zA-Z ]{{{length}}}')"
 
 
+def get_fk_range_expression(cursor, target_database, ref_table, ref_col):
+    """Query min/max values from target database's referenced table.
+
+    Uses exclusive upper bound: rand.range(min, max+1) generates min to max inclusive.
+    """
+    cursor.execute(
+        f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{target_database}`.`{ref_table}`"
+    )
+    min_val, max_val = cursor.fetchone()
+
+    if min_val is None or max_val is None:
+        return "rand.range(0,1)"
+
+    # rand.range uses exclusive upper bound, so add 1 to max
+    return f"rand.range({min_val},{max_val + 1})"
+
+
 def text_appendage():
     return "rand.regex('[a-zA-Z ]{100}')"
 
@@ -63,14 +80,18 @@ def get_string_column_values(cursor, database, table, column):
     return cursor.fetchall()
 
 
-def string_values_to_case(values_with_counts):
+def string_values_to_case(values_with_counts, column_name):
     """Generate a weighted CASE expression for string values.
 
     values_with_counts: list of (value, count) tuples
+    column_name: name of the column (used to generate synthetic values)
     Returns a dbgen expression like:
         case rand.weighted(array[0.25,0.50,0.25])
-        when 1 then 'A' when 2 then 'N' when 3 then 'R'
+        when 1 then 'col_1___' when 2 then 'col_2___' when 3 then 'col_3___'
         end
+
+    Uses synthetic values (column_name_N, padded to match original length)
+    to avoid data leakage while preserving string length distribution.
     """
     if not values_with_counts:
         return ""
@@ -83,9 +104,23 @@ def string_values_to_case(values_with_counts):
 
     case_lines = []
     for i, (value, _) in enumerate(values_with_counts, start=1):
-        # Escape single quotes in the value
-        escaped = value.replace("'", "''") if value else ""
-        case_lines.append(f"when {i} then '{escaped}'")
+        original_len = len(value) if value else 0
+        base = f"{column_name}_{i}"
+
+        if len(base) < original_len:
+            # Pad with underscores to match original length
+            synthetic_value = base + "_" * (original_len - len(base))
+        elif len(base) > original_len:
+            # Truncate but try to keep the number visible
+            if original_len >= 3:
+                # Keep at least the number at the end
+                synthetic_value = base[:original_len]
+            else:
+                synthetic_value = str(i)[:original_len] if original_len > 0 else ""
+        else:
+            synthetic_value = base
+
+        case_lines.append(f"when {i} then '{synthetic_value}'")
 
     return f"""case rand.weighted(array[{','.join(map(str, weights))}])
     {' '.join(case_lines)}
@@ -198,9 +233,11 @@ def histogram_to_case(hist, ddl_line):
     end"""
 
 
-def annotate_table_with_histogram(host, user, password, database, table, generated_appendages=None):
+def annotate_table_with_histogram(host, user, password, database, table, target_database=None, generated_appendages=None):
     if generated_appendages is None:
         generated_appendages = {}
+    if target_database is None:
+        target_database = database  # Default to source if not specified
 
     try:
         conn = mysql.connector.connect(
@@ -270,13 +307,13 @@ def annotate_table_with_histogram(host, user, password, database, table, generat
             col_type = column_types.get(col)
             synthetic = ""
 
-            # 🔴 FOREIGN KEY → use generated appendage if available, else @ref_col
+            # 🔴 FOREIGN KEY → query target database for actual range
             if col in foreign_keys:
                 if col in generated_appendages:
                     synthetic = generated_appendages[col]
                 else:
                     ref_table, ref_col = foreign_keys[col]
-                    synthetic = f"@{ref_col}"
+                    synthetic = get_fk_range_expression(cursor, target_database, ref_table, ref_col)
 
             # 🔴 PRIMARY KEY or AUTO_INCREMENT → rownum
             elif (
@@ -289,7 +326,7 @@ def annotate_table_with_histogram(host, user, password, database, table, generat
                 # Try to get actual distinct values from the source table
                 values = get_string_column_values(cursor, database, table, col)
                 if values:
-                    synthetic = string_values_to_case(values)
+                    synthetic = string_values_to_case(values, col)
                 else:
                     # High cardinality or empty — fall back to random strings
                     synthetic = char_varchar_appendage(line)
@@ -413,6 +450,7 @@ if __name__ == "__main__":
     user = "root"
     password = "newpassword"
     database = "tpch"
+    target_database = "tpch_harsha"  # Target schema for FK range queries
 
     conn = mysql.connector.connect(
         host=host, user=user, password=password, database=database
@@ -475,7 +513,7 @@ if __name__ == "__main__":
             print(f"⚙️ Processing table: {table} (no dependencies)")
 
         ddl = annotate_table_with_histogram(
-            host, user, password, database, table
+            host, user, password, database, table, target_database
         )
         if ddl:
             with open(os.path.join(out_dir, f"{table}.dbgen"), "w") as f:

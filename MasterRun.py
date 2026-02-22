@@ -124,14 +124,14 @@ def prepare_target_schema(cursor, target_schema):
 # 2. Per-table processing
 # ----------------------------------------------------------------
 def build_fk_appendages(cursor, table):
-    """For each FK column in `table`, query the distinct count of the
-    referenced column in the already-populated target schema and return
-    a dict of dbgen expressions.
+    """For each FK column in `table`, build dbgen expressions.
 
-    FK-only columns get ``rand.range(1,N)`` for a uniform distribution.
-    When *all* columns of a composite primary key are foreign keys,
-    ``rand.range`` would cause duplicate-key collisions, so those columns
-    use deterministic modular arithmetic with ``rownum`` instead.
+    Handles three cases:
+    1. Composite PK where all columns are FKs (e.g., PARTSUPP):
+       Uses interleaved arithmetic for full coverage of both domains.
+    2. Composite FK referencing another table's composite key (e.g., LINEITEM):
+       Uses same interleaved formula as referenced table, cycling as needed.
+    3. Single-column FKs: Uses rand.range() for uniform distribution.
     """
 
     # Build canonical name map for target schema (handles case mismatches)
@@ -142,17 +142,24 @@ def build_fk_appendages(cursor, table):
     """, (TARGET_SCHEMA,))
     tgt_canonical = {t[0].lower(): t[0] for t in cursor.fetchall()}
 
-    # FK columns for this table
+    # FK columns grouped by constraint name
     cursor.execute("""
-        SELECT COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+        SELECT CONSTRAINT_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
         WHERE TABLE_SCHEMA = %s
           AND TABLE_NAME = %s
           AND REFERENCED_TABLE_NAME IS NOT NULL
+        ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION
     """, (SOURCE_SCHEMA, table))
     fk_rows = cursor.fetchall()
     if not fk_rows:
         return {}
+
+    # Group by constraint name
+    from collections import defaultdict
+    constraints = defaultdict(list)  # constraint_name -> [(col, ref_table, ref_col), ...]
+    for constraint_name, col, ref_table, ref_col in fk_rows:
+        constraints[constraint_name].append((col, ref_table, ref_col))
 
     # PK columns for this table
     cursor.execute("""
@@ -164,60 +171,133 @@ def build_fk_appendages(cursor, table):
     """, (SOURCE_SCHEMA, table))
     pk_columns = {r[0] for r in cursor.fetchall()}
 
-    # Resolve distinct counts for each FK column
-    fk_info = []  # (col, actual_ref, ref_col, distinct_count)
-    for col, ref_table, ref_col in fk_rows:
-        actual_ref = tgt_canonical.get(ref_table.lower())
-        if actual_ref is None:
-            print(f"      FK {col} -> {ref_table}.{ref_col}: "
-                  f"SKIPPED (referenced table not yet in {TARGET_SCHEMA})")
-            continue
-        cursor.execute(
-            f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
-        )
-        distinct_count = cursor.fetchone()[0]
-        fk_info.append((col, actual_ref, ref_col, distinct_count))
+    # Get source row count for this table
+    cursor.execute(f"SELECT COUNT(*) FROM `{SOURCE_SCHEMA}`.`{table}`")
+    source_row_count = cursor.fetchone()[0]
 
-    # Split into PK+FK vs FK-only
-    pk_fk = [(col, ar, rc, dc) for col, ar, rc, dc in fk_info if col in pk_columns]
-    fk_only = [(col, ar, rc, dc) for col, ar, rc, dc in fk_info if col not in pk_columns]
+    # Collect all FK columns that are also PK columns
+    all_fk_columns = {col for _, cols in constraints.items() for col, _, _ in cols}
+    pk_fk_columns = pk_columns & all_fk_columns
 
-    # Check whether every PK column is a FK (composite-PK collision risk)
-    all_pk_are_fk = (
-        len(pk_columns) > 1
-        and pk_columns == {c[0] for c in pk_fk}
-    )
+    # Check if ALL PK columns are FKs (composite PK case like PARTSUPP)
+    # This can happen with multiple single-column FKs forming the PK
+    all_pk_are_fk = (len(pk_columns) > 1 and pk_columns == pk_fk_columns)
 
     appendages = {}
 
-    # FK-only columns: uniform random
-    for col, actual_ref, ref_col, distinct_count in fk_only:
-        appendages[col] = f"rand.range(1,{distinct_count})"
-        print(f"      FK {col} -> {actual_ref}.{ref_col}: "
-              f"{distinct_count} distinct values -> rand.range(1,{distinct_count})")
-
     if all_pk_are_fk:
-        # Composite PK where every column is a FK — use modular arithmetic
-        # to guarantee unique tuples.  Sort by distinct count descending so
-        # the largest domain gets the most coverage.
-        pk_fk.sort(key=lambda x: x[3], reverse=True)
-        divisor = 1
-        for col, actual_ref, ref_col, distinct_count in pk_fk:
-            if divisor == 1:
-                expr = f"mod(rownum-1, {distinct_count})+1"
-            else:
-                expr = f"mod(div(rownum-1, {divisor}), {distinct_count})+1"
-            appendages[col] = expr
-            print(f"      FK+PK {col} -> {actual_ref}.{ref_col}: "
-                  f"{distinct_count} distinct values -> {expr}")
-            divisor *= distinct_count
-    else:
-        # At least one PK column is not a FK and will get `rownum`,
-        # so the composite PK is unique regardless — safe to use random.
-        for col, actual_ref, ref_col, distinct_count in pk_fk:
-            appendages[col] = f"rand.range(1,{distinct_count})"
+        # Composite PK where all columns are FKs (e.g., PARTSUPP)
+        # Collect info for all PK+FK columns across all constraints
+        pk_fk_info = []  # [(col, ref_table, ref_col, distinct_count), ...]
+        for constraint_name, fk_cols in constraints.items():
+            for col, ref_table, ref_col in fk_cols:
+                if col in pk_columns:
+                    actual_ref = tgt_canonical.get(ref_table.lower())
+                    if actual_ref is None:
+                        continue
+                    cursor.execute(
+                        f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                    )
+                    distinct_count = cursor.fetchone()[0]
+                    pk_fk_info.append((col, actual_ref, ref_col, distinct_count))
+
+        if len(pk_fk_info) >= 2:
+            # Sort by distinct count ascending (smaller domain first)
+            pk_fk_info.sort(key=lambda x: x[3])
+
+            small_col, small_ref, small_refcol, small_count = pk_fk_info[0]
+            large_col, large_ref, large_refcol, large_count = pk_fk_info[1]
+
+            rows_per_large = max(1, source_row_count // large_count)
+
+            small_expr = f"mod(rownum-1, {small_count})+1"
+            appendages[small_col] = small_expr
+            print(f"      FK+PK {small_col} -> {small_ref}.{small_refcol}: "
+                  f"{small_count} distinct -> {small_expr}")
+
+            large_expr = f"div(rownum-1, {rows_per_large})+1"
+            appendages[large_col] = large_expr
+            print(f"      FK+PK {large_col} -> {large_ref}.{large_refcol}: "
+                  f"{large_count} distinct -> {large_expr}")
+
+        # Handle any remaining FK-only columns
+        for constraint_name, fk_cols in constraints.items():
+            for col, ref_table, ref_col in fk_cols:
+                if col not in pk_columns and col not in appendages:
+                    actual_ref = tgt_canonical.get(ref_table.lower())
+                    if actual_ref is None:
+                        continue
+                    cursor.execute(
+                        f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                    )
+                    distinct_count = cursor.fetchone()[0]
+                    appendages[col] = f"rand.range(1,{distinct_count + 1})"
+                    print(f"      FK {col} -> {actual_ref}.{ref_col}: "
+                          f"{distinct_count} distinct -> rand.range(1,{distinct_count + 1})")
+
+        return appendages
+
+    # Normal case: process each constraint
+    for constraint_name, fk_cols in constraints.items():
+        if len(fk_cols) == 1:
+            # Single-column FK
+            col, ref_table, ref_col = fk_cols[0]
+            actual_ref = tgt_canonical.get(ref_table.lower())
+            if actual_ref is None:
+                print(f"      FK {col} -> {ref_table}.{ref_col}: "
+                      f"SKIPPED (referenced table not yet in {TARGET_SCHEMA})")
+                continue
+
+            cursor.execute(
+                f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+            )
+            distinct_count = cursor.fetchone()[0]
+
+            appendages[col] = f"rand.range(1,{distinct_count + 1})"
             print(f"      FK {col} -> {actual_ref}.{ref_col}: "
-                  f"{distinct_count} distinct values -> rand.range(1,{distinct_count})")
+                  f"{distinct_count} distinct -> rand.range(1,{distinct_count + 1})")
+
+        else:
+            # Composite FK (multiple columns reference same table, e.g., LINEITEM -> PARTSUPP)
+            ref_table = fk_cols[0][1]
+            actual_ref = tgt_canonical.get(ref_table.lower())
+            if actual_ref is None:
+                print(f"      Composite FK -> {ref_table}: "
+                      f"SKIPPED (referenced table not yet in {TARGET_SCHEMA})")
+                continue
+
+            # Get row count of referenced table (total valid pairs)
+            cursor.execute(f"SELECT COUNT(*) FROM `{TARGET_SCHEMA}`.`{actual_ref}`")
+            ref_row_count = cursor.fetchone()[0]
+
+            # Get distinct counts for each column in the composite FK
+            col_info = []  # [(col, ref_col, distinct_count), ...]
+            for col, _, ref_col in fk_cols:
+                cursor.execute(
+                    f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                )
+                distinct_count = cursor.fetchone()[0]
+                col_info.append((col, ref_col, distinct_count))
+
+            # Sort by distinct count ascending (smaller domain first)
+            col_info.sort(key=lambda x: x[2])
+
+            small_col, small_refcol, small_count = col_info[0]
+            large_col, large_refcol, large_count = col_info[1]
+
+            # rows_per_large in the REFERENCED table
+            rows_per_large_ref = max(1, ref_row_count // large_count)
+
+            # Cycle through the referenced table's valid pairs
+            small_expr = f"mod(mod(rownum-1, {ref_row_count}), {small_count})+1"
+            appendages[small_col] = small_expr
+            print(f"      Composite FK {small_col} -> {actual_ref}.{small_refcol}: "
+                  f"cycling {ref_row_count} pairs -> {small_expr}")
+
+            large_expr = f"div(mod(rownum-1, {ref_row_count}), {rows_per_large_ref})+1"
+            appendages[large_col] = large_expr
+            print(f"      Composite FK {large_col} -> {actual_ref}.{large_refcol}: "
+                  f"cycling {ref_row_count} pairs -> {large_expr}")
 
     return appendages
 
