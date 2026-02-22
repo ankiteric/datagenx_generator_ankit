@@ -1,3 +1,13 @@
+
+To cretate the new data:
+python3 MasterRun.py
+
+To compare with tpch queries:
+./run_tpch_comparison.sh
+
+
+
+-----------------------------------------
 This Repo accomplishes the following:
 1) Create DDLs in the format expected by DATAGENX: https://github.com/kennytm/dbgen
 2) Use the .dbgen files created above to generate the INSERT statements.
