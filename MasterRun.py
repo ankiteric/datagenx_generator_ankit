@@ -202,23 +202,34 @@ def build_fk_appendages(cursor, table):
                     pk_fk_info.append((col, actual_ref, ref_col, distinct_count))
 
         if len(pk_fk_info) >= 2:
-            # Sort by distinct count ascending (smaller domain first)
+            # Sort by distinct count ascending (smaller domains first)
             pk_fk_info.sort(key=lambda x: x[3])
 
-            small_col, small_ref, small_refcol, small_count = pk_fk_info[0]
-            large_col, large_ref, large_refcol, large_count = pk_fk_info[1]
+            # For full coverage of ALL domains:
+            # - Smaller domains: use mod(rownum-1, distinct_count)+1 to cycle
+            # - Largest domain: use div(rownum-1, rows_per_large)+1 to spread
+            #
+            # This ensures each domain gets full coverage when R >= max(Di)
 
+            # All but the last (largest) use mod cycling
+            divisor = 1
+            for col, ref_table, ref_col, distinct_count in pk_fk_info[:-1]:
+                if divisor == 1:
+                    expr = f"mod(rownum-1, {distinct_count})+1"
+                else:
+                    expr = f"mod(div(rownum-1, {divisor}), {distinct_count})+1"
+                appendages[col] = expr
+                print(f"      FK+PK {col} -> {ref_table}.{ref_col}: "
+                      f"{distinct_count} distinct, divisor={divisor} -> {expr}")
+                divisor *= distinct_count
+
+            # Largest domain uses div to ensure full coverage
+            large_col, large_ref, large_refcol, large_count = pk_fk_info[-1]
             rows_per_large = max(1, source_row_count // large_count)
-
-            small_expr = f"mod(rownum-1, {small_count})+1"
-            appendages[small_col] = small_expr
-            print(f"      FK+PK {small_col} -> {small_ref}.{small_refcol}: "
-                  f"{small_count} distinct -> {small_expr}")
-
             large_expr = f"div(rownum-1, {rows_per_large})+1"
             appendages[large_col] = large_expr
             print(f"      FK+PK {large_col} -> {large_ref}.{large_refcol}: "
-                  f"{large_count} distinct -> {large_expr}")
+                  f"{large_count} distinct, rows_per={rows_per_large} -> {large_expr}")
 
         # Handle any remaining FK-only columns
         for constraint_name, fk_cols in constraints.items():
@@ -279,25 +290,35 @@ def build_fk_appendages(cursor, table):
                 distinct_count = cursor.fetchone()[0]
                 col_info.append((col, ref_col, distinct_count))
 
-            # Sort by distinct count ascending (smaller domain first)
+            # Sort by distinct count ascending (smaller domains first)
             col_info.sort(key=lambda x: x[2])
 
-            small_col, small_refcol, small_count = col_info[0]
-            large_col, large_refcol, large_count = col_info[1]
+            # For composite FK referencing another table:
+            # Must generate pairs that exist in the referenced table.
+            # Use same formula as the referenced table, but cycle through ref_row_count.
+            #
+            # - Smaller domains: mod(mod(rownum-1, ref_row_count), distinct_count)+1
+            # - Largest domain: div(mod(rownum-1, ref_row_count), rows_per_large)+1
 
-            # rows_per_large in the REFERENCED table
-            rows_per_large_ref = max(1, ref_row_count // large_count)
+            # All but the last (largest) use mod cycling
+            divisor = 1
+            for col, ref_col, distinct_count in col_info[:-1]:
+                if divisor == 1:
+                    expr = f"mod(mod(rownum-1, {ref_row_count}), {distinct_count})+1"
+                else:
+                    expr = f"mod(div(mod(rownum-1, {ref_row_count}), {divisor}), {distinct_count})+1"
+                appendages[col] = expr
+                print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
+                      f"cycling {ref_row_count} pairs, divisor={divisor} -> {expr}")
+                divisor *= distinct_count
 
-            # Cycle through the referenced table's valid pairs
-            small_expr = f"mod(mod(rownum-1, {ref_row_count}), {small_count})+1"
-            appendages[small_col] = small_expr
-            print(f"      Composite FK {small_col} -> {actual_ref}.{small_refcol}: "
-                  f"cycling {ref_row_count} pairs -> {small_expr}")
-
-            large_expr = f"div(mod(rownum-1, {ref_row_count}), {rows_per_large_ref})+1"
+            # Largest domain uses div to match referenced table's formula
+            large_col, large_refcol, large_count = col_info[-1]
+            rows_per_large = max(1, ref_row_count // large_count)
+            large_expr = f"div(mod(rownum-1, {ref_row_count}), {rows_per_large})+1"
             appendages[large_col] = large_expr
             print(f"      Composite FK {large_col} -> {actual_ref}.{large_refcol}: "
-                  f"cycling {ref_row_count} pairs -> {large_expr}")
+                  f"cycling {ref_row_count} pairs, rows_per={rows_per_large} -> {large_expr}")
 
     return appendages
 
