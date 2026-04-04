@@ -4,6 +4,7 @@ import re
 import json
 from datetime import datetime
 import os
+import base64
 
 
 NUMERIC_TYPES = {
@@ -24,27 +25,100 @@ YEAR = {"year"}
 STRING_CARDINALITY_THRESHOLD = 1000
 
 
+def decode_histogram_string(raw_value):
+    """Decode a string value from MySQL histogram.
+
+    MySQL stores string values in histograms as base64-encoded strings.
+    This function decodes the base64 and strips trailing whitespace
+    (CHAR columns are space-padded).
+
+    Returns the decoded string value.
+    """
+    if not isinstance(raw_value, str):
+        return str(raw_value).rstrip()
+
+    # Try base64 decoding
+    try:
+        # Ensure proper padding (base64 strings should be padded to multiple of 4)
+        padded = raw_value + '=' * (-len(raw_value) % 4)
+        decoded_bytes = base64.b64decode(padded)
+        decoded_str = decoded_bytes.decode('utf-8')
+        return decoded_str.rstrip()
+    except Exception:
+        pass
+
+    # If base64 fails, use the raw value (strip trailing whitespace)
+    return raw_value.rstrip()
+
+
+def get_string_column_length(ddl_line):
+    """Extract the length from a CHAR or VARCHAR column definition."""
+    m = re.search(r"\b(char|varchar)\s*\(\s*(\d+)\s*\)", ddl_line, re.IGNORECASE)
+    if m:
+        return int(m.group(2))
+    return None
+
+
 def char_varchar_appendage(ddl_line):
     """Fallback: generate random alphabetic string of the column's length."""
-    m = re.search(r"\b(char|varchar)\s*\(\s*(\d+)\s*\)", ddl_line, re.IGNORECASE)
-    if not m:
+    length = get_string_column_length(ddl_line)
+    if length is None:
         return ""
-    length = m.group(2)
     return f"rand.regex('[a-zA-Z ]{{{length}}}')"
 
 
+def get_min_max_from_histogram(histogram):
+    """Extract min and max values from a MySQL histogram JSON structure.
+
+    Returns (min_val, max_val) tuple, or (None, None) if extraction fails.
+    """
+    if not histogram:
+        return None, None
+
+    buckets = histogram.get("buckets", [])
+    if not buckets:
+        return None, None
+
+    hist_type = histogram.get("histogram-type")
+
+    if hist_type == "singleton":
+        # Singleton: each bucket is [value, cumulative_frequency]
+        min_val = buckets[0][0]
+        max_val = buckets[-1][0]
+    elif hist_type == "equi-height":
+        # Equi-height: each bucket is [min, max, cumulative_frequency, num_distinct]
+        min_val = buckets[0][0]
+        max_val = buckets[-1][1]
+    else:
+        return None, None
+
+    return min_val, max_val
+
+
 def get_fk_range_expression(cursor, target_database, ref_table, ref_col):
-    """Query min/max values from target database's referenced table.
+    """Get min/max values from histogram metadata for the referenced column.
 
     Uses exclusive upper bound: rand.range(min, max+1) generates min to max inclusive.
     """
-    cursor.execute(
-        f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{target_database}`.`{ref_table}`"
-    )
-    min_val, max_val = cursor.fetchone()
+    cursor.execute("""
+        SELECT HISTOGRAM
+        FROM information_schema.column_statistics
+        WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+    """, (target_database, ref_table, ref_col))
+
+    result = cursor.fetchone()
+    if not result or not result[0]:
+        return "rand.range(0,1)"
+
+    histogram = json.loads(result[0])
+    min_val, max_val = get_min_max_from_histogram(histogram)
 
     if min_val is None or max_val is None:
         return "rand.range(0,1)"
+
+    # Convert to int (histogram stores numeric values as floats/strings)
+    min_val = int(float(min_val))
+    max_val = int(float(max_val))
 
     # rand.range uses exclusive upper bound, so add 1 to max
     return f"rand.range({min_val},{max_val + 1})"
@@ -55,36 +129,71 @@ def text_appendage():
 
 
 def get_string_column_values(cursor, database, table, column):
-    """Query distinct values and their frequencies for a string column.
+    """Get distinct string values and frequencies from histogram metadata.
 
     Returns a list of (value, count) tuples sorted by count descending,
-    or None if cardinality exceeds STRING_CARDINALITY_THRESHOLD.
-    """
-    # First check cardinality
-    cursor.execute(
-        f"SELECT COUNT(DISTINCT `{column}`) FROM `{database}`.`{table}`"
-    )
-    cardinality = cursor.fetchone()[0]
+    or None if histogram doesn't exist, is equi-height, or cardinality
+    exceeds STRING_CARDINALITY_THRESHOLD.
 
-    if cardinality > STRING_CARDINALITY_THRESHOLD:
+    Note: MySQL stores string values in histograms as base64-encoded strings.
+    """
+    cursor.execute("""
+        SELECT HISTOGRAM
+        FROM information_schema.column_statistics
+        WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+    """, (database, table, column))
+
+    result = cursor.fetchone()
+    if not result or not result[0]:
         return None
 
-    # Fetch actual values and frequencies
-    cursor.execute(f"""
-        SELECT `{column}`, COUNT(*) as cnt
-        FROM `{database}`.`{table}`
-        WHERE `{column}` IS NOT NULL
-        GROUP BY `{column}`
-        ORDER BY cnt DESC
-    """)
-    return cursor.fetchall()
+    histogram = json.loads(result[0])
+    hist_type = histogram.get("histogram-type")
+    buckets = histogram.get("buckets", [])
+
+    if not buckets:
+        return None
+
+    # Only singleton histograms contain individual values
+    if hist_type != "singleton":
+        return None
+
+    # Check cardinality threshold
+    if len(buckets) > STRING_CARDINALITY_THRESHOLD:
+        return None
+
+    # Extract values and convert cumulative frequencies to individual frequencies
+    # Singleton buckets: [base64_value, cumulative_frequency]
+    # Scale frequencies to integer counts for compatibility with string_values_to_case
+    values_with_counts = []
+    prev_cum_freq = 0.0
+
+    for bucket in buckets:
+        raw_value = bucket[0]
+        cum_freq = bucket[1]
+        freq = cum_freq - prev_cum_freq
+        prev_cum_freq = cum_freq
+
+        # Decode base64-encoded string value (MySQL encodes string histogram values)
+        # First check if it looks like base64 (contains only valid base64 chars)
+        value = decode_histogram_string(raw_value)
+
+        # Scale to pseudo-count (maintains relative weights)
+        count = int(freq * 1000000)
+        values_with_counts.append((value, count))
+
+    # Sort by count descending
+    values_with_counts.sort(key=lambda x: x[1], reverse=True)
+
+    return values_with_counts
 
 
-def string_values_to_case(values_with_counts, column_name):
+def string_values_to_case(values_with_counts, column_name, max_length=None):
     """Generate a weighted CASE expression for string values.
 
     values_with_counts: list of (value, count) tuples
     column_name: name of the column (used to generate synthetic values)
+    max_length: optional maximum length for generated strings (from column definition)
     Returns a dbgen expression like:
         case rand.weighted(array[0.25,0.50,0.25])
         when 1 then 'col_1___' when 2 then 'col_2___' when 3 then 'col_3___'
@@ -105,6 +214,9 @@ def string_values_to_case(values_with_counts, column_name):
     case_lines = []
     for i, (value, _) in enumerate(values_with_counts, start=1):
         original_len = len(value) if value else 0
+        # Cap at max_length if provided (to handle CHAR/VARCHAR limits)
+        if max_length is not None and original_len > max_length:
+            original_len = max_length
         base = f"{column_name}_{i}"
 
         if len(base) < original_len:
@@ -120,6 +232,10 @@ def string_values_to_case(values_with_counts, column_name):
         else:
             synthetic_value = base
 
+        # Final safety check - truncate if still too long
+        if max_length is not None and len(synthetic_value) > max_length:
+            synthetic_value = synthetic_value[:max_length]
+
         case_lines.append(f"when {i} then '{synthetic_value}'")
 
     return f"""case rand.weighted(array[{','.join(map(str, weights))}])
@@ -128,11 +244,8 @@ def string_values_to_case(values_with_counts, column_name):
 
 
 def get_date_range_expression(cursor, database, table, column, col_type):
-    """Query min/max values for a DATE/DATETIME/TIMESTAMP column and generate
-    a dbgen expression that produces random values within that range.
-
-    The base date and day span are derived by querying:
-        SELECT MIN(column), MAX(column) FROM database.table
+    """Get min/max values from histogram metadata for DATE/DATETIME/TIMESTAMP columns
+    and generate a dbgen expression that produces random values within that range.
 
     For DATE columns, generates:
         TIMESTAMP 'YYYY-MM-DD' + INTERVAL rand.range(0, day_span) DAY
@@ -140,39 +253,53 @@ def get_date_range_expression(cursor, database, table, column, col_type):
     For DATETIME/TIMESTAMP columns, generates:
         TIMESTAMP 'YYYY-MM-DD HH:MM:SS' + INTERVAL rand.range(0, second_span) SECOND
 
-    Returns None if the column has no data or only NULL values.
+    Returns None if histogram doesn't exist for the column.
     """
-    cursor.execute(
-        f"SELECT MIN(`{column}`), MAX(`{column}`) FROM `{database}`.`{table}`"
-    )
+    cursor.execute("""
+        SELECT HISTOGRAM
+        FROM information_schema.column_statistics
+        WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+    """, (database, table, column))
+
     result = cursor.fetchone()
-    min_val, max_val = result
+    if not result or not result[0]:
+        return None
+
+    histogram = json.loads(result[0])
+    min_val, max_val = get_min_max_from_histogram(histogram)
 
     if min_val is None or max_val is None:
         return None
 
+    # MySQL stores dates in histograms as strings in format 'YYYY-MM-DD HH:MM:SS.ffffff'
     if col_type == "date":
-        # For DATE: use day-based offset
-        # min_val and max_val are datetime.date objects
-        # dbgen requires full timestamp format (YYYY-MM-DD HH:MM:SS)
-        base_date = min_val.strftime("%Y-%m-%d 00:00:00")
-        day_span = (max_val - min_val).days
+        # Parse date strings from histogram
+        min_date = datetime.strptime(min_val[:10], "%Y-%m-%d").date()
+        max_date = datetime.strptime(max_val[:10], "%Y-%m-%d").date()
+        base_date = min_date.strftime("%Y-%m-%d 00:00:00")
+        day_span = (max_date - min_date).days
         return f"TIMESTAMP '{base_date}' + INTERVAL rand.range(0, {day_span}) DAY"
 
     elif col_type in ("datetime", "timestamp"):
-        # For DATETIME/TIMESTAMP: use second-based offset for finer granularity
-        # min_val and max_val are datetime.datetime objects
-        base_ts = min_val.strftime("%Y-%m-%d %H:%M:%S")
-        second_span = int((max_val - min_val).total_seconds())
+        # Parse datetime strings from histogram (handle optional microseconds)
+        fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in min_val else "%Y-%m-%d %H:%M:%S"
+        min_ts = datetime.strptime(min_val, fmt)
+        fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in max_val else "%Y-%m-%d %H:%M:%S"
+        max_ts = datetime.strptime(max_val, fmt)
+        base_ts = min_ts.strftime("%Y-%m-%d %H:%M:%S")
+        second_span = int((max_ts - min_ts).total_seconds())
         return f"TIMESTAMP '{base_ts}' + INTERVAL rand.range(0, {second_span}) SECOND"
 
     elif col_type == "time":
-        # TIME columns: generate random time within the observed range
-        # min_val and max_val are datetime.timedelta objects
-        min_secs = int(min_val.total_seconds())
-        max_secs = int(max_val.total_seconds())
-        span = max_secs - min_secs
-        # dbgen doesn't have TIME literal, use interval from midnight
+        # TIME is stored as 'HH:MM:SS' or 'HH:MM:SS.ffffff'
+        def parse_time_to_secs(t):
+            parts = t.split(":")
+            h, m = int(parts[0]), int(parts[1])
+            s = float(parts[2]) if len(parts) > 2 else 0
+            return h * 3600 + m * 60 + int(s)
+
+        min_secs = parse_time_to_secs(min_val)
+        max_secs = parse_time_to_secs(max_val)
         return f"INTERVAL rand.range({min_secs}, {max_secs}) SECOND"
 
     return None
@@ -281,6 +408,10 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             for col, ref_table, ref_col in cursor.fetchall()
         }
 
+        # Ensure histograms exist on FK referenced columns in target database
+        if foreign_keys:
+            ensure_fk_histograms(cursor, target_database, foreign_keys)
+
         analyze_and_update_histograms(cursor, database, table)
 
         # Histograms
@@ -307,7 +438,7 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             col_type = column_types.get(col)
             synthetic = ""
 
-            # 🔴 FOREIGN KEY → query target database for actual range
+            # 🔴 FOREIGN KEY → get range from histogram metadata
             if col in foreign_keys:
                 if col in generated_appendages:
                     synthetic = generated_appendages[col]
@@ -323,10 +454,11 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 synthetic = "rownum"
 
             elif col_type in CHAR_TYPES:
-                # Try to get actual distinct values from the source table
+                # Try to get distinct values from histogram metadata
                 values = get_string_column_values(cursor, database, table, col)
+                col_max_length = get_string_column_length(line)
                 if values:
-                    synthetic = string_values_to_case(values, col)
+                    synthetic = string_values_to_case(values, col, max_length=col_max_length)
                 else:
                     # High cardinality or empty — fall back to random strings
                     synthetic = char_varchar_appendage(line)
@@ -335,7 +467,7 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 synthetic = text_appendage()
 
             elif col_type in DATETIME_TYPES:
-                # Query min/max from source to generate dates within actual range
+                # Get min/max from histogram metadata to generate dates within range
                 date_expr = get_date_range_expression(
                     cursor, database, table, col, col_type
                 )
@@ -378,16 +510,26 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
 
 
 def analyze_and_update_histograms(cursor, database, table):
+    """Create/update histograms for all relevant column types.
+
+    Creates histograms for:
+    - Numeric columns (for value distribution)
+    - Date/DateTime/Timestamp columns (for min/max extraction)
+    - Char/Varchar columns (for distinct value extraction)
+    """
     cursor.execute(f"ANALYZE TABLE `{database}`.`{table}`")
     cursor.fetchall()
 
+    # Get all columns that need histograms
     cursor.execute("""
         SELECT COLUMN_NAME
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
           AND DATA_TYPE IN (
               'tinyint','smallint','mediumint','int','bigint',
-              'decimal','numeric','float','double'
+              'decimal','numeric','float','double',
+              'date','datetime','timestamp','time',
+              'char','varchar'
           )
     """, (database, table))
 
@@ -403,6 +545,41 @@ def analyze_and_update_histograms(cursor, database, table):
         """
     )
     cursor.fetchall()
+
+
+def ensure_fk_histograms(cursor, target_database, foreign_keys):
+    """Ensure histograms exist on FK referenced columns in target database.
+
+    foreign_keys: dict of {column: (ref_table, ref_col)}
+    """
+    # Group by table to minimize ANALYZE calls
+    tables_columns = {}
+    for col, (ref_table, ref_col) in foreign_keys.items():
+        if ref_table not in tables_columns:
+            tables_columns[ref_table] = set()
+        tables_columns[ref_table].add(ref_col)
+
+    for ref_table, ref_cols in tables_columns.items():
+        # Check which columns already have histograms
+        cursor.execute("""
+            SELECT COLUMN_NAME
+            FROM information_schema.column_statistics
+            WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME IN ({})
+        """.format(','.join(['%s'] * len(ref_cols))),
+            (target_database, ref_table, *ref_cols))
+
+        existing = {row[0] for row in cursor.fetchall()}
+        missing = ref_cols - existing
+
+        if missing:
+            cursor.execute(
+                f"""
+                ANALYZE TABLE `{target_database}`.`{ref_table}`
+                UPDATE HISTOGRAM ON {','.join(f'`{c}`' for c in missing)}
+                WITH 100 BUCKETS
+                """
+            )
+            cursor.fetchall()
 
 
 def topological_sort(tables, dependencies):

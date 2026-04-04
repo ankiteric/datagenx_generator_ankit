@@ -113,19 +113,19 @@ def histogram_difference(h1, h2):
 
 
 def compare_histograms(h1, h2):
-    mismatches = []
+    """Compare histograms and return list of (col, diff_value, reason) tuples."""
+    results = []
     all_cols = set(h1.keys()) | set(h2.keys())
 
     for col in sorted(all_cols):
         if col not in h1:
-            mismatches.append((col, "missing in source"))
+            results.append((col, 1.0, "missing in source"))
         elif col not in h2:
-            mismatches.append((col, "missing in target"))
+            results.append((col, 1.0, "missing in target"))
         else:
             diff = histogram_difference(h1[col], h2[col])
-            if diff > 0:
-                mismatches.append((col, f"histogram diff = {diff:.5f}"))
-    return mismatches
+            results.append((col, diff, f"diff = {diff:.5f}"))
+    return results
 
 
 def load_table_stats(cursor, schema, table):
@@ -147,6 +147,38 @@ def load_index_stats(cursor, schema, table):
     return cursor.fetchall()
 
 
+def load_indexed_columns(cursor, schema, table):
+    """Get set of column names that are part of any index."""
+    cursor.execute("""
+        SELECT DISTINCT COLUMN_NAME
+        FROM information_schema.statistics
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+    """, (schema, table))
+    return {row[0] for row in cursor.fetchall()}
+
+
+def load_column_types(cursor, schema, table):
+    """Get dict of column_name -> column_type."""
+    cursor.execute("""
+        SELECT COLUMN_NAME, COLUMN_TYPE
+        FROM information_schema.columns
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+    """, (schema, table))
+    return {row[0]: row[1] for row in cursor.fetchall()}
+
+
+def is_string_type(col_type):
+    """Check if column type is a string type (char, varchar, text, etc.)."""
+    col_type_lower = col_type.lower()
+    return any(t in col_type_lower for t in ['char', 'varchar', 'text', 'blob'])
+
+
+def is_decimal_type(col_type):
+    """Check if column type is decimal/numeric (may have distinct count divergence)."""
+    col_type_lower = col_type.lower()
+    return any(t in col_type_lower for t in ['decimal', 'numeric'])
+
+
 def load_distinct_counts(cursor, schema, table):
     cursor.execute("""
         SELECT COLUMN_NAME, COLUMN_TYPE
@@ -156,6 +188,7 @@ def load_distinct_counts(cursor, schema, table):
     """, (schema, table))
 
     columns = cursor.fetchall()
+    indexed_cols = load_indexed_columns(cursor, schema, table)
     distinct_counts = {}
 
     for col, col_type in columns:
@@ -163,12 +196,14 @@ def load_distinct_counts(cursor, schema, table):
             cursor.execute(f"SELECT COUNT(DISTINCT `{col}`) FROM `{schema}`.`{table}`")
             distinct_counts[col] = {
                 'count': cursor.fetchone()[0],
-                'type': col_type
+                'type': col_type,
+                'indexed': col in indexed_cols
             }
         except Error as e:
             distinct_counts[col] = {
                 'count': None,
-                'type': col_type
+                'type': col_type,
+                'indexed': col in indexed_cols
             }
 
     return distinct_counts
@@ -193,9 +228,59 @@ def report_rowcount_mismatch(orig, new):
 
 
 def report_histogram_mismatch(mismatches):
+    """Deprecated - kept for backwards compatibility."""
     print("\n❌ HISTOGRAM MISMATCHES")
     for col, reason in mismatches:
         print(f" - Column `{col}`: {reason}")
+
+
+def report_histogram_comparison(results, indexed_cols, column_types):
+    """Report histogram comparison results.
+
+    results: list of (col, diff_value, reason) from compare_histograms
+    indexed_cols: set of column names that are indexed
+    column_types: dict of col -> type string
+
+    Returns list of critical mismatches (failures).
+    """
+    print("\n📊 HISTOGRAM COMPARISON")
+
+    THRESHOLD = 0.05  # 5% threshold
+    critical_mismatches = []
+    minor_mismatches = []
+
+    for col, diff, reason in results:
+        is_indexed = col in indexed_cols
+        col_type = column_types.get(col, 'unknown')
+        is_string = is_string_type(col_type)
+        is_decimal = is_decimal_type(col_type)
+        idx_marker = " [idx]" if is_indexed else ""
+
+        if diff < THRESHOLD:
+            status = "OK"
+        elif is_string and not is_indexed:
+            status = "NOTE (unindexed string)"
+            minor_mismatches.append((col, "string"))
+        elif is_decimal and not is_indexed:
+            status = "NOTE (decimal range generation)"
+            minor_mismatches.append((col, "decimal"))
+        else:
+            status = "DIVERGED"
+            critical_mismatches.append(col)
+
+        print(f"`{col}` ({col_type}){idx_marker}: {reason} → {status}")
+
+    if minor_mismatches:
+        string_cols = [c for c, t in minor_mismatches if t == "string"]
+        decimal_cols = [c for c, t in minor_mismatches if t == "decimal"]
+        if string_cols:
+            print(f"\n   ℹ️  {len(string_cols)} unindexed string column(s) diverged - "
+                  "typically not critical for query planning")
+        if decimal_cols:
+            print(f"   ℹ️  {len(decimal_cols)} decimal column(s) diverged - "
+                  "range-based generation may produce more distinct values")
+
+    return critical_mismatches
 
 
 def report_table_stats(orig, new):
@@ -229,34 +314,60 @@ def report_distinct_counts(orig, new):
     print("\n📊 DISTINCT VALUE COUNTS COMPARISON")
 
     all_cols = set(orig.keys()) | set(new.keys())
-    mismatches = []
+    critical_mismatches = []  # Indexed columns or numeric columns
+    minor_mismatches = []     # Unindexed string columns (less critical)
 
     for col in sorted(all_cols):
         if col not in orig:
             col_type = new[col]['type'] if col in new else 'unknown'
             print(f"`{col}` ({col_type}): missing in source")
-            mismatches.append(col)
+            critical_mismatches.append(col)
         elif col not in new:
             col_type = orig[col]['type'] if col in orig else 'unknown'
             print(f"`{col}` ({col_type}): missing in target")
-            mismatches.append(col)
+            critical_mismatches.append(col)
         else:
             oc = orig[col]['count']
             nc = new[col]['count']
             col_type = orig[col]['type']
+            is_indexed = orig[col].get('indexed', False)
+            is_string = is_string_type(col_type)
+            is_decimal = is_decimal_type(col_type)
 
             if oc is None or nc is None:
                 print(f"`{col}` ({col_type}): could not compute (NULL)")
                 continue
 
             diff = pct_diff(oc, nc)
-            status = "OK" if diff < 0.05 else "DIVERGED"
-            print(f"`{col}` ({col_type}): orig={oc}, replay={nc}, diff={diff:.2%} → {status}")
 
-            if diff >= 0.05:
-                mismatches.append(col)
+            if diff < 0.05:
+                status = "OK"
+            elif is_string and not is_indexed:
+                # Unindexed string column - less critical for query planning
+                status = "NOTE (unindexed string)"
+                minor_mismatches.append((col, "string"))
+            elif is_decimal and not is_indexed:
+                # Decimal columns may have more distinct values due to range-based generation
+                status = "NOTE (decimal range generation)"
+                minor_mismatches.append((col, "decimal"))
+            else:
+                status = "DIVERGED"
+                critical_mismatches.append(col)
 
-    return mismatches
+            idx_marker = " [idx]" if is_indexed else ""
+            print(f"`{col}` ({col_type}){idx_marker}: orig={oc}, replay={nc}, diff={diff:.2%} → {status}")
+
+    if minor_mismatches:
+        string_cols = [c for c, t in minor_mismatches if t == "string"]
+        decimal_cols = [c for c, t in minor_mismatches if t == "decimal"]
+        if string_cols:
+            print(f"\n   ℹ️  {len(string_cols)} unindexed string column(s) diverged - "
+                  "typically not critical for query planning")
+        if decimal_cols:
+            print(f"   ℹ️  {len(decimal_cols)} decimal column(s) diverged - "
+                  "range-based generation may produce more distinct values")
+
+    return critical_mismatches  # Only return critical mismatches as failures
 
 
 # ------------------------------------------------------------

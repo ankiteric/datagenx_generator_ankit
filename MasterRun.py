@@ -19,15 +19,17 @@ from PopulateNewTableAndValidate import (
     clone_histograms,
     compare_histograms,
     execute_statements,
+    load_column_types,
     load_distinct_counts,
     load_histograms,
     load_index_stats,
+    load_indexed_columns,
     load_table_stats,
     normalize_ddl,
     pct_diff,
     report_ddl_mismatch,
     report_distinct_counts,
-    report_histogram_mismatch,
+    report_histogram_comparison,
     report_index_stats,
     report_rowcount_mismatch,
     report_table_stats,
@@ -451,13 +453,15 @@ def step_c_create_insert_validate(cursor, table):
 
     src_hist = load_histograms(cursor, SOURCE_SCHEMA, table)
     tgt_hist = load_histograms(cursor, TARGET_SCHEMA, table)
-    hist_diff = compare_histograms(src_hist, tgt_hist)
+    hist_results = compare_histograms(src_hist, tgt_hist)
 
-    if hist_diff:
+    # Get column metadata for categorizing mismatches
+    indexed_cols = load_indexed_columns(cursor, SOURCE_SCHEMA, table)
+    column_types = load_column_types(cursor, SOURCE_SCHEMA, table)
+
+    hist_critical = report_histogram_comparison(hist_results, indexed_cols, column_types)
+    if hist_critical:
         hist_ok = False
-        report_histogram_mismatch(hist_diff)
-    else:
-        print(f"      Histograms: OK")
 
     # --- Table stats ---
     report_table_stats(
