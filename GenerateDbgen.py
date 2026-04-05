@@ -217,17 +217,24 @@ def string_values_to_case(values_with_counts, column_name, max_length=None):
         # Cap at max_length if provided (to handle CHAR/VARCHAR limits)
         if max_length is not None and original_len > max_length:
             original_len = max_length
-        base = f"{column_name}_{i}"
+
+        num_suffix = f"_{i}"
+        base = f"{column_name}{num_suffix}"
 
         if len(base) < original_len:
             # Pad with underscores to match original length
             synthetic_value = base + "_" * (original_len - len(base))
         elif len(base) > original_len:
-            # Truncate but try to keep the number visible
-            if original_len >= 3:
-                # Keep at least the number at the end
-                synthetic_value = base[:original_len]
+            # Truncate column name but preserve the unique number suffix
+            available_for_name = original_len - len(num_suffix)
+            if available_for_name >= 1:
+                # Keep as much of the column name as possible, plus the number
+                synthetic_value = column_name[:available_for_name] + num_suffix
+            elif original_len >= len(str(i)):
+                # No room for name, use zero-padded number
+                synthetic_value = str(i).zfill(original_len)
             else:
+                # Extreme case: truncate even the number
                 synthetic_value = str(i)[:original_len] if original_len > 0 else ""
         else:
             synthetic_value = base
@@ -446,12 +453,26 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                     ref_table, ref_col = foreign_keys[col]
                     synthetic = get_fk_range_expression(cursor, target_database, ref_table, ref_col)
 
-            # 🔴 PRIMARY KEY or AUTO_INCREMENT → rownum
+            # 🔴 PRIMARY KEY or AUTO_INCREMENT → rownum (or rownum-1 if 0-based)
             elif (
                 re.search(r"\bauto_increment\b", line, re.IGNORECASE)
                 or col in primary_key_columns
             ):
-                synthetic = "rownum"
+                # Check if source data is 0-based by looking at histogram
+                if col in histograms:
+                    min_val, _ = get_min_max_from_histogram(histograms[col])
+                    if min_val is not None:
+                        try:
+                            if int(float(min_val)) == 0:
+                                synthetic = "rownum-1"
+                            else:
+                                synthetic = "rownum"
+                        except (ValueError, TypeError):
+                            synthetic = "rownum"
+                    else:
+                        synthetic = "rownum"
+                else:
+                    synthetic = "rownum"
 
             elif col_type in CHAR_TYPES:
                 # Try to get distinct values from histogram metadata
