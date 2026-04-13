@@ -278,6 +278,10 @@ def get_date_range_expression(cursor, database, table, column, col_type):
     if min_val is None or max_val is None:
         return None
 
+    # Handle MySQL zero dates ('0000-00-00') which are invalid
+    if min_val.startswith("0000-00-00") or max_val.startswith("0000-00-00"):
+        return None
+
     # MySQL stores dates in histograms as strings in format 'YYYY-MM-DD HH:MM:SS.ffffff'
     if col_type == "date":
         # Parse date strings from histogram
@@ -647,8 +651,8 @@ if __name__ == "__main__":
     host = "localhost"
     user = "root"
     password = "newpassword"
-    database = "tpch"
-    target_database = "tpch_harsha"  # Target schema for FK range queries
+    database = "tpcds"
+    target_database = "tpcds_harsha"  # Target schema for FK range queries
 
     conn = mysql.connector.connect(
         host=host, user=user, password=password, database=database

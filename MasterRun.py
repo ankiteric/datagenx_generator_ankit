@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-MasterRun.py — End-to-end tpch data generation and validation.
+MasterRun.py — End-to-end data generation and validation.
 
 Orchestrates GenerateDbgen, dbgen binary, and PopulateNewTableAndValidate
-for every table in `tpch`, writing results into `tpch_harsha`.
+for every table in SOURCE_SCHEMA, writing results into TARGET_SCHEMA.
 """
 
 import os
@@ -41,8 +41,8 @@ from PopulateNewTableAndValidate import (
 HOST = "localhost"
 USER = "root"
 PASSWORD = "newpassword"
-SOURCE_SCHEMA = "tpch"
-TARGET_SCHEMA = "tpch_harsha"
+SOURCE_SCHEMA = "tpcds"
+TARGET_SCHEMA = "tpcds_harsha"
 
 DBGEN_BINARY = "/Users/sreeharshar/work/db/datagenx/code/dbgen/target/release/dbgen"
 DBGEN_FILES_DIR = "dbgen_files"
@@ -190,7 +190,7 @@ def build_fk_appendages(cursor, table):
     if all_pk_are_fk:
         # Composite PK where all columns are FKs (e.g., PARTSUPP)
         # Collect info for all PK+FK columns across all constraints
-        pk_fk_info = []  # [(col, ref_table, ref_col, distinct_count), ...]
+        pk_fk_info = []  # [(col, ref_table, ref_col, distinct_count, min_val), ...]
         for constraint_name, fk_cols in constraints.items():
             for col, ref_table, ref_col in fk_cols:
                 if col in pk_columns:
@@ -198,40 +198,40 @@ def build_fk_appendages(cursor, table):
                     if actual_ref is None:
                         continue
                     cursor.execute(
-                        f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                        f"SELECT COUNT(DISTINCT `{ref_col}`), MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
                     )
-                    distinct_count = cursor.fetchone()[0]
-                    pk_fk_info.append((col, actual_ref, ref_col, distinct_count))
+                    distinct_count, min_val = cursor.fetchone()
+                    min_val = min_val if min_val is not None else 0
+                    pk_fk_info.append((col, actual_ref, ref_col, distinct_count, min_val))
 
         if len(pk_fk_info) >= 2:
             # Sort by distinct count ascending (smaller domains first)
             pk_fk_info.sort(key=lambda x: x[3])
 
             # For full coverage of ALL domains:
-            # - Smaller domains: use mod(rownum-1, distinct_count)+1 to cycle
-            # - Largest domain: use div(rownum-1, rows_per_large)+1 to spread
+            # - Smaller domains: use mod(rownum-1, distinct_count)+min_val to cycle
+            # - Largest domain: use div(rownum-1, rows_per_large)+min_val to spread
             #
             # This ensures each domain gets full coverage when R >= max(Di)
 
             # All but the last (largest) use mod cycling
             divisor = 1
-            for col, ref_table, ref_col, distinct_count in pk_fk_info[:-1]:
+            for col, ref_table, ref_col, distinct_count, min_val in pk_fk_info[:-1]:
                 if divisor == 1:
-                    expr = f"mod(rownum-1, {distinct_count})+1"
+                    expr = f"mod(rownum-1, {distinct_count})+{min_val}"
                 else:
-                    expr = f"mod(div(rownum-1, {divisor}), {distinct_count})+1"
+                    expr = f"mod(div(rownum-1, {divisor}), {distinct_count})+{min_val}"
                 appendages[col] = expr
                 print(f"      FK+PK {col} -> {ref_table}.{ref_col}: "
-                      f"{distinct_count} distinct, divisor={divisor} -> {expr}")
+                      f"{distinct_count} distinct, min={min_val}, divisor={divisor} -> {expr}")
                 divisor *= distinct_count
 
-            # Largest domain uses div to ensure full coverage
-            large_col, large_ref, large_refcol, large_count = pk_fk_info[-1]
-            rows_per_large = max(1, source_row_count // large_count)
-            large_expr = f"div(rownum-1, {rows_per_large})+1"
+            # Largest domain also uses mod to stay within valid range
+            large_col, large_ref, large_refcol, large_count, large_min = pk_fk_info[-1]
+            large_expr = f"mod(div(rownum-1, {divisor}), {large_count})+{large_min}"
             appendages[large_col] = large_expr
             print(f"      FK+PK {large_col} -> {large_ref}.{large_refcol}: "
-                  f"{large_count} distinct, rows_per={rows_per_large} -> {large_expr}")
+                  f"{large_count} distinct, min={large_min}, divisor={divisor} -> {large_expr}")
 
         # Handle any remaining FK-only columns
         for constraint_name, fk_cols in constraints.items():
@@ -241,12 +241,16 @@ def build_fk_appendages(cursor, table):
                     if actual_ref is None:
                         continue
                     cursor.execute(
-                        f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                        f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
                     )
-                    distinct_count = cursor.fetchone()[0]
-                    appendages[col] = f"rand.range(1,{distinct_count + 1})"
-                    print(f"      FK {col} -> {actual_ref}.{ref_col}: "
-                          f"{distinct_count} distinct -> rand.range(1,{distinct_count + 1})")
+                    min_val, max_val = cursor.fetchone()
+                    if min_val is None or max_val is None:
+                        appendages[col] = "rand.range(0,1)"
+                        print(f"      FK {col} -> {actual_ref}.{ref_col}: empty table -> rand.range(0,1)")
+                    else:
+                        appendages[col] = f"rand.range({min_val},{max_val + 1})"
+                        print(f"      FK {col} -> {actual_ref}.{ref_col}: "
+                              f"range [{min_val}, {max_val}] -> rand.range({min_val},{max_val + 1})")
 
         return appendages
 
@@ -262,13 +266,17 @@ def build_fk_appendages(cursor, table):
                 continue
 
             cursor.execute(
-                f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
             )
-            distinct_count = cursor.fetchone()[0]
+            min_val, max_val = cursor.fetchone()
 
-            appendages[col] = f"rand.range(1,{distinct_count + 1})"
-            print(f"      FK {col} -> {actual_ref}.{ref_col}: "
-                  f"{distinct_count} distinct -> rand.range(1,{distinct_count + 1})")
+            if min_val is None or max_val is None:
+                appendages[col] = "rand.range(0,1)"
+                print(f"      FK {col} -> {actual_ref}.{ref_col}: empty table -> rand.range(0,1)")
+            else:
+                appendages[col] = f"rand.range({min_val},{max_val + 1})"
+                print(f"      FK {col} -> {actual_ref}.{ref_col}: "
+                      f"range [{min_val}, {max_val}] -> rand.range({min_val},{max_val + 1})")
 
         else:
             # Composite FK (multiple columns reference same table, e.g., LINEITEM -> PARTSUPP)
@@ -283,14 +291,15 @@ def build_fk_appendages(cursor, table):
             cursor.execute(f"SELECT COUNT(*) FROM `{TARGET_SCHEMA}`.`{actual_ref}`")
             ref_row_count = cursor.fetchone()[0]
 
-            # Get distinct counts for each column in the composite FK
-            col_info = []  # [(col, ref_col, distinct_count), ...]
+            # Get distinct counts and min values for each column in the composite FK
+            col_info = []  # [(col, ref_col, distinct_count, min_val), ...]
             for col, _, ref_col in fk_cols:
                 cursor.execute(
-                    f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                    f"SELECT COUNT(DISTINCT `{ref_col}`), MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
                 )
-                distinct_count = cursor.fetchone()[0]
-                col_info.append((col, ref_col, distinct_count))
+                distinct_count, min_val = cursor.fetchone()
+                min_val = min_val if min_val is not None else 0
+                col_info.append((col, ref_col, distinct_count, min_val))
 
             # Sort by distinct count ascending (smaller domains first)
             col_info.sort(key=lambda x: x[2])
@@ -299,28 +308,27 @@ def build_fk_appendages(cursor, table):
             # Must generate pairs that exist in the referenced table.
             # Use same formula as the referenced table, but cycle through ref_row_count.
             #
-            # - Smaller domains: mod(mod(rownum-1, ref_row_count), distinct_count)+1
-            # - Largest domain: div(mod(rownum-1, ref_row_count), rows_per_large)+1
+            # - Smaller domains: mod(mod(rownum-1, ref_row_count), distinct_count)+min_val
+            # - Largest domain: div(mod(rownum-1, ref_row_count), rows_per_large)+min_val
 
             # All but the last (largest) use mod cycling
             divisor = 1
-            for col, ref_col, distinct_count in col_info[:-1]:
+            for col, ref_col, distinct_count, min_val in col_info[:-1]:
                 if divisor == 1:
-                    expr = f"mod(mod(rownum-1, {ref_row_count}), {distinct_count})+1"
+                    expr = f"mod(mod(rownum-1, {ref_row_count}), {distinct_count})+{min_val}"
                 else:
-                    expr = f"mod(div(mod(rownum-1, {ref_row_count}), {divisor}), {distinct_count})+1"
+                    expr = f"mod(div(mod(rownum-1, {ref_row_count}), {divisor}), {distinct_count})+{min_val}"
                 appendages[col] = expr
                 print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
-                      f"cycling {ref_row_count} pairs, divisor={divisor} -> {expr}")
+                      f"cycling {ref_row_count} pairs, min={min_val}, divisor={divisor} -> {expr}")
                 divisor *= distinct_count
 
-            # Largest domain uses div to match referenced table's formula
-            large_col, large_refcol, large_count = col_info[-1]
-            rows_per_large = max(1, ref_row_count // large_count)
-            large_expr = f"div(mod(rownum-1, {ref_row_count}), {rows_per_large})+1"
+            # Largest domain also uses mod to stay within valid range
+            large_col, large_refcol, large_count, large_min = col_info[-1]
+            large_expr = f"mod(div(mod(rownum-1, {ref_row_count}), {divisor}), {large_count})+{large_min}"
             appendages[large_col] = large_expr
             print(f"      Composite FK {large_col} -> {actual_ref}.{large_refcol}: "
-                  f"cycling {ref_row_count} pairs, rows_per={rows_per_large} -> {large_expr}")
+                  f"cycling {ref_row_count} pairs, min={large_min}, divisor={divisor} -> {large_expr}")
 
     return appendages
 
@@ -518,7 +526,7 @@ def main():
     sorted_tables = topological_sort(all_tables, dependencies)
 
     print("=" * 60)
-    print("MASTER RUN — tpch -> tpch_harsha")
+    print(f"MASTER RUN — {SOURCE_SCHEMA} -> {TARGET_SCHEMA}")
     print("=" * 60)
     print(f"Tables ({len(sorted_tables)}): {' -> '.join(sorted_tables)}")
     print()
