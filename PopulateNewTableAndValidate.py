@@ -234,20 +234,20 @@ def report_histogram_mismatch(mismatches):
         print(f" - Column `{col}`: {reason}")
 
 
-def report_histogram_comparison(results, indexed_cols, column_types):
+def report_histogram_comparison(results, indexed_cols, column_types, verbose=True):
     """Report histogram comparison results.
 
     results: list of (col, diff_value, reason) from compare_histograms
     indexed_cols: set of column names that are indexed
     column_types: dict of col -> type string
+    verbose: if False, only print DIVERGED items
 
     Returns list of critical mismatches (failures).
     """
-    print("\n📊 HISTOGRAM COMPARISON")
-
     THRESHOLD = 0.05  # 5% threshold
     critical_mismatches = []
     minor_mismatches = []
+    output_lines = []
 
     for col, diff, reason in results:
         is_indexed = col in indexed_cols
@@ -268,9 +268,15 @@ def report_histogram_comparison(results, indexed_cols, column_types):
             status = "DIVERGED"
             critical_mismatches.append(col)
 
-        print(f"`{col}` ({col_type}){idx_marker}: {reason} → {status}")
+        if verbose or status == "DIVERGED":
+            output_lines.append(f"`{col}` ({col_type}){idx_marker}: {reason} → {status}")
 
-    if minor_mismatches:
+    if output_lines:
+        print("\n📊 HISTOGRAM COMPARISON")
+        for line in output_lines:
+            print(line)
+
+    if verbose and minor_mismatches:
         string_cols = [c for c, t in minor_mismatches if t == "string"]
         decimal_cols = [c for c, t in minor_mismatches if t == "decimal"]
         if string_cols:
@@ -283,48 +289,57 @@ def report_histogram_comparison(results, indexed_cols, column_types):
     return critical_mismatches
 
 
-def report_table_stats(orig, new):
+def report_table_stats(orig, new, verbose=True):
     labels = ["TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "INDEX_LENGTH"]
-    print("\n📊 TABLE STATISTICS COMPARISON")
+    output_lines = []
     for i, label in enumerate(labels):
         diff = pct_diff(orig[i], new[i])
         status = "OK" if diff < 0.10 else "DIVERGED"
-        print(f"{label:16} diff={diff:.2%} → {status}")
+        if verbose or status == "DIVERGED":
+            output_lines.append(f"{label:16} diff={diff:.2%} → {status}")
+    if output_lines:
+        print("\n📊 TABLE STATISTICS COMPARISON")
+        for line in output_lines:
+            print(line)
 
 
-def report_index_stats(orig, new):
-    print("\n📊 INDEX CARDINALITY COMPARISON")
-
+def report_index_stats(orig, new, verbose=True):
     def to_map(rows):
         return {(r[0], r[1]): r[2] for r in rows}
 
     o = to_map(orig)
     n = to_map(new)
 
+    output_lines = []
     all_keys = set(o.keys()) | set(n.keys())
     for key in sorted(all_keys):
         oc = o.get(key)
         nc = n.get(key)
         diff = pct_diff(oc, nc)
         status = "OK" if diff < 0.20 else "DIVERGED"
-        print(f"{key}: diff={diff:.2%} → {status}")
+        if verbose or status == "DIVERGED":
+            output_lines.append(f"{key}: diff={diff:.2%} → {status}")
+
+    if output_lines:
+        print("\n📊 INDEX CARDINALITY COMPARISON")
+        for line in output_lines:
+            print(line)
 
 
-def report_distinct_counts(orig, new):
-    print("\n📊 DISTINCT VALUE COUNTS COMPARISON")
-
+def report_distinct_counts(orig, new, verbose=True):
     all_cols = set(orig.keys()) | set(new.keys())
     critical_mismatches = []  # Indexed columns or numeric columns
     minor_mismatches = []     # Unindexed string columns (less critical)
+    output_lines = []
 
     for col in sorted(all_cols):
         if col not in orig:
             col_type = new[col]['type'] if col in new else 'unknown'
-            print(f"`{col}` ({col_type}): missing in source")
+            output_lines.append(f"`{col}` ({col_type}): missing in source")
             critical_mismatches.append(col)
         elif col not in new:
             col_type = orig[col]['type'] if col in orig else 'unknown'
-            print(f"`{col}` ({col_type}): missing in target")
+            output_lines.append(f"`{col}` ({col_type}): missing in target")
             critical_mismatches.append(col)
         else:
             oc = orig[col]['count']
@@ -335,7 +350,8 @@ def report_distinct_counts(orig, new):
             is_decimal = is_decimal_type(col_type)
 
             if oc is None or nc is None:
-                print(f"`{col}` ({col_type}): could not compute (NULL)")
+                if verbose:
+                    output_lines.append(f"`{col}` ({col_type}): could not compute (NULL)")
                 continue
 
             diff = pct_diff(oc, nc)
@@ -343,11 +359,9 @@ def report_distinct_counts(orig, new):
             if diff < 0.05:
                 status = "OK"
             elif is_string and not is_indexed:
-                # Unindexed string column - less critical for query planning
                 status = "NOTE (unindexed string)"
                 minor_mismatches.append((col, "string"))
             elif is_decimal and not is_indexed:
-                # Decimal columns may have more distinct values due to range-based generation
                 status = "NOTE (decimal range generation)"
                 minor_mismatches.append((col, "decimal"))
             else:
@@ -355,9 +369,15 @@ def report_distinct_counts(orig, new):
                 critical_mismatches.append(col)
 
             idx_marker = " [idx]" if is_indexed else ""
-            print(f"`{col}` ({col_type}){idx_marker}: orig={oc}, replay={nc}, diff={diff:.2%} → {status}")
+            if verbose or status == "DIVERGED":
+                output_lines.append(f"`{col}` ({col_type}){idx_marker}: orig={oc}, replay={nc}, diff={diff:.2%} → {status}")
 
-    if minor_mismatches:
+    if output_lines:
+        print("\n📊 DISTINCT VALUE COUNTS COMPARISON")
+        for line in output_lines:
+            print(line)
+
+    if verbose and minor_mismatches:
         string_cols = [c for c, t in minor_mismatches if t == "string"]
         decimal_cols = [c for c, t in minor_mismatches if t == "decimal"]
         if string_cols:

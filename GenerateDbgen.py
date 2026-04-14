@@ -24,6 +24,12 @@ YEAR = {"year"}
 # Above this threshold, fall back to random string generation.
 STRING_CARDINALITY_THRESHOLD = 1000
 
+# Synthetic base date for generating date values.
+# We use a synthetic date range to avoid exposing actual source data dates.
+# This date is arbitrary - what matters is the distribution shape, not actual values.
+SYNTHETIC_BASE_DATE = "2000-01-01"
+SYNTHETIC_BASE_DATETIME = "2000-01-01 00:00:00"
+
 
 def decode_histogram_string(raw_value):
     """Decode a string value from MySQL histogram.
@@ -95,33 +101,235 @@ def get_min_max_from_histogram(histogram):
     return min_val, max_val
 
 
-def get_fk_range_expression(cursor, target_database, ref_table, ref_col):
-    """Get min/max values from histogram metadata for the referenced column.
+def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col):
+    """Build expression for a single-column FK. Returns (expression, description).
 
-    Uses exclusive upper bound: rand.range(min, max+1) generates min to max inclusive.
+    Tries sparse approach first (for low-cardinality FKs with singleton histograms),
+    falls back to dense approach (rand.range) for high-cardinality FKs.
+
+    This is the SINGLE SOURCE OF TRUTH for FK expression generation.
+    Called by both MasterRun.py and GenerateDbgen.py.
+
+    Args:
+        cursor: MySQL cursor
+        source_db: Source schema name (for reading FK column's histogram)
+        target_db: Target schema name (for sampling values from referenced table)
+        table: Table containing the FK column
+        col: FK column name
+        ref_table: Referenced table name
+        ref_col: Referenced column name
+
+    Returns:
+        (expression, description) tuple where:
+        - expression: dbgen expression string
+        - description: human-readable description for logging
     """
+    # First, try sparse approach (for low-cardinality FKs)
+    sparse_result = _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col)
+    if sparse_result:
+        return sparse_result
+
+    # Fall back to dense approach
+    return _build_dense_fk_expression(cursor, target_db, ref_table, ref_col)
+
+
+def _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col):
+    """Try to build sparse FK expression using FK column's own histogram.
+
+    PRIVACY: This function is privacy-safe because:
+    - It uses distribution weights from source histogram (statistical pattern only)
+    - It samples PK values from TARGET schema (already synthetically generated)
+    - No actual source data values are used
+
+    Returns (expression, description) tuple if sparse approach is applicable,
+    or None if dense approach should be used instead.
+    """
+    # Get FK column's histogram from source schema
     cursor.execute("""
         SELECT HISTOGRAM
         FROM information_schema.column_statistics
         WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
-    """, (target_database, ref_table, ref_col))
+    """, (source_db, table, col))
 
     result = cursor.fetchone()
     if not result or not result[0]:
-        return "rand.range(0,1)"
+        return None  # No histogram - use dense approach
 
     histogram = json.loads(result[0])
-    min_val, max_val = get_min_max_from_histogram(histogram)
+    hist_type = histogram.get("histogram-type")
+    buckets = histogram.get("buckets", [])
+
+    if not buckets:
+        return None
+
+    # Get referenced table size to determine if FK has low cardinality
+    cursor.execute(f"SELECT COUNT(*) FROM `{target_db}`.`{ref_table}`")
+    ref_table_size = cursor.fetchone()[0]
+
+    if hist_type == "singleton":
+        # Singleton histogram - use sparse approach directly
+        n_distinct = len(buckets)
+        return _build_singleton_fk_expression(
+            cursor, target_db, ref_table, ref_col, buckets, n_distinct
+        )
+
+    elif hist_type == "equi-height":
+        # Equi-height histogram - check if FK has low cardinality relative to referenced table
+        #
+        # IMPORTANT: Histogram's estimated_distinct (sum of bucket[3]) is unreliable.
+        # MySQL samples during ANALYZE TABLE, so estimates can be off by 10-50x.
+        # Example: ss_item_sk histogram claims ~500 distinct, actual is 18,000.
+        #
+        # We query the ACTUAL distinct count from source instead.
+        # COUNT(DISTINCT) doesn't expose values - it's just a statistical count.
+        # See CLAUDE.md "Why We Use COUNT(DISTINCT) Instead of Histogram Estimates"
+
+        cursor.execute(f"""
+            SELECT COUNT(DISTINCT `{col}`) FROM `{source_db}`.`{table}`
+        """)
+        actual_distinct = cursor.fetchone()[0]
+
+        # Calculate coverage ratio using ACTUAL distinct count
+        coverage_ratio = actual_distinct / ref_table_size if ref_table_size > 0 else 1.0
+        n_buckets = len(buckets)
+
+        # Use equi-height sparse when FK uses a small subset of referenced table:
+        # 1. Coverage < 20% (FK uses less than 20% of referenced table's values)
+        # 2. At least 10 histogram buckets (enough granularity for weighted distribution)
+        # 3. At least 100 actual distinct values (meaningful cardinality)
+        if (coverage_ratio < 0.20 and n_buckets >= 10 and actual_distinct >= 100):
+            return _build_equiheight_fk_expression(
+                cursor, target_db, ref_table, ref_col, buckets, actual_distinct, ref_table_size
+            )
+
+    return None  # High cardinality - use dense approach
+
+
+def _build_singleton_fk_expression(cursor, target_db, ref_table, ref_col, buckets, n_distinct):
+    """Build FK expression for singleton histogram (low cardinality).
+
+    Samples N evenly-spaced values from the target table and assigns
+    weights from the source histogram.
+    """
+    # Get N evenly-spaced values from replay's referenced table
+    cursor.execute(f"""
+        SELECT `{ref_col}` FROM `{target_db}`.`{ref_table}`
+        ORDER BY `{ref_col}`
+    """)
+    all_ref_values = [row[0] for row in cursor.fetchall()]
+
+    if not all_ref_values or len(all_ref_values) < n_distinct:
+        return None  # Not enough values in referenced table
+
+    # Sample evenly spaced values to get good coverage
+    if len(all_ref_values) == n_distinct:
+        sampled_values = all_ref_values
+    else:
+        step = len(all_ref_values) / n_distinct
+        sampled_values = [all_ref_values[int(i * step)] for i in range(n_distinct)]
+
+    # Extract frequency weights from original histogram
+    weights = []
+    prev_cum = 0.0
+    for bucket in buckets:
+        cum_freq = bucket[1]
+        weights.append(round(cum_freq - prev_cum, 6))
+        prev_cum = cum_freq
+
+    # Generate weighted CASE expression
+    case_lines = [f"when {i+1} then {val}" for i, val in enumerate(sampled_values)]
+    expression = f"""case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
+    end"""
+
+    description = f"sparse ({n_distinct} distinct values, weighted)"
+    return (expression, description)
+
+
+def _build_equiheight_fk_expression(cursor, target_db, ref_table, ref_col, buckets, distinct_count, ref_table_size):
+    """Build FK expression for equi-height histogram with low cardinality.
+
+    For FK columns that only use a small subset of the referenced table's values,
+    we generate weighted ranges based on the histogram buckets.
+
+    Args:
+        distinct_count: Actual distinct count from source (via COUNT(DISTINCT)),
+                       NOT the unreliable histogram estimate.
+
+    PRIVACY: Uses bucket weights and synthetic range positions, not actual values.
+    """
+    # Get min/max from target table to calculate synthetic ranges
+    cursor.execute(f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{target_db}`.`{ref_table}`")
+    min_val, max_val = cursor.fetchone()
 
     if min_val is None or max_val is None:
-        return "rand.range(0,1)"
+        return None
 
-    # Convert to int (histogram stores numeric values as floats/strings)
-    min_val = int(float(min_val))
-    max_val = int(float(max_val))
+    # Calculate the proportion of the referenced table that FK uses
+    coverage_ratio = distinct_count / ref_table_size
 
-    # rand.range uses exclusive upper bound, so add 1 to max
-    return f"rand.range({min_val},{max_val + 1})"
+    # Extract bucket weights and relative positions
+    weights = []
+    prev_cum = 0.0
+    for bucket in buckets:
+        cum_freq = bucket[2]  # equi-height: [min, max, cum_freq, num_distinct]
+        weights.append(round(cum_freq - prev_cum, 6))
+        prev_cum = cum_freq
+
+    n_buckets = len(buckets)
+
+    # Generate synthetic ranges within the target table's value space
+    # Scale ranges proportionally to coverage_ratio
+    total_range = max_val - min_val + 1
+    scaled_range = int(total_range * coverage_ratio)
+    if scaled_range < n_buckets:
+        scaled_range = n_buckets  # At least one value per bucket
+
+    # Distribute values across buckets
+    values_per_bucket = max(1, scaled_range // n_buckets)
+
+    case_lines = []
+    for i in range(n_buckets):
+        bucket_start = min_val + (i * values_per_bucket)
+        bucket_end = min_val + ((i + 1) * values_per_bucket) - 1
+        if bucket_end > max_val:
+            bucket_end = max_val
+        if bucket_start > max_val:
+            bucket_start = max_val
+
+        if bucket_start == bucket_end:
+            case_lines.append(f"when {i+1} then {bucket_start}")
+        else:
+            span = bucket_end - bucket_start + 1
+            case_lines.append(f"when {i+1} then rand.range(0,{span})+{bucket_start}")
+
+    expression = f"""case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
+    end"""
+
+    description = f"equi-height sparse ({distinct_count} distinct, {coverage_ratio:.1%} coverage)"
+    return (expression, description)
+
+
+def _build_dense_fk_expression(cursor, target_db, ref_table, ref_col):
+    """Build dense FK expression using min/max range from referenced table.
+
+    PRIVACY: This function is privacy-safe because it reads min/max from
+    the TARGET schema (synthetically generated PK values), not from source.
+
+    Returns (expression, description) tuple.
+    """
+    cursor.execute(
+        f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{target_db}`.`{ref_table}`"
+    )
+    min_val, max_val = cursor.fetchone()
+
+    if min_val is None or max_val is None:
+        return ("rand.range(0,1)", "empty table")
+
+    expression = f"rand.range({min_val},{max_val + 1})"
+    description = f"range [{min_val}, {max_val}]"
+    return (expression, description)
 
 
 def text_appendage():
@@ -250,17 +458,86 @@ def string_values_to_case(values_with_counts, column_name, max_length=None):
     end"""
 
 
-def get_date_range_expression(cursor, database, table, column, col_type):
-    """Get min/max values from histogram metadata for DATE/DATETIME/TIMESTAMP columns
-    and generate a dbgen expression that produces random values within that range.
+def _try_sparse_date_expression(cursor, database, table, column, col_type):
+    """Try to build sparse date expression using singleton histogram.
 
-    For DATE columns, generates:
-        TIMESTAMP 'YYYY-MM-DD' + INTERVAL rand.range(0, day_span) DAY
+    For date columns with singleton histograms (low cardinality), generates
+    a weighted CASE expression with SYNTHETIC date values.
 
-    For DATETIME/TIMESTAMP columns, generates:
-        TIMESTAMP 'YYYY-MM-DD HH:MM:SS' + INTERVAL rand.range(0, second_span) SECOND
+    PRIVACY: We use synthetic sequential dates (2000-01-01, 2000-01-02, ...)
+    instead of actual source dates to avoid data leakage. Only the distribution
+    weights are preserved from the source histogram.
 
-    Returns None if histogram doesn't exist for the column.
+    Returns expression string if sparse approach is applicable, None otherwise.
+    """
+    cursor.execute("""
+        SELECT HISTOGRAM
+        FROM information_schema.column_statistics
+        WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+    """, (database, table, column))
+
+    result = cursor.fetchone()
+    if not result or not result[0]:
+        return None
+
+    histogram = json.loads(result[0])
+    hist_type = histogram.get("histogram-type")
+    buckets = histogram.get("buckets", [])
+
+    if not buckets or hist_type != "singleton":
+        return None
+
+    # Extract weights from histogram (distribution shape - OK to use)
+    # We DO NOT use actual date values from histogram (would be data leak)
+    weights = []
+    has_null = False
+    prev_cum = 0.0
+
+    for bucket in buckets:
+        raw_value = bucket[0]
+        cum_freq = bucket[1]
+        weights.append(round(cum_freq - prev_cum, 6))
+        prev_cum = cum_freq
+
+        # Check if any bucket represents zero date (which becomes NULL)
+        if isinstance(raw_value, str) and raw_value.startswith("0000-00-00"):
+            has_null = True
+
+    # Generate SYNTHETIC date values - sequential from base date
+    # We use synthetic dates to preserve privacy while maintaining distribution shape
+    n_distinct = len(buckets)
+    date_values = []
+
+    for i in range(n_distinct):
+        if has_null and i == 0:
+            # If source had zero dates, generate NULL for first bucket
+            date_values.append("NULL")
+        else:
+            # Generate synthetic sequential dates
+            if col_type == "date":
+                # TIMESTAMP 'YYYY-MM-DD HH:MM:SS' + INTERVAL N DAY
+                date_values.append(f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL {i} DAY")
+            elif col_type in ("datetime", "timestamp"):
+                # For datetime, space values by 1 hour each
+                date_values.append(f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {i} HOUR")
+            else:
+                return None  # TIME columns use dense approach
+
+    # Generate weighted CASE expression
+    case_lines = [f"when {i+1} then {val}" for i, val in enumerate(date_values)]
+
+    return f"""case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
+    end"""
+
+
+def _build_dense_date_expression(cursor, database, table, column, col_type):
+    """Build dense date expression using calculated span from histogram.
+
+    PRIVACY: We use a synthetic base date and only extract the SPAN (range size)
+    from the histogram, not the actual min/max dates. This avoids data leakage.
+
+    Returns expression string or None if histogram doesn't exist.
     """
     cursor.execute("""
         SELECT HISTOGRAM
@@ -278,31 +555,29 @@ def get_date_range_expression(cursor, database, table, column, col_type):
     if min_val is None or max_val is None:
         return None
 
-    # Handle MySQL zero dates ('0000-00-00') which are invalid
+    # Handle MySQL zero dates - skip range approach if present
     if min_val.startswith("0000-00-00") or max_val.startswith("0000-00-00"):
         return None
 
-    # MySQL stores dates in histograms as strings in format 'YYYY-MM-DD HH:MM:SS.ffffff'
+    # Calculate SPAN only - we don't use actual min/max values as base
+    # Instead, we use synthetic base date + span for privacy
     if col_type == "date":
-        # Parse date strings from histogram
         min_date = datetime.strptime(min_val[:10], "%Y-%m-%d").date()
         max_date = datetime.strptime(max_val[:10], "%Y-%m-%d").date()
-        base_date = min_date.strftime("%Y-%m-%d 00:00:00")
         day_span = (max_date - min_date).days
-        return f"TIMESTAMP '{base_date}' + INTERVAL rand.range(0, {day_span}) DAY"
+        # Use synthetic base date, not actual min_date
+        return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL rand.range(0, {day_span + 1}) DAY"
 
     elif col_type in ("datetime", "timestamp"):
-        # Parse datetime strings from histogram (handle optional microseconds)
         fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in min_val else "%Y-%m-%d %H:%M:%S"
         min_ts = datetime.strptime(min_val, fmt)
         fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in max_val else "%Y-%m-%d %H:%M:%S"
         max_ts = datetime.strptime(max_val, fmt)
-        base_ts = min_ts.strftime("%Y-%m-%d %H:%M:%S")
         second_span = int((max_ts - min_ts).total_seconds())
-        return f"TIMESTAMP '{base_ts}' + INTERVAL rand.range(0, {second_span}) SECOND"
+        # Use synthetic base datetime, not actual min_ts
+        return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL rand.range(0, {second_span + 1}) SECOND"
 
     elif col_type == "time":
-        # TIME is stored as 'HH:MM:SS' or 'HH:MM:SS.ffffff'
         def parse_time_to_secs(t):
             parts = t.split(":")
             h, m = int(parts[0]), int(parts[1])
@@ -311,12 +586,39 @@ def get_date_range_expression(cursor, database, table, column, col_type):
 
         min_secs = parse_time_to_secs(min_val)
         max_secs = parse_time_to_secs(max_val)
-        return f"INTERVAL rand.range({min_secs}, {max_secs}) SECOND"
+        # For TIME, the span is what matters, not actual times
+        # Use span from 0 (midnight) for privacy
+        time_span = max_secs - min_secs
+        return f"INTERVAL rand.range(0, {time_span + 1}) SECOND"
 
     return None
 
 
+def get_date_range_expression(cursor, database, table, column, col_type):
+    """Get expression for DATE/DATETIME/TIMESTAMP columns.
+
+    Tries sparse approach first (for singleton histograms with few distinct values),
+    falls back to dense range approach for high-cardinality date columns.
+    """
+    # Try sparse approach first
+    sparse_expr = _try_sparse_date_expression(cursor, database, table, column, col_type)
+    if sparse_expr:
+        return sparse_expr
+
+    # Fall back to dense range approach
+    return _build_dense_date_expression(cursor, database, table, column, col_type)
+
+
 def histogram_to_case(hist, ddl_line):
+    """Generate weighted CASE expression for numeric columns using SYNTHETIC values.
+
+    PRIVACY: We use synthetic sequential values instead of actual numeric values
+    from the histogram. Only the distribution weights and relative range sizes
+    are preserved. This avoids data leakage.
+
+    For singleton histograms: Generate values 1, 2, 3, ... (or scaled for decimals)
+    For equi-height histograms: Generate synthetic ranges with same relative spans
+    """
     buckets = hist.get("buckets", [])
     if not buckets:
         return ""
@@ -335,36 +637,53 @@ def histogram_to_case(hist, ddl_line):
     )
     scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
 
-    weights, ranges = [], []
+    # Extract weights (distribution shape - OK to use)
+    weights = []
     prev = 0.0
-
     for b in buckets:
         cumulative = b[-2] if hist_type == "equi-height" else b[1]
         weights.append(round(cumulative - prev, 5))
         prev = cumulative
 
-    for b in buckets:
-        if hist_type == "singleton":
-            v = int(round(float(b[0]) * scale))
-            ranges.append((v, v))
-        else:
-            ranges.append((
-                int(round(float(b[0]) * scale)),
-                int(round(float(b[1]) * scale))
-            ))
-
+    # Generate SYNTHETIC values/ranges
+    # We preserve: number of buckets, weights, relative range sizes
+    # We DO NOT use: actual numeric values from source data
     case_lines = []
-    for i, (lo, hi) in enumerate(ranges, start=1):
-        if lo == hi:
-            case_lines.append(f"when {i} then {lo / scale}")
-        else:
-            span = hi - lo
+
+    if hist_type == "singleton":
+        # For singleton: generate synthetic sequential values
+        # Use simple sequential integers (or scaled for decimals)
+        for i in range(1, len(buckets) + 1):
+            synthetic_val = i / scale if scale > 1 else float(i)
+            case_lines.append(f"when {i} then {synthetic_val}")
+    else:
+        # For equi-height: generate synthetic ranges with same relative spans
+        # Calculate relative span sizes from original histogram
+        original_spans = []
+        for b in buckets:
+            lo = float(b[0])
+            hi = float(b[1])
+            original_spans.append(hi - lo)
+
+        # Normalize spans to generate synthetic CONTIGUOUS ranges starting from 0
+        # We preserve the relative span sizes but not actual values
+        # IMPORTANT: Ranges must be contiguous (no gaps) to avoid doubling distinct count
+        synthetic_start = 0
+        for i, span in enumerate(original_spans, start=1):
+            # Use relative span (normalized to reasonable range)
+            # For privacy, we scale spans to start from 0
+            synthetic_lo = synthetic_start
+            synthetic_hi = synthetic_start + max(1, int(span * scale))
+
+            span_size = synthetic_hi - synthetic_lo
             if scale == 1:
-                case_lines.append(f"when {i} then rand.range(0,{span})+{lo}")
+                case_lines.append(f"when {i} then rand.range(0,{span_size + 1})+{synthetic_lo}")
             else:
                 case_lines.append(
-                    f"when {i} then rand.range(0,{span})/{scale}+{lo/scale}"
+                    f"when {i} then rand.range(0,{span_size + 1})/{scale}+{synthetic_lo/scale}"
                 )
+            # Move to next range WITHOUT gap (contiguous ranges)
+            synthetic_start = synthetic_hi
 
     return f"""case rand.weighted(array[{','.join(map(str, weights))}])
     {' '.join(case_lines)}
@@ -449,34 +768,61 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             col_type = column_types.get(col)
             synthetic = ""
 
-            # 🔴 FOREIGN KEY → get range from histogram metadata
+            # 🔴 FOREIGN KEY → use sparse or dense approach based on histogram type
             if col in foreign_keys:
                 if col in generated_appendages:
                     synthetic = generated_appendages[col]
                 else:
                     ref_table, ref_col = foreign_keys[col]
-                    synthetic = get_fk_range_expression(cursor, target_database, ref_table, ref_col)
+                    # Use unified FK expression builder
+                    synthetic, _ = build_single_fk_expression(
+                        cursor, database, target_database, table, col, ref_table, ref_col
+                    )
 
-            # 🔴 PRIMARY KEY or AUTO_INCREMENT → rownum (or rownum-1 if 0-based)
+            # 🔴 PRIMARY KEY or AUTO_INCREMENT
             elif (
                 re.search(r"\bauto_increment\b", line, re.IGNORECASE)
                 or col in primary_key_columns
             ):
-                # Check if source data is 0-based by looking at histogram
-                if col in histograms:
-                    min_val, _ = get_min_max_from_histogram(histograms[col])
-                    if min_val is not None:
-                        try:
-                            if int(float(min_val)) == 0:
-                                synthetic = "rownum-1"
-                            else:
-                                synthetic = "rownum"
-                        except (ValueError, TypeError):
-                            synthetic = "rownum"
+                is_auto_increment = re.search(r"\bauto_increment\b", line, re.IGNORECASE)
+                is_composite_pk = len(primary_key_columns) > 1
+                is_fk = col in foreign_keys
+
+                # For composite PK columns that are NOT FKs (e.g., ticket_number, order_number),
+                # we need to generate repeating values to match source cardinality.
+                # Example: ss_ticket_number has 75,807 distinct values across 799,666 rows,
+                # meaning each ticket appears ~10 times (multiple items per transaction).
+                if is_composite_pk and not is_fk and not is_auto_increment:
+                    # Query actual distinct count from source
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`)
+                        FROM `{database}`.`{table}`
+                    """)
+                    distinct_count, min_val = cursor.fetchone()
+
+                    if distinct_count and distinct_count > 0:
+                        min_val = min_val if min_val is not None else 1
+                        # Generate cycling values: 1,2,3,...,N,1,2,3,...,N,...
+                        synthetic = f"mod(rownum-1, {distinct_count}) + {min_val}"
                     else:
                         synthetic = "rownum"
                 else:
-                    synthetic = "rownum"
+                    # Single-column PK or AUTO_INCREMENT → unique per row
+                    # Check if source data is 0-based by looking at histogram
+                    if col in histograms:
+                        min_val, _ = get_min_max_from_histogram(histograms[col])
+                        if min_val is not None:
+                            try:
+                                if int(float(min_val)) == 0:
+                                    synthetic = "rownum-1"
+                                else:
+                                    synthetic = "rownum"
+                            except (ValueError, TypeError):
+                                synthetic = "rownum"
+                        else:
+                            synthetic = "rownum"
+                    else:
+                        synthetic = "rownum"
 
             elif col_type in CHAR_TYPES:
                 # Try to get distinct values from histogram metadata

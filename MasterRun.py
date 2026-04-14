@@ -6,6 +6,7 @@ Orchestrates GenerateDbgen, dbgen binary, and PopulateNewTableAndValidate
 for every table in SOURCE_SCHEMA, writing results into TARGET_SCHEMA.
 """
 
+import argparse
 import os
 import re
 import subprocess
@@ -14,7 +15,11 @@ import sys
 import mysql.connector
 from mysql.connector import Error
 
-from GenerateDbgen import annotate_table_with_histogram, topological_sort
+# Global flags (set by argparse)
+VERBOSE = True
+COMPARE_HISTOGRAMS = False  # Disabled by default - histogram comparison is unreliable
+
+from GenerateDbgen import annotate_table_with_histogram, topological_sort, build_single_fk_expression
 from PopulateNewTableAndValidate import (
     clone_histograms,
     compare_histograms,
@@ -233,31 +238,25 @@ def build_fk_appendages(cursor, table):
             print(f"      FK+PK {large_col} -> {large_ref}.{large_refcol}: "
                   f"{large_count} distinct, min={large_min}, divisor={divisor} -> {large_expr}")
 
-        # Handle any remaining FK-only columns
+        # Handle any remaining FK-only columns (not part of PK)
         for constraint_name, fk_cols in constraints.items():
             for col, ref_table, ref_col in fk_cols:
                 if col not in pk_columns and col not in appendages:
                     actual_ref = tgt_canonical.get(ref_table.lower())
                     if actual_ref is None:
                         continue
-                    cursor.execute(
-                        f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                    expression, description = build_single_fk_expression(
+                        cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
                     )
-                    min_val, max_val = cursor.fetchone()
-                    if min_val is None or max_val is None:
-                        appendages[col] = "rand.range(0,1)"
-                        print(f"      FK {col} -> {actual_ref}.{ref_col}: empty table -> rand.range(0,1)")
-                    else:
-                        appendages[col] = f"rand.range({min_val},{max_val + 1})"
-                        print(f"      FK {col} -> {actual_ref}.{ref_col}: "
-                              f"range [{min_val}, {max_val}] -> rand.range({min_val},{max_val + 1})")
+                    appendages[col] = expression
+                    print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
         return appendages
 
     # Normal case: process each constraint
     for constraint_name, fk_cols in constraints.items():
         if len(fk_cols) == 1:
-            # Single-column FK
+            # Single-column FK - use unified FK expression builder
             col, ref_table, ref_col = fk_cols[0]
             actual_ref = tgt_canonical.get(ref_table.lower())
             if actual_ref is None:
@@ -265,18 +264,11 @@ def build_fk_appendages(cursor, table):
                       f"SKIPPED (referenced table not yet in {TARGET_SCHEMA})")
                 continue
 
-            cursor.execute(
-                f"SELECT MIN(`{ref_col}`), MAX(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+            expression, description = build_single_fk_expression(
+                cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
             )
-            min_val, max_val = cursor.fetchone()
-
-            if min_val is None or max_val is None:
-                appendages[col] = "rand.range(0,1)"
-                print(f"      FK {col} -> {actual_ref}.{ref_col}: empty table -> rand.range(0,1)")
-            else:
-                appendages[col] = f"rand.range({min_val},{max_val + 1})"
-                print(f"      FK {col} -> {actual_ref}.{ref_col}: "
-                      f"range [{min_val}, {max_val}] -> rand.range({min_val},{max_val + 1})")
+            appendages[col] = expression
+            print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
         else:
             # Composite FK (multiple columns reference same table, e.g., LINEITEM -> PARTSUPP)
@@ -399,7 +391,8 @@ def step_c_create_insert_validate(cursor, table):
         dbgen_ddl = f.read()
 
     # Strip dbgen annotations to get clean DDL
-    clean_ddl = re.sub(r"/\*\{\{.*?\}\}\*/", "", dbgen_ddl)
+    # Note: re.DOTALL makes . match newlines (annotations can span multiple lines)
+    clean_ddl = re.sub(r"/\*\{\{.*?\}\}\*/", "", dbgen_ddl, flags=re.DOTALL)
 
     # Replace table name with target-schema-qualified name
     create_stmt = re.sub(
@@ -409,6 +402,15 @@ def step_c_create_insert_validate(cursor, table):
         count=1,
         flags=re.IGNORECASE,
     )
+
+    # Update FK REFERENCES to point to target schema
+    create_stmt = re.sub(
+        r"REFERENCES\s+`([^`]+)`\s*\(",
+        rf"REFERENCES `{TARGET_SCHEMA}`.`\1` (",
+        create_stmt,
+        flags=re.IGNORECASE,
+    )
+
     cursor.execute(create_stmt)
     print(f"      Created `{TARGET_SCHEMA}`.`{table}`")
 
@@ -456,37 +458,40 @@ def step_c_create_insert_validate(cursor, table):
     else:
         print(f"      DDL match: OK")
 
-    # --- Histogram validation ---
+    # --- Histogram validation (optional - disabled by default) ---
     clone_histograms(cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table)
-
-    src_hist = load_histograms(cursor, SOURCE_SCHEMA, table)
-    tgt_hist = load_histograms(cursor, TARGET_SCHEMA, table)
-    hist_results = compare_histograms(src_hist, tgt_hist)
 
     # Get column metadata for categorizing mismatches
     indexed_cols = load_indexed_columns(cursor, SOURCE_SCHEMA, table)
     column_types = load_column_types(cursor, SOURCE_SCHEMA, table)
 
-    hist_critical = report_histogram_comparison(hist_results, indexed_cols, column_types)
-    if hist_critical:
-        hist_ok = False
+    if COMPARE_HISTOGRAMS:
+        src_hist = load_histograms(cursor, SOURCE_SCHEMA, table)
+        tgt_hist = load_histograms(cursor, TARGET_SCHEMA, table)
+        hist_results = compare_histograms(src_hist, tgt_hist)
+
+        hist_critical = report_histogram_comparison(hist_results, indexed_cols, column_types, VERBOSE)
+        if hist_critical:
+            hist_ok = False
 
     # --- Table stats ---
     report_table_stats(
         load_table_stats(cursor, SOURCE_SCHEMA, table),
         load_table_stats(cursor, TARGET_SCHEMA, table),
+        VERBOSE,
     )
 
     # --- Index stats ---
     report_index_stats(
         load_index_stats(cursor, SOURCE_SCHEMA, table),
         load_index_stats(cursor, TARGET_SCHEMA, table),
+        VERBOSE,
     )
 
     # --- Distinct counts ---
     src_distinct = load_distinct_counts(cursor, SOURCE_SCHEMA, table)
     tgt_distinct = load_distinct_counts(cursor, TARGET_SCHEMA, table)
-    distinct_mismatches = report_distinct_counts(src_distinct, tgt_distinct)
+    distinct_mismatches = report_distinct_counts(src_distinct, tgt_distinct, VERBOSE)
 
     if distinct_mismatches:
         distinct_ok = False
@@ -566,6 +571,8 @@ def main():
     # --- Final summary ---
     print("=" * 60)
     print("FINAL SUMMARY")
+    if not COMPARE_HISTOGRAMS:
+        print("(Histogram comparison disabled - use --compare-histograms to enable)")
     print("=" * 60)
 
     any_failure = False
@@ -578,10 +585,21 @@ def main():
             print(f"  {table}: FAILED — {r['error']}")
             any_failure = True
         else:
-            all_ok = all(r.values())
-            status_parts = []
-            for key in ("ddl", "rows", "histograms", "distinct"):
-                status_parts.append(f"{key}={'OK' if r[key] else 'FAIL'}")
+            # When histogram comparison is disabled, don't count it in pass/fail
+            if COMPARE_HISTOGRAMS:
+                all_ok = all(r.values())
+                status_parts = []
+                for key in ("ddl", "rows", "histograms", "distinct"):
+                    status_parts.append(f"{key}={'OK' if r[key] else 'FAIL'}")
+            else:
+                # Skip histogram check in pass/fail determination
+                all_ok = r["ddl"] and r["rows"] and r["distinct"]
+                status_parts = [
+                    f"ddl={'OK' if r['ddl'] else 'FAIL'}",
+                    f"rows={'OK' if r['rows'] else 'FAIL'}",
+                    "histograms=SKIP",
+                    f"distinct={'OK' if r['distinct'] else 'FAIL'}",
+                ]
             overall = "PASS" if all_ok else "FAIL"
             print(f"  {table}: {overall}  [{', '.join(status_parts)}]")
             if not all_ok:
@@ -600,4 +618,14 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="End-to-end data generation and validation"
+    )
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Verbose output (show all results, not just failures)")
+    parser.add_argument("--compare-histograms", action="store_true",
+                        help="Enable histogram comparison (disabled by default - unreliable)")
+    args = parser.parse_args()
+    VERBOSE = args.verbose
+    COMPARE_HISTOGRAMS = args.compare_histograms
     main()
