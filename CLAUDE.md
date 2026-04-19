@@ -98,6 +98,8 @@ Three approaches for FK columns (determined by `build_single_fk_expression()` in
 
 **Key decision logic**: Uses `COUNT(DISTINCT col)` from source (actual count) rather than histogram estimates, because histogram `num_distinct` can be off by 10-50x due to sampling. See "Why We Use COUNT(DISTINCT)" section above.
 
+**Important**: We only treat columns as FKs if they are declared in the DDL. We do not infer FK relationships based on naming conventions (e.g., columns ending in `_sk` or `_id`).
+
 ## Workflow
 
 1. **Extract metadata** from source schema (MySQL `information_schema.column_statistics`)
@@ -186,6 +188,62 @@ For FK generation decisions, we query `COUNT(DISTINCT column)` from the source t
 
 This is consistent with our privacy requirement: we use **statistical patterns** (counts, distributions) but never actual data values.
 
+## Histogram Sampling Requirement
+
+MySQL histograms use **sampling** when data exceeds `histogram_generation_max_mem_size` (default 20MB). This causes `bucket[3]` (num_distinct) values to be inaccurate estimates.
+
+**MasterRun.py automatically regenerates histograms** at startup with:
+- `histogram_generation_max_mem_size = 500MB`
+- Verifies `sampling_rate = 1.0` for all tables
+
+To check sampling rates manually:
+```sql
+SELECT TABLE_NAME, COLUMN_NAME, HISTOGRAM->>'$."sampling-rate"' AS sampling_rate
+FROM information_schema.COLUMN_STATISTICS
+WHERE SCHEMA_NAME = 'tpcds'
+ORDER BY sampling_rate;
+```
+
+If `sampling_rate < 1.0`, the histogram data is unreliable.
+
+## Understanding histogram_to_case()
+
+The `histogram_to_case()` function in `GenerateDbgen.py` generates CASE expressions for numeric columns based on MySQL histograms.
+
+### MySQL Equi-height Histogram Bucket Format
+
+Each bucket is an array: `[lo, hi, cumulative_freq, num_distinct]`
+- `lo`: Lower bound of the bucket range
+- `hi`: Upper bound of the bucket range
+- `cumulative_freq`: Cumulative frequency (0.0 to 1.0)
+- `num_distinct`: **Estimated distinct values in this bucket** (bucket[3])
+
+### Critical Distinction: Span vs Distinct Count
+
+For sparse data (e.g., brand IDs scattered across a large numeric range):
+- **span = hi - lo** → The VALUE RANGE (can be very large)
+- **num_distinct = bucket[3]** → Actual distinct count (much smaller)
+
+Example: Brand IDs 1001000-9001000 with only 949 distinct values
+- span = 8,000,000 (value range)
+- num_distinct = 949 (actual count)
+
+Using span instead of num_distinct causes massive over-generation of distinct values.
+
+### Bugs Fixed
+
+1. **Overlapping ranges**: When generating synthetic ranges, consecutive buckets overlapped
+   - Fix: Changed `synthetic_start = synthetic_hi` to `synthetic_start = synthetic_hi + 1`
+
+2. **span=0 generating 2 values**: For single-value buckets, `max(1, 0) = 1` caused `rand.range(0, 2)` to generate {0, 1}
+   - Fix: Special case for span=0 to generate exactly 1 value (no rand.range)
+
+3. **Using span instead of num_distinct** (PENDING): For equi-height histograms with sparse data, must use `bucket[3]` (num_distinct) not `hi - lo`
+
+### Validation Alignment
+
+Validation compares **index cardinality** (from `SHOW INDEX`) which reflects true distinct counts. The generation logic must use the same source of truth (bucket[3] or COUNT(DISTINCT)) to match validation results.
+
 ## Known Issues
 
 ### FK Column Divergence (e.g., `web_close_date_sk`)
@@ -198,9 +256,27 @@ Foreign key columns use `rand.range(min, max+1)` which generates **uniform distr
 
 Columns in composite PKs (but not FKs) like `ss_ticket_number` and `cs_order_number` now use:
 ```
-mod(rownum-1, distinct_count) + min_val
+div(rownum-1, rows_per_value) + min_val
 ```
-This generates cycling values that match the source's distinct count. For example, if source has 75,807 distinct ticket numbers across 799,666 rows, we generate values 1-75,807 that repeat ~10 times each.
+where `rows_per_value = total_rows / distinct_count`.
+
+This generates **grouped** values (not cycling) to avoid duplicate PK combinations:
+- `div()` groups: 1,1,1,1,1,2,2,2,2,2,3,3,3,... (consecutive rows share same value)
+- `mod()` cycles: 1,2,3,4,5,1,2,3,4,5,1,2,... (would cause duplicates with random FK column)
+
+For example, with 75,807 distinct tickets across 799,666 rows (10 items/ticket):
+`div(rownum-1, 10) + 1` → rows 1-10 get ticket 1, rows 11-20 get ticket 2, etc.
+
+### Composite FK+PK Cardinality (FIXED)
+
+When ALL columns of a composite PK are also FKs (e.g., `inventory` table), we use an odometer pattern.
+The key fix: divisors must be based on **source distinct counts**, not reference table sizes.
+
+See `COMPOSITE_FK_PK_CARDINALITY.md` for full explanation.
+
+**Example**: `inventory.inv_date_sk` (PK + FK to date_dim)
+- Old approach: divisor = 90,000 (product of other ref tables) → only 131 dates generated
+- Fixed approach: divisor = 11,745,000 / 261 ≈ 45,000 → all 261 dates generated
 
 ## Code Maintenance Guidelines
 

@@ -104,8 +104,10 @@ def get_min_max_from_histogram(histogram):
 def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col):
     """Build expression for a single-column FK. Returns (expression, description).
 
-    Tries sparse approach first (for low-cardinality FKs with singleton histograms),
-    falls back to dense approach (rand.range) for high-cardinality FKs.
+    Three approaches based on coverage (actual_distinct / ref_table_size):
+    1. Sparse weighted (<20%): Weighted CASE with sampled values - preserves distribution
+    2. Moderate cycling (20-80%): mod() cycling - matches exact distinct count
+    3. Dense random (>=80%): rand.range() - full coverage
 
     This is the SINGLE SOURCE OF TRUTH for FK expression generation.
     Called by both MasterRun.py and GenerateDbgen.py.
@@ -124,12 +126,54 @@ def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_tab
         - expression: dbgen expression string
         - description: human-readable description for logging
     """
-    # First, try sparse approach (for low-cardinality FKs)
-    sparse_result = _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col)
-    if sparse_result:
-        return sparse_result
+    # Get actual distinct count and row count from source (privacy-safe: just counts)
+    cursor.execute(f"""
+        SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` IS NOT NULL
+    """)
+    actual_distinct, source_row_count = cursor.fetchone()
+    actual_distinct = actual_distinct or 0
+    source_row_count = source_row_count or 1
 
-    # Fall back to dense approach
+    # Get referenced table size and min value from target
+    cursor.execute(f"SELECT COUNT(*), MIN(`{ref_col}`) FROM `{target_db}`.`{ref_table}`")
+    ref_table_size, ref_min = cursor.fetchone()
+    ref_table_size = ref_table_size or 1
+    ref_min = ref_min if ref_min is not None else 1
+
+    # Calculate coverage ratio (how much of referenced table is used)
+    coverage_ratio = actual_distinct / ref_table_size if ref_table_size > 0 else 1.0
+
+    # Calculate distinct ratio (how unique values are in source table)
+    # High ratio means random selection will cause collisions (birthday paradox)
+    distinct_ratio = actual_distinct / source_row_count if source_row_count > 0 else 1.0
+
+    # Decision based on coverage AND distinct_ratio:
+    # - If distinct_ratio > 0.5: use mod() cycling (random would cause collisions)
+    # - Else if coverage < 20%: try sparse weighted approach (preserves distribution shape)
+    # - Else if coverage < 80%: use mod() cycling (matches exact distinct count)
+    # - Else (coverage >= 80%): use dense rand.range (nearly full coverage anyway)
+
+    # High distinct ratio means random selection causes collisions - use mod() cycling
+    if distinct_ratio > 0.5 and coverage_ratio < 0.80:
+        expression = f"mod(rownum-1, {actual_distinct}) + {ref_min}"
+        description = f"cycling mod({actual_distinct})+{ref_min} (high distinct ratio {distinct_ratio*100:.0f}%)"
+        return (expression, description)
+
+    if coverage_ratio < 0.20:
+        # Try sparse approach for low-cardinality FKs
+        sparse_result = _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col)
+        if sparse_result:
+            return sparse_result
+        # Fall through to moderate if sparse doesn't apply
+
+    if coverage_ratio < 0.80:
+        # Moderate coverage: use mod() cycling to match exact distinct count
+        # This generates values 1 to actual_distinct (assuming ref_min=1)
+        expression = f"mod(rownum-1, {actual_distinct}) + {ref_min}"
+        description = f"cycling mod({actual_distinct})+{ref_min} ({coverage_ratio*100:.1f}% coverage)"
+        return (expression, description)
+
+    # High coverage (>=80%): use dense rand.range
     return _build_dense_fk_expression(cursor, target_db, ref_table, ref_col)
 
 
@@ -656,36 +700,58 @@ def histogram_to_case(hist, ddl_line):
         for i in range(1, len(buckets) + 1):
             synthetic_val = i / scale if scale > 1 else float(i)
             case_lines.append(f"when {i} then {synthetic_val}")
+
+        return f"""case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
+    end"""
     else:
-        # For equi-height: generate synthetic ranges with same relative spans
-        # Calculate relative span sizes from original histogram
-        original_spans = []
+        # For equi-height: use DETERMINISTIC bucket assignment to guarantee all distinct values
+        #
+        # Problem with rand.weighted: randomly assigns rows to buckets, causing collisions
+        # when we try to generate num_distinct values per bucket.
+        #
+        # Solution: Use mod(rownum, num_buckets) for bucket selection (equi-height = equal frequency)
+        # Then use div(rownum, num_buckets) as "local row number" to cycle through all values.
+        #
+        # This guarantees:
+        # 1. Equal distribution across buckets (matches equi-height histogram)
+        # 2. All distinct values are used (no random collisions)
+
+        num_buckets = len(buckets)
+        distinct_counts = []
         for b in buckets:
-            lo = float(b[0])
-            hi = float(b[1])
-            original_spans.append(hi - lo)
+            # Use num_distinct (b[3]) directly - it's a count, not a value range
+            num_distinct = int(b[3]) if len(b) > 3 else 1
+            distinct_counts.append(max(1, num_distinct))
 
-        # Normalize spans to generate synthetic CONTIGUOUS ranges starting from 0
-        # We preserve the relative span sizes but not actual values
-        # IMPORTANT: Ranges must be contiguous (no gaps) to avoid doubling distinct count
+        # Generate case expressions with deterministic cycling
+        # local_row = div(rownum-1, num_buckets) gives 0, 0, 0, ..., 1, 1, 1, ..., 2, 2, 2, ...
+        # mod(local_row, num_distinct) cycles through all distinct values
         synthetic_start = 0
-        for i, span in enumerate(original_spans, start=1):
-            # Use relative span (normalized to reasonable range)
-            # For privacy, we scale spans to start from 0
+        for i, num_distinct in enumerate(distinct_counts, start=1):
             synthetic_lo = synthetic_start
-            synthetic_hi = synthetic_start + max(1, int(span * scale))
 
-            span_size = synthetic_hi - synthetic_lo
-            if scale == 1:
-                case_lines.append(f"when {i} then rand.range(0,{span_size + 1})+{synthetic_lo}")
+            if num_distinct == 1:
+                # Single value bucket - generate exactly 1 value
+                if scale == 1:
+                    case_lines.append(f"when {i} then {synthetic_lo}")
+                else:
+                    case_lines.append(f"when {i} then {synthetic_lo}/{scale}")
+                synthetic_start = synthetic_lo + 1
             else:
-                case_lines.append(
-                    f"when {i} then rand.range(0,{span_size + 1})/{scale}+{synthetic_lo/scale}"
-                )
-            # Move to next range WITHOUT gap (contiguous ranges)
-            synthetic_start = synthetic_hi
+                # Multi-value bucket - use div/mod for deterministic cycling through all values
+                # div(rownum-1, num_buckets) = local row number (0, 1, 2, ... for each bucket)
+                # mod(local_row, num_distinct) = cycles through 0 to num_distinct-1
+                if scale == 1:
+                    case_lines.append(f"when {i} then mod(div(rownum-1,{num_buckets}),{num_distinct})+{synthetic_lo}")
+                else:
+                    case_lines.append(
+                        f"when {i} then (mod(div(rownum-1,{num_buckets}),{num_distinct})+{synthetic_lo})/{scale}"
+                    )
+                synthetic_start = synthetic_lo + num_distinct
 
-    return f"""case rand.weighted(array[{','.join(map(str, weights))}])
+        # Use deterministic bucket selection: mod(rownum-1, num_buckets)+1 gives buckets 1,2,3,...,N,1,2,3,...
+        return f"""case mod(rownum-1,{num_buckets})+1
     {' '.join(case_lines)}
     end"""
 
@@ -792,18 +858,34 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 # we need to generate repeating values to match source cardinality.
                 # Example: ss_ticket_number has 75,807 distinct values across 799,666 rows,
                 # meaning each ticket appears ~10 times (multiple items per transaction).
+                #
+                # IMPORTANT: We use div() not mod() to group consecutive rows together.
+                # This avoids duplicate PK combinations when other PK columns are random.
+                # - mod() cycles: 1,2,3,...,N,1,2,3,... → duplicates likely with random other col
+                # - div() groups: 1,1,1,...,2,2,2,...   → consecutive rows share value, safe
                 if is_composite_pk and not is_fk and not is_auto_increment:
-                    # Query actual distinct count from source
+                    # Query actual distinct count and row count from source
                     cursor.execute(f"""
-                        SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`)
+                        SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`), COUNT(*)
                         FROM `{database}`.`{table}`
                     """)
-                    distinct_count, min_val = cursor.fetchone()
+                    distinct_count, min_val, row_count = cursor.fetchone()
 
                     if distinct_count and distinct_count > 0:
                         min_val = min_val if min_val is not None else 1
-                        # Generate cycling values: 1,2,3,...,N,1,2,3,...,N,...
-                        synthetic = f"mod(rownum-1, {distinct_count}) + {min_val}"
+                        # Calculate rows per distinct value (how many rows share each value)
+                        rows_per_value = row_count // distinct_count
+
+                        if rows_per_value >= 2:
+                            # Many rows per value (e.g., sales tables with ~10 items per ticket)
+                            # Use div() grouping: 1,1,1,...,2,2,2,...,3,3,3,...
+                            synthetic = f"div(rownum-1, {rows_per_value}) + {min_val}"
+                        else:
+                            # Few rows per value (e.g., returns tables with ~1 item per ticket)
+                            # Use mod() cycling to match exact distinct count
+                            # This works because the FK column (handled by MasterRun.py) also
+                            # uses mod() cycling, and LCM of the two cycle lengths >> row_count
+                            synthetic = f"mod(rownum-1, {distinct_count}) + {min_val}"
                     else:
                         synthetic = "rownum"
                 else:
@@ -852,6 +934,8 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 synthetic = "rand.range(1975,2025)"
 
             elif col_type in NUMERIC_TYPES:
+                # Use histogram-based generation for numeric columns
+                # Note: We only treat columns as FKs if declared in DDL - no guessing based on names
                 if col in histograms:
                     synthetic = histogram_to_case(histograms[col], line)
                 else:

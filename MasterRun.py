@@ -11,6 +11,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import mysql.connector
 from mysql.connector import Error
@@ -98,6 +99,66 @@ def discover_tables_and_dependencies(cursor, database):
 
     dependencies = {k: list(v) for k, v in dependencies.items()}
     return all_tables, dependencies
+
+
+def regenerate_histograms_with_full_sampling(cursor, database):
+    """Regenerate all histograms with sampling_rate=1.0 for accurate num_distinct values.
+
+    MySQL samples data when histogram_generation_max_mem_size is exceeded.
+    We set it high enough to read all data, ensuring bucket[3] (num_distinct) is accurate.
+    """
+    print("Regenerating histograms with full sampling...")
+
+    # Set high memory limit to avoid sampling
+    cursor.execute("SET GLOBAL histogram_generation_max_mem_size = 1000000000")  # 1GB
+
+    # Get all columns that currently have histograms
+    cursor.execute("""
+        SELECT TABLE_NAME, COLUMN_NAME
+        FROM information_schema.COLUMN_STATISTICS
+        WHERE SCHEMA_NAME = %s
+        ORDER BY TABLE_NAME, COLUMN_NAME
+    """, (database,))
+    columns_with_histograms = cursor.fetchall()
+
+    if not columns_with_histograms:
+        print("  No existing histograms found.")
+        return
+
+    # Group by table
+    table_columns = {}
+    for table, column in columns_with_histograms:
+        if table not in table_columns:
+            table_columns[table] = []
+        table_columns[table].append(column)
+
+    # Regenerate histograms for each table
+    for table, columns in table_columns.items():
+        cols_str = ", ".join(f"`{c}`" for c in columns)
+        sql = f"ANALYZE TABLE `{database}`.`{table}` UPDATE HISTOGRAM ON {cols_str} WITH 100 BUCKETS"
+        try:
+            cursor.execute(sql)
+            cursor.fetchall()  # consume results
+        except Exception as e:
+            print(f"  Warning: Failed to regenerate histogram for {table}: {e}")
+            continue
+
+    # Verify sampling rates
+    cursor.execute("""
+        SELECT TABLE_NAME, MIN(HISTOGRAM->>'$."sampling-rate"') as min_rate
+        FROM information_schema.COLUMN_STATISTICS
+        WHERE SCHEMA_NAME = %s
+        GROUP BY TABLE_NAME
+        HAVING min_rate < 1.0
+    """, (database,))
+    low_sampling = cursor.fetchall()
+
+    if low_sampling:
+        print(f"  Warning: {len(low_sampling)} tables still have sampling_rate < 1.0:")
+        for table, rate in low_sampling:
+            print(f"    {table}: {rate}")
+    else:
+        print(f"  All {len(table_columns)} tables now have sampling_rate = 1.0")
 
 
 def prepare_target_schema(cursor, target_schema):
@@ -193,50 +254,68 @@ def build_fk_appendages(cursor, table):
     appendages = {}
 
     if all_pk_are_fk:
-        # Composite PK where all columns are FKs (e.g., PARTSUPP)
+        # Composite PK where all columns are FKs (e.g., PARTSUPP, inventory)
         # Collect info for all PK+FK columns across all constraints
-        pk_fk_info = []  # [(col, ref_table, ref_col, distinct_count, min_val), ...]
+        # We need BOTH reference table info (for valid FK values) AND source distinct counts
+        pk_fk_info = []  # [(col, ref_table, ref_col, source_distinct, ref_distinct, min_val), ...]
         for constraint_name, fk_cols in constraints.items():
             for col, ref_table, ref_col in fk_cols:
                 if col in pk_columns:
                     actual_ref = tgt_canonical.get(ref_table.lower())
                     if actual_ref is None:
                         continue
+                    # Get reference table info (for valid FK range)
                     cursor.execute(
                         f"SELECT COUNT(DISTINCT `{ref_col}`), MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
                     )
-                    distinct_count, min_val = cursor.fetchone()
+                    ref_distinct, min_val = cursor.fetchone()
                     min_val = min_val if min_val is not None else 0
-                    pk_fk_info.append((col, actual_ref, ref_col, distinct_count, min_val))
+
+                    # Get SOURCE distinct count (actual cardinality we need to match)
+                    cursor.execute(
+                        f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
+                    )
+                    source_distinct = cursor.fetchone()[0]
+
+                    pk_fk_info.append((col, actual_ref, ref_col, source_distinct, ref_distinct, min_val))
 
         if len(pk_fk_info) >= 2:
-            # Sort by distinct count ascending (smaller domains first)
+            # Sort by SOURCE distinct count ascending (smaller domains first)
+            # This determines the odometer order
             pk_fk_info.sort(key=lambda x: x[3])
 
-            # For full coverage of ALL domains:
-            # - Smaller domains: use mod(rownum-1, distinct_count)+min_val to cycle
-            # - Largest domain: use div(rownum-1, rows_per_large)+min_val to spread
+            # For full coverage of ALL domains using SOURCE distinct counts:
+            # - Smaller domains: use mod(rownum-1, source_distinct)+min_val to cycle
+            # - Largest domain: use div with source-based divisor to match source cardinality
             #
-            # This ensures each domain gets full coverage when R >= max(Di)
+            # Key insight: divisor for largest = total_rows / source_distinct
+            # This ensures we generate exactly source_distinct values
 
-            # All but the last (largest) use mod cycling
+            # All but the last (largest) use mod cycling with SOURCE distinct counts
             divisor = 1
-            for col, ref_table, ref_col, distinct_count, min_val in pk_fk_info[:-1]:
+            for col, ref_table, ref_col, source_distinct, ref_distinct, min_val in pk_fk_info[:-1]:
                 if divisor == 1:
-                    expr = f"mod(rownum-1, {distinct_count})+{min_val}"
+                    expr = f"mod(rownum-1, {source_distinct})+{min_val}"
                 else:
-                    expr = f"mod(div(rownum-1, {divisor}), {distinct_count})+{min_val}"
+                    expr = f"mod(div(rownum-1, {divisor}), {source_distinct})+{min_val}"
                 appendages[col] = expr
                 print(f"      FK+PK {col} -> {ref_table}.{ref_col}: "
-                      f"{distinct_count} distinct, min={min_val}, divisor={divisor} -> {expr}")
-                divisor *= distinct_count
+                      f"source={source_distinct}, ref={ref_distinct}, min={min_val}, divisor={divisor} -> {expr}")
+                divisor *= source_distinct
 
-            # Largest domain also uses mod to stay within valid range
-            large_col, large_ref, large_refcol, large_count, large_min = pk_fk_info[-1]
-            large_expr = f"mod(div(rownum-1, {divisor}), {large_count})+{large_min}"
+            # Largest domain: use same divisor chain to maintain PK uniqueness
+            # The generated distinct count = min(source_distinct, rows/divisor)
+            large_col, large_ref, large_refcol, large_source, large_ref_distinct, large_min = pk_fk_info[-1]
+
+            # Calculate achievable distinct count with proper odometer
+            achievable = source_row_count // divisor + 1 if divisor > 0 else source_row_count
+            actual_distinct = min(large_source, achievable)
+
+            large_expr = f"mod(div(rownum-1, {divisor}), {large_source})+{large_min}"
             appendages[large_col] = large_expr
             print(f"      FK+PK {large_col} -> {large_ref}.{large_refcol}: "
-                  f"{large_count} distinct, min={large_min}, divisor={divisor} -> {large_expr}")
+                  f"source={large_source}, ref={large_ref_distinct}, achievable={achievable}, "
+                  f"min={large_min}, divisor={divisor} -> {large_expr}")
 
         # Handle any remaining FK-only columns (not part of PK)
         for constraint_name, fk_cols in constraints.items():
@@ -245,6 +324,42 @@ def build_fk_appendages(cursor, table):
                     actual_ref = tgt_canonical.get(ref_table.lower())
                     if actual_ref is None:
                         continue
+                    expression, description = build_single_fk_expression(
+                        cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
+                    )
+                    appendages[col] = expression
+                    print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
+
+        return appendages
+
+    # Check for partial FK+PK case: composite PK where SOME (but not all) columns are FKs
+    # Example: store_sales PK is (ss_item_sk, ss_ticket_number) where only ss_item_sk is FK
+    # In this case, FK columns in PK must use mod() cycling (not random) to coordinate
+    # with non-FK PK columns which use div() grouping in GenerateDbgen.py
+    is_composite_pk = len(pk_columns) > 1
+    has_pk_fk_columns = len(pk_fk_columns) > 0
+    has_non_fk_pk_columns = len(pk_columns - pk_fk_columns) > 0
+
+    if is_composite_pk and has_pk_fk_columns and has_non_fk_pk_columns:
+        # Partial FK+PK case: FK columns in PK use mod() cycling for uniqueness
+        for constraint_name, fk_cols in constraints.items():
+            for col, ref_table, ref_col in fk_cols:
+                actual_ref = tgt_canonical.get(ref_table.lower())
+                if actual_ref is None:
+                    continue
+
+                if col in pk_columns:
+                    # FK column that is part of composite PK - use mod() cycling
+                    cursor.execute(
+                        f"SELECT COUNT(DISTINCT `{ref_col}`), MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                    )
+                    distinct_count, min_val = cursor.fetchone()
+                    min_val = min_val if min_val is not None else 1
+                    expr = f"mod(rownum-1, {distinct_count})+{min_val}"
+                    appendages[col] = expr
+                    print(f"      FK+PK {col} -> {actual_ref}.{ref_col}: cycling mod({distinct_count})+{min_val}")
+                else:
+                    # FK column not in PK - use normal FK expression
                     expression, description = build_single_fk_expression(
                         cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
                     )
@@ -347,7 +462,7 @@ def step_a_generate_dbgen(cursor, table):
 
 
 def step_b_run_dbgen(cursor, table):
-    """Run dbgen binary to produce .sql file. Returns True on success."""
+    """Run dbgen binary to produce .csv file. Returns True on success."""
     print(f"  [B] Running dbgen binary ...")
 
     cursor.execute(f"SELECT COUNT(*) FROM `{SOURCE_SCHEMA}`.`{table}`")
@@ -362,6 +477,8 @@ def step_b_run_dbgen(cursor, table):
         "--rows-per-file", str(row_count),
         "--rows-count", ROWS_COUNT,
         "--template", template_path,
+        "--format", "csv",           # Generate CSV instead of SQL
+        "--format-null", "\\N",      # MySQL's default NULL representation
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -370,12 +487,12 @@ def step_b_run_dbgen(cursor, table):
         print(result.stderr)
         return False
 
-    sql_path = os.path.join(DBGEN_TMP_OUT_DIR, f"{table}.1.sql")
-    if not os.path.isfile(sql_path):
-        print(f"  [B] FAILED — expected output file not found: {sql_path}")
+    csv_path = os.path.join(DBGEN_TMP_OUT_DIR, f"{table}.1.csv")
+    if not os.path.isfile(csv_path):
+        print(f"  [B] FAILED — expected output file not found: {csv_path}")
         return False
 
-    print(f"  [B] Generated {sql_path}")
+    print(f"  [B] Generated {csv_path}")
     return True
 
 
@@ -414,18 +531,31 @@ def step_c_create_insert_validate(cursor, table):
     cursor.execute(create_stmt)
     print(f"      Created `{TARGET_SCHEMA}`.`{table}`")
 
-    # --- Read and execute INSERT statements ---
-    sql_path = os.path.join(DBGEN_TMP_OUT_DIR, f"{table}.1.sql")
-    with open(sql_path) as f:
-        insert_sql = f.read()
+    # --- Load CSV data using LOAD DATA LOCAL INFILE ---
+    csv_path = os.path.abspath(os.path.join(DBGEN_TMP_OUT_DIR, f"{table}.1.csv"))
 
-    insert_sql = re.sub(
-        rf"(INSERT\s+INTO\s+)`?{re.escape(table)}`?",
-        rf"\1`{TARGET_SCHEMA}`.`{table}`",
-        insert_sql,
-        flags=re.IGNORECASE,
-    )
-    execute_statements(cursor, insert_sql)
+    # Extract column names from DDL (columns are between first ( and PRIMARY KEY or first constraint)
+    # Pattern: `column_name` type ... ,
+    col_pattern = r"`(\w+)`\s+\w+"
+    # Find content between CREATE TABLE ... ( and PRIMARY KEY or CONSTRAINT or KEY
+    ddl_body_match = re.search(r"CREATE\s+TABLE[^(]*\((.*?)(?:PRIMARY\s+KEY|CONSTRAINT|KEY\s+`)", clean_ddl, re.DOTALL | re.IGNORECASE)
+    if ddl_body_match:
+        ddl_body = ddl_body_match.group(1)
+        columns = re.findall(col_pattern, ddl_body)
+    else:
+        # Fallback: get all backtick-quoted identifiers before PRIMARY KEY
+        columns = re.findall(col_pattern, clean_ddl.split("PRIMARY KEY")[0])
+
+    column_list = ", ".join(f"`{col}`" for col in columns)
+
+    load_stmt = f"""
+        LOAD DATA LOCAL INFILE '{csv_path}'
+        INTO TABLE `{TARGET_SCHEMA}`.`{table}`
+        FIELDS TERMINATED BY ',' ENCLOSED BY '"'
+        LINES TERMINATED BY '\\n'
+        ({column_list})
+    """
+    cursor.execute(load_stmt)
 
     # --- Validate row count ---
     cursor.execute(f"SELECT COUNT(*) FROM `{SOURCE_SCHEMA}`.`{table}`")
@@ -508,6 +638,8 @@ def step_c_create_insert_validate(cursor, table):
 # Main
 # ----------------------------------------------------------------
 def main():
+    start_time = time.time()
+
     # --- Setup directories ---
     os.makedirs(DBGEN_FILES_DIR, exist_ok=True)
     os.makedirs(DBGEN_TMP_OUT_DIR, exist_ok=True)
@@ -517,6 +649,7 @@ def main():
         conn = mysql.connector.connect(
             host=HOST, user=USER, password=PASSWORD, database=SOURCE_SCHEMA,
             autocommit=True,
+            allow_local_infile=True,  # Enable LOAD DATA LOCAL INFILE
         )
         cursor = conn.cursor()
     except Error as e:
@@ -538,6 +671,10 @@ def main():
 
     # --- Prepare target schema ---
     prepare_target_schema(cursor, TARGET_SCHEMA)
+    print()
+
+    # --- Regenerate histograms with full sampling ---
+    regenerate_histograms_with_full_sampling(cursor, SOURCE_SCHEMA)
     print()
 
     # --- Process each table ---
@@ -606,6 +743,11 @@ def main():
                 any_failure = True
 
     print("=" * 60)
+
+    elapsed = time.time() - start_time
+    minutes = int(elapsed // 60)
+    seconds = elapsed % 60
+    print(f"\nTotal elapsed time: {minutes}m {seconds:.1f}s")
 
     if any_failure:
         print("Some tables had validation failures.")
