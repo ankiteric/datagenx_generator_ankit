@@ -581,6 +581,10 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
     PRIVACY: We use a synthetic base date and only extract the SPAN (range size)
     from the histogram, not the actual min/max dates. This avoids data leakage.
 
+    For 1:1 date columns (where row_count ≈ distinct_count), we use deterministic
+    generation (rownum-1) instead of random to avoid birthday paradox collisions.
+    See VALIDATION_ISSUES.md for explanation.
+
     Returns expression string or None if histogram doesn't exist.
     """
     cursor.execute("""
@@ -603,14 +607,32 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
     if min_val.startswith("0000-00-00") or max_val.startswith("0000-00-00"):
         return None
 
+    # Check if this is a 1:1 date column (row_count ≈ distinct_count)
+    # If so, use deterministic generation to avoid birthday paradox
+    cursor.execute(f"""
+        SELECT COUNT(*), COUNT(DISTINCT `{column}`)
+        FROM `{database}`.`{table}`
+    """)
+    row_count, distinct_count = cursor.fetchone()
+
+    # Use deterministic generation if distinct ratio > 90%
+    use_deterministic = (distinct_count and row_count and
+                         distinct_count / row_count > 0.9)
+
     # Calculate SPAN only - we don't use actual min/max values as base
     # Instead, we use synthetic base date + span for privacy
     if col_type == "date":
         min_date = datetime.strptime(min_val[:10], "%Y-%m-%d").date()
         max_date = datetime.strptime(max_val[:10], "%Y-%m-%d").date()
         day_span = (max_date - min_date).days
-        # Use synthetic base date, not actual min_date
-        return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL rand.range(0, {day_span + 1}) DAY"
+
+        if use_deterministic:
+            # 1:1 column: use rownum for guaranteed unique dates
+            # mod() ensures we stay within the span even if row_count > span
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL mod(rownum-1, {day_span + 1}) DAY"
+        else:
+            # Use synthetic base date, not actual min_date
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL rand.range(0, {day_span + 1}) DAY"
 
     elif col_type in ("datetime", "timestamp"):
         fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in min_val else "%Y-%m-%d %H:%M:%S"
@@ -618,8 +640,13 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
         fmt = "%Y-%m-%d %H:%M:%S.%f" if "." in max_val else "%Y-%m-%d %H:%M:%S"
         max_ts = datetime.strptime(max_val, fmt)
         second_span = int((max_ts - min_ts).total_seconds())
-        # Use synthetic base datetime, not actual min_ts
-        return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL rand.range(0, {second_span + 1}) SECOND"
+
+        if use_deterministic:
+            # 1:1 column: use rownum for guaranteed unique timestamps
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL mod(rownum-1, {second_span + 1}) SECOND"
+        else:
+            # Use synthetic base datetime, not actual min_ts
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL rand.range(0, {second_span + 1}) SECOND"
 
     elif col_type == "time":
         def parse_time_to_secs(t):
@@ -633,7 +660,11 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
         # For TIME, the span is what matters, not actual times
         # Use span from 0 (midnight) for privacy
         time_span = max_secs - min_secs
-        return f"INTERVAL rand.range(0, {time_span + 1}) SECOND"
+
+        if use_deterministic:
+            return f"INTERVAL mod(rownum-1, {time_span + 1}) SECOND"
+        else:
+            return f"INTERVAL rand.range(0, {time_span + 1}) SECOND"
 
     return None
 
@@ -653,7 +684,7 @@ def get_date_range_expression(cursor, database, table, column, col_type):
     return _build_dense_date_expression(cursor, database, table, column, col_type)
 
 
-def histogram_to_case(hist, ddl_line):
+def histogram_to_case(hist, ddl_line, actual_distinct_count=None):
     """Generate weighted CASE expression for numeric columns using SYNTHETIC values.
 
     PRIVACY: We use synthetic sequential values instead of actual numeric values
@@ -662,6 +693,13 @@ def histogram_to_case(hist, ddl_line):
 
     For singleton histograms: Generate values 1, 2, 3, ... (or scaled for decimals)
     For equi-height histograms: Generate synthetic ranges with same relative spans
+
+    Args:
+        hist: MySQL histogram JSON object
+        ddl_line: DDL line for the column (to detect DECIMAL scale)
+        actual_distinct_count: If provided, scale bucket num_distinct values to match
+                               this total. This avoids histogram extrapolation errors
+                               when sampling_rate < 1.0. See HISTOGRAM_SAMPLING_EXPLAINED.md.
     """
     buckets = hist.get("buckets", [])
     if not buckets:
@@ -697,9 +735,16 @@ def histogram_to_case(hist, ddl_line):
     if hist_type == "singleton":
         # For singleton: generate synthetic sequential values
         # Use simple sequential integers (or scaled for decimals)
-        for i in range(1, len(buckets) + 1):
+        # If actual_distinct_count provided, use it instead of bucket count
+        num_values = actual_distinct_count if actual_distinct_count else len(buckets)
+        for i in range(1, num_values + 1):
             synthetic_val = i / scale if scale > 1 else float(i)
             case_lines.append(f"when {i} then {synthetic_val}")
+
+        # Adjust weights array if needed
+        if actual_distinct_count and actual_distinct_count != len(buckets):
+            # Redistribute weights evenly for the actual count
+            weights = [1.0 / num_values] * num_values
 
         return f"""case rand.weighted(array[{','.join(map(str, weights))}])
     {' '.join(case_lines)}
@@ -718,11 +763,27 @@ def histogram_to_case(hist, ddl_line):
         # 2. All distinct values are used (no random collisions)
 
         num_buckets = len(buckets)
-        distinct_counts = []
+
+        # Get raw num_distinct from each bucket
+        raw_distinct_counts = []
         for b in buckets:
-            # Use num_distinct (b[3]) directly - it's a count, not a value range
             num_distinct = int(b[3]) if len(b) > 3 else 1
-            distinct_counts.append(max(1, num_distinct))
+            raw_distinct_counts.append(max(1, num_distinct))
+
+        # If actual_distinct_count is provided, scale bucket counts proportionally
+        # This fixes histogram extrapolation errors when sampling_rate < 1.0
+        histogram_total = sum(raw_distinct_counts)
+        if actual_distinct_count and histogram_total > 0:
+            scale_factor = actual_distinct_count / histogram_total
+            distinct_counts = [max(1, int(round(c * scale_factor))) for c in raw_distinct_counts]
+            # Adjust to match exact total (rounding may cause slight mismatch)
+            diff = actual_distinct_count - sum(distinct_counts)
+            if diff != 0:
+                # Add/subtract from largest bucket
+                max_idx = distinct_counts.index(max(distinct_counts))
+                distinct_counts[max_idx] = max(1, distinct_counts[max_idx] + diff)
+        else:
+            distinct_counts = raw_distinct_counts
 
         # Generate case expressions with deterministic cycling
         # local_row = div(rownum-1, num_buckets) gives 0, 0, 0, ..., 1, 1, 1, ..., 2, 2, 2, ...
@@ -937,7 +998,11 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 # Use histogram-based generation for numeric columns
                 # Note: We only treat columns as FKs if declared in DDL - no guessing based on names
                 if col in histograms:
-                    synthetic = histogram_to_case(histograms[col], line)
+                    # Query actual distinct count to avoid histogram extrapolation errors
+                    # See HISTOGRAM_SAMPLING_EXPLAINED.md for why this is necessary
+                    cursor.execute(f"SELECT COUNT(DISTINCT `{col}`) FROM `{database}`.`{table}`")
+                    actual_distinct = cursor.fetchone()[0]
+                    synthetic = histogram_to_case(histograms[col], line, actual_distinct)
                 else:
                     synthetic = "rand.range(0,5)"
 
