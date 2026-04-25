@@ -506,7 +506,9 @@ def _try_sparse_date_expression(cursor, database, table, column, col_type):
     """Try to build sparse date expression using singleton histogram.
 
     For date columns with singleton histograms (low cardinality), generates
-    a weighted CASE expression with SYNTHETIC date values.
+    either:
+    - Weighted CASE expression (for normal tables with repeated values)
+    - Deterministic mod() expression (for small tables to avoid birthday paradox)
 
     PRIVACY: We use synthetic sequential dates (2000-01-01, 2000-01-02, ...)
     instead of actual source dates to avoid data leakage. Only the distribution
@@ -531,6 +533,31 @@ def _try_sparse_date_expression(cursor, database, table, column, col_type):
     if not buckets or hist_type != "singleton":
         return None
 
+    n_distinct = len(buckets)
+
+    # Check for small table or high distinct ratio
+    # These need deterministic generation to avoid birthday paradox
+    # See VALIDATION_ISSUES.md Section 5: "Small Table Histogram Issues"
+    cursor.execute(f"""
+        SELECT COUNT(*), COUNT(DISTINCT `{column}`)
+        FROM `{database}`.`{table}`
+    """)
+    row_count, actual_distinct = cursor.fetchone()
+
+    use_deterministic = False
+    if row_count and actual_distinct:
+        distinct_ratio = actual_distinct / row_count if row_count > 0 else 0
+        use_deterministic = (row_count < 100) or (distinct_ratio > 0.9)
+
+    # For small tables, use deterministic mod() cycling
+    if use_deterministic:
+        if col_type == "date":
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL mod(rownum-1, {n_distinct}) DAY"
+        elif col_type in ("datetime", "timestamp"):
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL mod(rownum-1, {n_distinct}) HOUR"
+        else:
+            return None  # TIME columns use dense approach
+
     # Extract weights from histogram (distribution shape - OK to use)
     # We DO NOT use actual date values from histogram (would be data leak)
     weights = []
@@ -549,7 +576,6 @@ def _try_sparse_date_expression(cursor, database, table, column, col_type):
 
     # Generate SYNTHETIC date values - sequential from base date
     # We use synthetic dates to preserve privacy while maintaining distribution shape
-    n_distinct = len(buckets)
     date_values = []
 
     for i in range(n_distinct):
@@ -607,17 +633,20 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
     if min_val.startswith("0000-00-00") or max_val.startswith("0000-00-00"):
         return None
 
-    # Check if this is a 1:1 date column (row_count ≈ distinct_count)
+    # Check if this is a 1:1 date column (row_count ≈ distinct_count) OR a small table
     # If so, use deterministic generation to avoid birthday paradox
+    # See VALIDATION_ISSUES.md Section 5: "Small Table Histogram Issues"
     cursor.execute(f"""
         SELECT COUNT(*), COUNT(DISTINCT `{column}`)
         FROM `{database}`.`{table}`
     """)
     row_count, distinct_count = cursor.fetchone()
 
-    # Use deterministic generation if distinct ratio > 90%
+    # Use deterministic generation if:
+    # 1. Small table (<100 rows) - histogram approach unsuitable
+    # 2. High distinct ratio (>90%) - birthday paradox would cause collisions
     use_deterministic = (distinct_count and row_count and
-                         distinct_count / row_count > 0.9)
+                         (row_count < 100 or distinct_count / row_count > 0.9))
 
     # Calculate SPAN only - we don't use actual min/max values as base
     # Instead, we use synthetic base date + span for privacy
@@ -684,7 +713,7 @@ def get_date_range_expression(cursor, database, table, column, col_type):
     return _build_dense_date_expression(cursor, database, table, column, col_type)
 
 
-def histogram_to_case(hist, ddl_line, actual_distinct_count=None):
+def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None):
     """Generate weighted CASE expression for numeric columns using SYNTHETIC values.
 
     PRIVACY: We use synthetic sequential values instead of actual numeric values
@@ -693,6 +722,7 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None):
 
     For singleton histograms: Generate values 1, 2, 3, ... (or scaled for decimals)
     For equi-height histograms: Generate synthetic ranges with same relative spans
+    For small tables (<100 rows or >90% distinct): Use deterministic mod() cycling
 
     Args:
         hist: MySQL histogram JSON object
@@ -700,6 +730,8 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None):
         actual_distinct_count: If provided, scale bucket num_distinct values to match
                                this total. This avoids histogram extrapolation errors
                                when sampling_rate < 1.0. See HISTOGRAM_SAMPLING_EXPLAINED.md.
+        row_count: If provided, used to detect small tables that need deterministic
+                   generation to avoid birthday paradox collisions.
     """
     buckets = hist.get("buckets", [])
     if not buckets:
@@ -718,6 +750,23 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None):
         re.IGNORECASE
     )
     scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
+
+    # Detect small tables or high distinct ratio (>90%)
+    # These need deterministic generation to avoid birthday paradox collisions
+    # See VALIDATION_ISSUES.md Section 5: "Small Table Histogram Issues"
+    use_deterministic = False
+    if row_count and actual_distinct_count:
+        distinct_ratio = actual_distinct_count / row_count if row_count > 0 else 0
+        # Small tables (<100 rows) OR high distinct ratio (>90%) need deterministic
+        use_deterministic = (row_count < 100) or (distinct_ratio > 0.9)
+
+    # For small tables or 1:1 columns, use simple deterministic mod() cycling
+    # This guarantees all distinct values are used exactly once (or evenly distributed)
+    if use_deterministic and actual_distinct_count:
+        if scale == 1:
+            return f"mod(rownum-1, {actual_distinct_count}) + 1"
+        else:
+            return f"(mod(rownum-1, {actual_distinct_count}) + 1) / {scale}"
 
     # Extract weights (distribution shape - OK to use)
     weights = []
@@ -939,8 +988,12 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
 
                         if rows_per_value >= 2:
                             # Many rows per value (e.g., sales tables with ~10 items per ticket)
-                            # Use div() grouping: 1,1,1,...,2,2,2,...,3,3,3,...
-                            synthetic = f"div(rownum-1, {rows_per_value}) + {min_val}"
+                            # Use div() grouping with mod() capping:
+                            # - div() groups consecutive rows: 1,1,1,...,2,2,2,...,3,3,3,...
+                            # - mod() caps at distinct_count to avoid over-generation
+                            #   (integer division truncation would otherwise create extra values)
+                            # See VALIDATION_ISSUES.md Section 3 for explanation.
+                            synthetic = f"mod(div(rownum-1, {rows_per_value}), {distinct_count}) + {min_val}"
                         else:
                             # Few rows per value (e.g., returns tables with ~1 item per ticket)
                             # Use mod() cycling to match exact distinct count
@@ -998,11 +1051,12 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 # Use histogram-based generation for numeric columns
                 # Note: We only treat columns as FKs if declared in DDL - no guessing based on names
                 if col in histograms:
-                    # Query actual distinct count to avoid histogram extrapolation errors
-                    # See HISTOGRAM_SAMPLING_EXPLAINED.md for why this is necessary
-                    cursor.execute(f"SELECT COUNT(DISTINCT `{col}`) FROM `{database}`.`{table}`")
-                    actual_distinct = cursor.fetchone()[0]
-                    synthetic = histogram_to_case(histograms[col], line, actual_distinct)
+                    # Query actual distinct count AND row count
+                    # - actual_distinct: avoids histogram extrapolation errors (HISTOGRAM_SAMPLING_EXPLAINED.md)
+                    # - row_count: detects small tables needing deterministic generation (VALIDATION_ISSUES.md #5)
+                    cursor.execute(f"SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{database}`.`{table}`")
+                    actual_distinct, table_row_count = cursor.fetchone()
+                    synthetic = histogram_to_case(histograms[col], line, actual_distinct, table_row_count)
                 else:
                     synthetic = "rand.range(0,5)"
 
