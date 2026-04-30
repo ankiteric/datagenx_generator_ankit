@@ -280,6 +280,15 @@ See `COMPOSITE_FK_PK_CARDINALITY.md` for full explanation.
 
 ## Code Maintenance Guidelines
 
+### Generic Code Only
+
+**All fixes must be schema-agnostic.** This tool is NOT specific to TPC-DS or TPC-H - it must work for any MySQL schema with any table/column names.
+
+- ❌ **No hardcoded table names** (e.g., `if table == 'web_returns'`)
+- ❌ **No hardcoded column names** (e.g., `if col.endswith('_sk')`)
+- ❌ **No schema-specific thresholds** (e.g., `if distinct_count == 18000`)
+- ✅ **Use metadata-driven logic** (DDL constraints, histogram statistics, COUNT queries)
+
 ### Before Making Changes
 
 1. **Trace execution from MasterRun.py** - Don't assume code in GenerateDbgen.py is used

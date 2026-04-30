@@ -1,11 +1,11 @@
 # Validation Issues Catalog
 
-Based on `validation_output2.log` (16m 30s run with CSV loading)
+Based on `validation_output.log` (28m 46s run with CSV loading)
 
 ## Summary
 
-- **PASS**: 12 tables
-- **FAIL**: 12 tables
+- **PASS**: 22 tables
+- **FAIL**: 2 tables (item, inventory)
 
 ## Root Cause Classification
 
@@ -183,21 +183,32 @@ This guarantees all distinct values are generated exactly (or evenly distributed
 
 ---
 
-### 6. FK+PK Item Column Over-generating
+### 6. FK+PK Column Over-generating
 
-**Root Cause**: ALGORITHM (uses reference table count, not source distinct)
+**Root Cause**: ALGORITHM (used reference table count, not source distinct)
 
-**Affected Tables**: web_returns
+**Status**: ✅ FIXED - Now uses source distinct count instead of reference table count
 
-| Table | Column | Source | Replay | Diff |
-|-------|--------|--------|--------|------|
-| web_returns | wr_item_sk | 16,805 | 18,000 | +7% |
+**Affected Tables**: Any table with partial FK+PK pattern (FK column that is part of composite PK)
+
+| Table | Column | Before | After |
+|-------|--------|--------|-------|
+| web_returns | wr_item_sk | +7% FAIL | PASS |
+| store_returns | sr_item_sk | (was using 18000, now 17357) | PASS |
+| catalog_returns | cr_item_sk | (was using 18000, now 17847) | PASS |
 
 **Root Cause**:
-- Expression: `mod(rownum-1, 18000)+1` cycles through ALL 18,000 items
-- Source only has returns for 16,805 items (93% coverage)
+- Expression used `mod(rownum-1, ref_table_count)+1` (e.g., 18,000 items in item table)
+- Source only uses a subset of FK values (e.g., 16,805 items actually returned)
 
-**Fix**: Use source distinct count as modulus: `mod(rownum-1, 16805)+1`
+**Fix Applied** (MasterRun.py:build_fk_appendages):
+```python
+# Before: used reference table count (over-generates)
+cursor.execute(f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`")
+
+# After: uses source distinct count (matches actual usage)
+cursor.execute(f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`")
+```
 
 ---
 
@@ -208,9 +219,11 @@ This guarantees all distinct values are generated exactly (or evenly distributed
 | **COUNT(DISTINCT) instead of histogram estimates** | #1 Non-FK _SK over-generating (24% errors) | ✅ FIXED |
 | **Deterministic date generation (1:1 columns)** | #2 date_dim.d_date under-generating | ✅ FIXED |
 | **Deterministic generation for small tables** | #5 Small table issues | ✅ FIXED |
-| **Adjust div/mod calculation** | #3 Order number over-generating | PENDING |
-| **Use source distinct for FK+PK** | #6 web_returns item over-generating | PENDING |
+| **mod() capping for composite PK** | #3 Order number over-generating | ✅ FIXED |
+| **Use source distinct for FK+PK** | #6 FK+PK column over-generating | ✅ FIXED |
 | **Accept trade-off** | #4 Inventory FK+PK (inherent) | N/A |
+
+## Current Status: 22 PASS / 2 FAIL
 
 ## Current Sampling Rates
 

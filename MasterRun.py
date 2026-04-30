@@ -350,14 +350,21 @@ def build_fk_appendages(cursor, table):
 
                 if col in pk_columns:
                     # FK column that is part of composite PK - use mod() cycling
+                    # Use SOURCE distinct count (how many FK values are actually used)
+                    # not reference table count (which may be larger)
                     cursor.execute(
-                        f"SELECT COUNT(DISTINCT `{ref_col}`), MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                        f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
                     )
-                    distinct_count, min_val = cursor.fetchone()
+                    source_distinct = cursor.fetchone()[0]
+                    # Get MIN from target schema (for valid FK values)
+                    cursor.execute(
+                        f"SELECT MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                    )
+                    min_val = cursor.fetchone()[0]
                     min_val = min_val if min_val is not None else 1
-                    expr = f"mod(rownum-1, {distinct_count})+{min_val}"
+                    expr = f"mod(rownum-1, {source_distinct})+{min_val}"
                     appendages[col] = expr
-                    print(f"      FK+PK {col} -> {actual_ref}.{ref_col}: cycling mod({distinct_count})+{min_val}")
+                    print(f"      FK+PK {col} -> {actual_ref}.{ref_col}: cycling mod({source_distinct})+{min_val}")
                 else:
                     # FK column not in PK - use normal FK expression
                     expression, description = build_single_fk_expression(
