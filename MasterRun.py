@@ -42,20 +42,14 @@ from PopulateNewTableAndValidate import (
 )
 
 # ----------------------------------------------------------------
-# Configuration
+# Configuration - imported from central config.py
 # ----------------------------------------------------------------
-HOST = "localhost"
-USER = "root"
-PASSWORD = "newpassword"
-SOURCE_SCHEMA = "tpcds"
-TARGET_SCHEMA = "tpcds_harsha"
-
-DBGEN_BINARY = "/Users/sreeharshar/work/db/datagenx/code/dbgen/target/release/dbgen"
-DBGEN_FILES_DIR = "dbgen_files"
-DBGEN_TMP_OUT_DIR = "dbgen_tmp_out"
-
-FILES_COUNT = "1"
-ROWS_COUNT = "1000"
+from config import (
+    HOST, USER, PASSWORD,
+    SOURCE_SCHEMA, TARGET_SCHEMA,
+    DBGEN_BINARY, DBGEN_FILES_DIR, DBGEN_TMP_OUT_DIR,
+    FILES_COUNT, ROWS_COUNT
+)
 
 
 # ----------------------------------------------------------------

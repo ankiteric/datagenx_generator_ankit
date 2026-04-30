@@ -6,17 +6,19 @@ from mysql.connector import Error
 import re
 
 # ---------------- CONFIG ----------------
-input_dir = "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/dbgen_files"
-dbgen_binary = "/Users/sreeharshar/work/db/datagenx/code/dbgen/target/release/dbgen"
-temp_out_dir = "dbgen_tmp_out"
+from config import (
+    HOST as mysql_host,
+    USER as mysql_user,
+    PASSWORD as mysql_password,
+    SOURCE_SCHEMA as mysql_schema,
+    DBGEN_BINARY as dbgen_binary,
+    DBGEN_FILES_DIR,
+    DBGEN_TMP_OUT_DIR as temp_out_dir,
+    FILES_COUNT as files_count,
+    ROWS_COUNT as rows_count
+)
 
-files_count = "1"
-rows_count = "1000"
-
-mysql_host = "localhost"
-mysql_user = "root"
-mysql_password = "newpassword"
-mysql_schema = "tpch"
+input_dir = DBGEN_FILES_DIR
 # ---------------------------------------
 
 NUMERIC_TYPES = {

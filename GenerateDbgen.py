@@ -1197,14 +1197,10 @@ def topological_sort(tables, dependencies):
 
 
 if __name__ == "__main__":
-    host = "localhost"
-    user = "root"
-    password = "newpassword"
-    database = "tpcds"
-    target_database = "tpcds_harsha"  # Target schema for FK range queries
+    from config import HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA
 
     conn = mysql.connector.connect(
-        host=host, user=user, password=password, database=database
+        host=HOST, user=USER, password=PASSWORD, database=SOURCE_SCHEMA
     )
     cursor = conn.cursor()
 
@@ -1213,7 +1209,7 @@ if __name__ == "__main__":
         SELECT TABLE_NAME
         FROM INFORMATION_SCHEMA.TABLES
         WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE'
-    """, (database,))
+    """, (SOURCE_SCHEMA,))
     all_tables = [t[0] for t in cursor.fetchall()]
 
     # Build dependency map: table -> [tables it depends on]
@@ -1222,7 +1218,7 @@ if __name__ == "__main__":
         FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
         WHERE TABLE_SCHEMA = %s
           AND REFERENCED_TABLE_NAME IS NOT NULL
-    """, (database,))
+    """, (SOURCE_SCHEMA,))
 
     dependencies = {}
     for table, referenced_table in cursor.fetchall():
@@ -1264,7 +1260,7 @@ if __name__ == "__main__":
             print(f"⚙️ Processing table: {table} (no dependencies)")
 
         ddl = annotate_table_with_histogram(
-            host, user, password, database, table, target_database
+            HOST, USER, PASSWORD, SOURCE_SCHEMA, table, TARGET_SCHEMA
         )
         if ddl:
             with open(os.path.join(out_dir, f"{table}.dbgen"), "w") as f:

@@ -11,6 +11,23 @@ The `inventory` table has:
 - **Row count**: 11,745,000 rows
 - **Source distinct `inv_date_sk`**: 261 distinct dates
 
+
+mysql> SELECT COUNT(DISTINCT inv_warehouse_sk) , COUNT(DISTINCT inv_date_sk) , COUNT(DISTINCT inv_item_sk) , COUNT(*) FROM tpcds.inventory;
++----------------------------------+-----------------------------+-----------------------------+----------+
+| COUNT(DISTINCT inv_warehouse_sk) | COUNT(DISTINCT inv_date_sk) | COUNT(DISTINCT inv_item_sk) | COUNT(*) |
++----------------------------------+-----------------------------+-----------------------------+----------+
+|                                5 |                         261 |                       18000 | 11745000 |
++----------------------------------+-----------------------------+-----------------------------+----------+
+1 row in set (3.75 sec)
+
+mysql> SELECT COUNT(DISTINCT inv_warehouse_sk) , COUNT(DISTINCT inv_date_sk) , COUNT(DISTINCT inv_item_sk) , COUNT(*) FROM tpcds_harsha.inventory;
++----------------------------------+-----------------------------+-----------------------------+----------+
+| COUNT(DISTINCT inv_warehouse_sk) | COUNT(DISTINCT inv_date_sk) | COUNT(DISTINCT inv_item_sk) | COUNT(*) |
++----------------------------------+-----------------------------+-----------------------------+----------+
+|                                5 |                         261 |                        9000 | 11745000 |
++----------------------------------+-----------------------------+-----------------------------+----------+
+1 row in set (3.52 sec)
+
 The current odometer approach:
 ```
 inv_date_sk:     mod(div(rownum-1, 90000), 261) + 1
