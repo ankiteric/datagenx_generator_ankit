@@ -269,14 +269,21 @@ For example, with 75,807 distinct tickets across 799,666 rows (10 items/ticket):
 
 ### Composite FK+PK Cardinality (FIXED)
 
-When ALL columns of a composite PK are also FKs (e.g., `inventory` table), we use an odometer pattern.
-The key fix: divisors must be based on **source distinct counts**, not reference table sizes.
+When ALL columns of a composite PK are also FKs (e.g., `PARTSUPP`, `inventory`), we use **n-cycling**:
+- **Largest dimension**: `div(rownum-1, rows_per_largest) + min` (grouped)
+- **Other dimensions**: `mod(rownum-1, distinct) + min` (cycling)
 
-See `COMPOSITE_FK_PK_CARDINALITY.md` for full explanation.
+This achieves full coverage of ALL dimensions, unlike odometer which can only cover one.
 
-**Example**: `inventory.inv_date_sk` (PK + FK to date_dim)
-- Old approach: divisor = 90,000 (product of other ref tables) → only 131 dates generated
-- Fixed approach: divisor = 11,745,000 / 261 ≈ 45,000 → all 261 dates generated
+See `N_CYCLING_COMPOSITE_FK_PK.md` for full explanation.
+
+**Example**: `PARTSUPP` (ps_partkey=200000, ps_suppkey=10000, rows=800000)
+```
+ps_partkey = div(rownum-1, 4) + 1       # grouped: 1,1,1,1,2,2,2,2,...
+ps_suppkey = mod(rownum-1, 10000) + 1   # cycling: 1,2,3,4,5,6,7,8,...
+```
+
+For composite FK references (e.g., LINEITEM → PARTSUPP), we use the same n-cycling pattern wrapped with `mod(rownum-1, ref_row_count)` to cycle through valid pairs.
 
 ## Code Maintenance Guidelines
 

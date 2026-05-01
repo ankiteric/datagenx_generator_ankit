@@ -209,31 +209,32 @@ if len(pk_fk_info) >= 2:
 
 | Condition | Lines | Pattern | Affected by N-Cycling? |
 |-----------|-------|---------|------------------------|
-| All PK are FK | 250-350 | **N-Cycling** | YES - this is the fix |
+| All PK are FK | 250-350 | **N-Cycling** | YES - composite PK where all cols are FK |
 | Partial FK+PK | 352-393 | mod() cycling | NO |
 | Single-column FK | 396-410 | build_single_fk_expression() | NO |
-| Composite FK reference | 412-462 | Odometer on ref table | SEPARATE ISSUE |
+| Composite FK reference | 389-438 | **N-Cycling** | YES - must match referenced table |
 
 ---
 
-## Known Issues
+## Composite FK References (LINEITEM → PARTSUPP)
 
-### Composite FK References (LINEITEM → PARTSUPP)
+When a table has a composite FK referencing another table's composite key, it must generate pairs that **exist** in the referenced table. Since the referenced table uses n-cycling, the referencing table must use the same pattern.
 
-LINEITEM has a **composite FK** referencing PARTSUPP:
-```sql
-FOREIGN KEY (l_partkey, l_suppkey) REFERENCES PARTSUPP (ps_partkey, ps_suppkey)
+**Example:** LINEITEM references PARTSUPP via `(l_partkey, l_suppkey)`
+
+PARTSUPP n-cycling (800,000 rows):
+```
+ps_partkey = div(rownum-1, 4) + 1       # grouped
+ps_suppkey = mod(rownum-1, 10000) + 1   # cycling
 ```
 
-**Problem:** The current code generates `(l_partkey, l_suppkey)` pairs using odometer pattern cycling through `ref_row_count`. But PARTSUPP uses n-cycling, so the pairs don't match!
+LINEITEM must use same formula, wrapped to cycle through all 800,000 pairs:
+```
+l_partkey = div(mod(rownum-1, 800000), 4) + 1
+l_suppkey = mod(mod(rownum-1, 800000), 10000) + 1
+```
 
-**Example:**
-- PARTSUPP has: (1,1), (1,2), (1,3), (1,4), (2,5), (2,6), ...
-- LINEITEM generates: (1,50), (2,100), ... — these pairs don't exist in PARTSUPP!
-
-**Result:** FK constraint rejects most LINEITEM rows.
-
-**This is a separate issue** requiring the composite FK generation to match the referenced table's n-cycling pattern. Not addressed in this fix.
+This ensures LINEITEM generates pairs like (1,1), (1,2), (1,3), (1,4), (2,5)... which exist in PARTSUPP.
 
 ---
 
@@ -246,6 +247,11 @@ After implementation, verify:
 SELECT COUNT(DISTINCT ps_partkey), COUNT(DISTINCT ps_suppkey), COUNT(*)
 FROM tpch_harsha.PARTSUPP;
 -- Expected: 200000, 10000, 800000
+
+-- LINEITEM coverage (references PARTSUPP)
+SELECT COUNT(DISTINCT l_partkey), COUNT(DISTINCT l_suppkey), COUNT(*)
+FROM tpch_harsha.LINEITEM;
+-- Expected: 200000, 10000, 6001215
 
 -- inventory coverage
 SELECT COUNT(DISTINCT inv_item_sk), COUNT(DISTINCT inv_date_sk),

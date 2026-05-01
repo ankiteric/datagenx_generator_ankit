@@ -408,34 +408,30 @@ def build_fk_appendages(cursor, table):
                 min_val = min_val if min_val is not None else 0
                 col_info.append((col, ref_col, distinct_count, min_val))
 
-            # Sort by distinct count ascending (smaller domains first)
-            col_info.sort(key=lambda x: x[2])
+            # N-CYCLING for composite FK references
+            # Must generate pairs that MATCH the referenced table's n-cycling pattern.
+            # The referenced table uses: largest=div, others=mod
+            # We use the same pattern, but wrap with mod(rownum-1, ref_row_count) to cycle.
 
-            # For composite FK referencing another table:
-            # Must generate pairs that exist in the referenced table.
-            # Use same formula as the referenced table, but cycle through ref_row_count.
-            #
-            # - Smaller domains: mod(mod(rownum-1, ref_row_count), distinct_count)+min_val
-            # - Largest domain: div(mod(rownum-1, ref_row_count), rows_per_large)+min_val
+            # Sort by distinct count DESCENDING (largest first) - matches n-cycling
+            col_info.sort(key=lambda x: x[2], reverse=True)
 
-            # All but the last (largest) use mod cycling
-            divisor = 1
-            for col, ref_col, distinct_count, min_val in col_info[:-1]:
-                if divisor == 1:
-                    expr = f"mod(mod(rownum-1, {ref_row_count}), {distinct_count})+{min_val}"
+            # Calculate rows_per_largest (same formula as n-cycling in referenced table)
+            largest_distinct = col_info[0][2]
+            rows_per_largest = max(1, ref_row_count // largest_distinct)
+
+            for i, (col, ref_col, distinct_count, min_val) in enumerate(col_info):
+                if i == 0:
+                    # Largest dimension: div (grouped)
+                    expr = f"div(mod(rownum-1, {ref_row_count}), {rows_per_largest})+{min_val}"
+                    print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
+                          f"n-cycling {ref_row_count} pairs, rows_per_value={rows_per_largest} -> {expr}")
                 else:
-                    expr = f"mod(div(mod(rownum-1, {ref_row_count}), {divisor}), {distinct_count})+{min_val}"
+                    # Other dimensions: mod (cycling)
+                    expr = f"mod(mod(rownum-1, {ref_row_count}), {distinct_count})+{min_val}"
+                    print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
+                          f"n-cycling {ref_row_count} pairs, cycling mod {distinct_count} -> {expr}")
                 appendages[col] = expr
-                print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
-                      f"cycling {ref_row_count} pairs, min={min_val}, divisor={divisor} -> {expr}")
-                divisor *= distinct_count
-
-            # Largest domain also uses mod to stay within valid range
-            large_col, large_refcol, large_count, large_min = col_info[-1]
-            large_expr = f"mod(div(mod(rownum-1, {ref_row_count}), {divisor}), {large_count})+{large_min}"
-            appendages[large_col] = large_expr
-            print(f"      Composite FK {large_col} -> {actual_ref}.{large_refcol}: "
-                  f"cycling {ref_row_count} pairs, min={large_min}, divisor={divisor} -> {large_expr}")
 
     return appendages
 

@@ -561,37 +561,29 @@ def _try_sparse_date_expression(cursor, database, table, column, col_type):
     # Extract weights from histogram (distribution shape - OK to use)
     # We DO NOT use actual date values from histogram (would be data leak)
     weights = []
-    has_null = False
     prev_cum = 0.0
 
     for bucket in buckets:
-        raw_value = bucket[0]
         cum_freq = bucket[1]
         weights.append(round(cum_freq - prev_cum, 6))
         prev_cum = cum_freq
 
-        # Check if any bucket represents zero date (which becomes NULL)
-        if isinstance(raw_value, str) and raw_value.startswith("0000-00-00"):
-            has_null = True
-
     # Generate SYNTHETIC date values - sequential from base date
     # We use synthetic dates to preserve privacy while maintaining distribution shape
+    # NOTE: MySQL's '0000-00-00' is a valid date (not NULL), so we don't need
+    # special handling for it - we just generate synthetic dates for all buckets
     date_values = []
 
     for i in range(n_distinct):
-        if has_null and i == 0:
-            # If source had zero dates, generate NULL for first bucket
-            date_values.append("NULL")
+        # Generate synthetic sequential dates
+        if col_type == "date":
+            # TIMESTAMP 'YYYY-MM-DD HH:MM:SS' + INTERVAL N DAY
+            date_values.append(f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL {i} DAY")
+        elif col_type in ("datetime", "timestamp"):
+            # For datetime, space values by 1 hour each
+            date_values.append(f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {i} HOUR")
         else:
-            # Generate synthetic sequential dates
-            if col_type == "date":
-                # TIMESTAMP 'YYYY-MM-DD HH:MM:SS' + INTERVAL N DAY
-                date_values.append(f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL {i} DAY")
-            elif col_type in ("datetime", "timestamp"):
-                # For datetime, space values by 1 hour each
-                date_values.append(f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {i} HOUR")
-            else:
-                return None  # TIME columns use dense approach
+            return None  # TIME columns use dense approach
 
     # Generate weighted CASE expression
     case_lines = [f"when {i+1} then {val}" for i, val in enumerate(date_values)]
