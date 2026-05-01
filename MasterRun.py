@@ -291,13 +291,16 @@ def build_fk_appendages(cursor, table):
             # Sort by source_distinct DESCENDING (largest first)
             pk_fk_info.sort(key=lambda x: x[3], reverse=True)
 
-            # Calculate rows per largest value
+            # Calculate rows per largest value using CEILING division
+            # This ensures div() never exceeds source_distinct, avoiding FK violations
+            # and eliminating need for mod() wrapper (which causes PK collisions)
             largest_source = pk_fk_info[0][3]
-            rows_per_largest = max(1, source_row_count // largest_source)
+            rows_per_largest = max(1, (source_row_count + largest_source - 1) // largest_source)
 
             for i, (col, ref_table, ref_col, source_distinct, ref_distinct, min_val) in enumerate(pk_fk_info):
                 if i == 0:
                     # Largest dimension: grouped via div
+                    # With ceiling division, div() stays within [0, source_distinct-1]
                     expr = f"div(rownum-1, {rows_per_largest})+{min_val}"
                     print(f"      FK+PK {col} -> {ref_table}.{ref_col}: "
                           f"source={source_distinct}, rows_per_value={rows_per_largest}, "
@@ -334,37 +337,113 @@ def build_fk_appendages(cursor, table):
     has_non_fk_pk_columns = len(pk_columns - pk_fk_columns) > 0
 
     if is_composite_pk and has_pk_fk_columns and has_non_fk_pk_columns:
-        # Partial FK+PK case: FK columns in PK use mod() cycling for uniqueness
+        # Partial FK+PK case: FK columns in PK use mod() cycling
+        # Non-FK PK columns use div() grouping to coordinate (avoid PK collisions)
+        # Composite FKs (not in PK) use n-cycling to generate valid pairs
+
+        # First, calculate the cycle length for FK+PK columns (product of their distinct counts)
+        fk_pk_cycle_length = 1
         for constraint_name, fk_cols in constraints.items():
             for col, ref_table, ref_col in fk_cols:
-                actual_ref = tgt_canonical.get(ref_table.lower())
-                if actual_ref is None:
-                    continue
-
                 if col in pk_columns:
-                    # FK column that is part of composite PK - use mod() cycling
-                    # Use SOURCE distinct count (how many FK values are actually used)
-                    # not reference table count (which may be larger)
                     cursor.execute(
                         f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
                     )
                     source_distinct = cursor.fetchone()[0]
-                    # Get MIN from target schema (for valid FK values)
+                    fk_pk_cycle_length *= source_distinct
+
+        # Handle non-FK PK columns with mod() cycling
+        # Using mod() gives exact distinct count; no collision risk since
+        # product of all PK column distinct counts >> total rows
+        non_fk_pk_cols = pk_columns - pk_fk_columns
+        for col in non_fk_pk_cols:
+            cursor.execute(
+                f"SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
+            )
+            source_distinct, min_val = cursor.fetchone()
+            min_val = min_val if min_val is not None else 1
+            expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+            appendages[col] = expr
+            print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
+
+        for constraint_name, fk_cols in constraints.items():
+            # Separate columns into PK and non-PK groups
+            pk_cols_in_constraint = [(c, rt, rc) for c, rt, rc in fk_cols if c in pk_columns]
+            non_pk_cols_in_constraint = [(c, rt, rc) for c, rt, rc in fk_cols if c not in pk_columns]
+
+            # Handle FK+PK columns with mod() cycling
+            for col, ref_table, ref_col in pk_cols_in_constraint:
+                actual_ref = tgt_canonical.get(ref_table.lower())
+                if actual_ref is None:
+                    continue
+                cursor.execute(
+                    f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
+                )
+                source_distinct = cursor.fetchone()[0]
+                cursor.execute(
+                    f"SELECT MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                )
+                min_val = cursor.fetchone()[0]
+                min_val = min_val if min_val is not None else 1
+                expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+                appendages[col] = expr
+                print(f"      FK+PK {col} -> {actual_ref}.{ref_col}: cycling mod({source_distinct})+{min_val}")
+
+            # Handle non-PK FK columns
+            if len(non_pk_cols_in_constraint) == 1:
+                # Single-column FK - use normal FK expression
+                col, ref_table, ref_col = non_pk_cols_in_constraint[0]
+                actual_ref = tgt_canonical.get(ref_table.lower())
+                if actual_ref is None:
+                    continue
+                expression, description = build_single_fk_expression(
+                    cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
+                )
+                appendages[col] = expression
+                print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
+
+            elif len(non_pk_cols_in_constraint) >= 2:
+                # Composite FK (not in PK) - use n-cycling to match referenced table
+                ref_table = non_pk_cols_in_constraint[0][1]
+                actual_ref = tgt_canonical.get(ref_table.lower())
+                if actual_ref is None:
+                    print(f"      Composite FK -> {ref_table}: "
+                          f"SKIPPED (referenced table not yet in {TARGET_SCHEMA})")
+                    continue
+
+                # Get row count of referenced table (total valid pairs)
+                cursor.execute(f"SELECT COUNT(*) FROM `{TARGET_SCHEMA}`.`{actual_ref}`")
+                ref_row_count = cursor.fetchone()[0]
+
+                # Get distinct counts and min values for each column
+                col_info = []
+                for col, _, ref_col in non_pk_cols_in_constraint:
                     cursor.execute(
-                        f"SELECT MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+                        f"SELECT COUNT(DISTINCT `{ref_col}`), MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
                     )
-                    min_val = cursor.fetchone()[0]
-                    min_val = min_val if min_val is not None else 1
-                    expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+                    distinct_count, min_val = cursor.fetchone()
+                    min_val = min_val if min_val is not None else 0
+                    col_info.append((col, ref_col, distinct_count, min_val))
+
+                # N-CYCLING: Sort by distinct count DESCENDING (largest first)
+                col_info.sort(key=lambda x: x[2], reverse=True)
+
+                # Use CEILING division (matches referenced table)
+                largest_distinct = col_info[0][2]
+                rows_per_largest = max(1, (ref_row_count + largest_distinct - 1) // largest_distinct)
+
+                for i, (col, ref_col, distinct_count, min_val) in enumerate(col_info):
+                    if i == 0:
+                        # Largest dimension: div (grouped)
+                        expr = f"div(mod(rownum-1, {ref_row_count}), {rows_per_largest})+{min_val}"
+                        print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
+                              f"n-cycling {ref_row_count} pairs, rows_per_value={rows_per_largest} -> {expr}")
+                    else:
+                        # Other dimensions: mod (cycling)
+                        expr = f"mod(mod(rownum-1, {ref_row_count}), {distinct_count})+{min_val}"
+                        print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
+                              f"n-cycling {ref_row_count} pairs, cycling mod {distinct_count} -> {expr}")
                     appendages[col] = expr
-                    print(f"      FK+PK {col} -> {actual_ref}.{ref_col}: cycling mod({source_distinct})+{min_val}")
-                else:
-                    # FK column not in PK - use normal FK expression
-                    expression, description = build_single_fk_expression(
-                        cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
-                    )
-                    appendages[col] = expression
-                    print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
         return appendages
 
@@ -416,13 +495,13 @@ def build_fk_appendages(cursor, table):
             # Sort by distinct count DESCENDING (largest first) - matches n-cycling
             col_info.sort(key=lambda x: x[2], reverse=True)
 
-            # Calculate rows_per_largest (same formula as n-cycling in referenced table)
+            # Calculate rows_per_largest using CEILING division (matches referenced table)
             largest_distinct = col_info[0][2]
-            rows_per_largest = max(1, ref_row_count // largest_distinct)
+            rows_per_largest = max(1, (ref_row_count + largest_distinct - 1) // largest_distinct)
 
             for i, (col, ref_col, distinct_count, min_val) in enumerate(col_info):
                 if i == 0:
-                    # Largest dimension: div (grouped)
+                    # Largest dimension: div (grouped), cycling through ref_row_count pairs
                     expr = f"div(mod(rownum-1, {ref_row_count}), {rows_per_largest})+{min_val}"
                     print(f"      Composite FK {col} -> {actual_ref}.{ref_col}: "
                           f"n-cycling {ref_row_count} pairs, rows_per_value={rows_per_largest} -> {expr}")

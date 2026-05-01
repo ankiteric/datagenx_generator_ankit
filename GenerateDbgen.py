@@ -936,16 +936,18 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             col_type = column_types.get(col)
             synthetic = ""
 
+            # 🟢 CHECK generated_appendages FIRST for ALL columns
+            # MasterRun.py may have generated expressions for FK, PK, or composite FK columns
+            if col in generated_appendages:
+                synthetic = generated_appendages[col]
+
             # 🔴 FOREIGN KEY → use sparse or dense approach based on histogram type
-            if col in foreign_keys:
-                if col in generated_appendages:
-                    synthetic = generated_appendages[col]
-                else:
-                    ref_table, ref_col = foreign_keys[col]
-                    # Use unified FK expression builder
-                    synthetic, _ = build_single_fk_expression(
-                        cursor, database, target_database, table, col, ref_table, ref_col
-                    )
+            elif col in foreign_keys:
+                ref_table, ref_col = foreign_keys[col]
+                # Use unified FK expression builder
+                synthetic, _ = build_single_fk_expression(
+                    cursor, database, target_database, table, col, ref_table, ref_col
+                )
 
             # 🔴 PRIMARY KEY or AUTO_INCREMENT
             elif (

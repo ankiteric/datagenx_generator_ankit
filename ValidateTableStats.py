@@ -247,17 +247,9 @@ def report_histogram_comparison(results, indexed_cols, column_types, verbose=Tru
 
 
 def report_table_stats(orig, new, verbose=True):
-    labels = ["TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH", "INDEX_LENGTH"]
-    output_lines = []
-    for i, label in enumerate(labels):
-        diff = pct_diff(orig[i], new[i])
-        status = "OK" if diff < 0.10 else "DIVERGED"
-        if verbose or status == "DIVERGED":
-            output_lines.append(f"{label:16} diff={diff:.2%} → {status}")
-    if output_lines:
-        print("\n📊 TABLE STATISTICS COMPARISON")
-        for line in output_lines:
-            print(line)
+    # Table statistics (AVG_ROW_LENGTH, DATA_LENGTH, etc.) are not useful
+    # for query plan comparison - they depend on actual data content, not distribution
+    pass
 
 
 def report_index_stats(orig, new, verbose=True):
