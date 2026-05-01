@@ -274,42 +274,41 @@ def build_fk_appendages(cursor, table):
                     pk_fk_info.append((col, actual_ref, ref_col, source_distinct, ref_distinct, min_val))
 
         if len(pk_fk_info) >= 2:
-            # Sort by SOURCE distinct count ascending (smaller domains first)
-            # This determines the odometer order
-            pk_fk_info.sort(key=lambda x: x[3])
-
-            # For full coverage of ALL domains using SOURCE distinct counts:
-            # - Smaller domains: use mod(rownum-1, source_distinct)+min_val to cycle
-            # - Largest domain: use div with source-based divisor to match source cardinality
+            # N-CYCLING APPROACH for composite FK+PK (any number of columns)
+            # See N_CYCLING_COMPOSITE_FK_PK.md for detailed explanation.
             #
-            # Key insight: divisor for largest = total_rows / source_distinct
-            # This ensures we generate exactly source_distinct values
+            # Problem: Odometer can only give full coverage to ONE dimension.
+            # Solution: Largest dimension uses div (grouping), all others use mod (cycling).
+            #
+            # Pattern:
+            #   largest_col = div(rownum-1, rows_per_largest) + min  (grouped)
+            #   other_cols  = mod(rownum-1, distinct) + min          (cycling)
+            #
+            # This guarantees:
+            #   - Full coverage of ALL dimensions
+            #   - Unique PK combinations (when cycling cols wrap, largest has advanced)
 
-            # All but the last (largest) use mod cycling with SOURCE distinct counts
-            divisor = 1
-            for col, ref_table, ref_col, source_distinct, ref_distinct, min_val in pk_fk_info[:-1]:
-                if divisor == 1:
-                    expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+            # Sort by source_distinct DESCENDING (largest first)
+            pk_fk_info.sort(key=lambda x: x[3], reverse=True)
+
+            # Calculate rows per largest value
+            largest_source = pk_fk_info[0][3]
+            rows_per_largest = max(1, source_row_count // largest_source)
+
+            for i, (col, ref_table, ref_col, source_distinct, ref_distinct, min_val) in enumerate(pk_fk_info):
+                if i == 0:
+                    # Largest dimension: grouped via div
+                    expr = f"div(rownum-1, {rows_per_largest})+{min_val}"
+                    print(f"      FK+PK {col} -> {ref_table}.{ref_col}: "
+                          f"source={source_distinct}, rows_per_value={rows_per_largest}, "
+                          f"min={min_val} -> {expr}")
                 else:
-                    expr = f"mod(div(rownum-1, {divisor}), {source_distinct})+{min_val}"
+                    # Other dimensions: cycling via mod
+                    expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+                    print(f"      FK+PK {col} -> {ref_table}.{ref_col}: "
+                          f"source={source_distinct}, cycling, "
+                          f"min={min_val} -> {expr}")
                 appendages[col] = expr
-                print(f"      FK+PK {col} -> {ref_table}.{ref_col}: "
-                      f"source={source_distinct}, ref={ref_distinct}, min={min_val}, divisor={divisor} -> {expr}")
-                divisor *= source_distinct
-
-            # Largest domain: use same divisor chain to maintain PK uniqueness
-            # The generated distinct count = min(source_distinct, rows/divisor)
-            large_col, large_ref, large_refcol, large_source, large_ref_distinct, large_min = pk_fk_info[-1]
-
-            # Calculate achievable distinct count with proper odometer
-            achievable = source_row_count // divisor + 1 if divisor > 0 else source_row_count
-            actual_distinct = min(large_source, achievable)
-
-            large_expr = f"mod(div(rownum-1, {divisor}), {large_source})+{large_min}"
-            appendages[large_col] = large_expr
-            print(f"      FK+PK {large_col} -> {large_ref}.{large_refcol}: "
-                  f"source={large_source}, ref={large_ref_distinct}, achievable={achievable}, "
-                  f"min={large_min}, divisor={divisor} -> {large_expr}")
 
         # Handle any remaining FK-only columns (not part of PK)
         for constraint_name, fk_cols in constraints.items():
