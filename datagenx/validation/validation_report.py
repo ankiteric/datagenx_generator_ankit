@@ -176,18 +176,29 @@ def histogram_probabilities(hist):
         cumulative = bucket[-2] if hist_type == "equi-height" else bucket[1]
         probs.append(max(0.0, cumulative - prev))
         prev = cumulative
-    return probs
+    # Sort by mass so validation compares distribution shape, not literal
+    # bucket endpoint values. This is important for synthetic string domains.
+    return sorted(probs, reverse=True)
 
 
 def histogram_diff(source_hist, target_hist):
     if not source_hist or not target_hist:
-        return 1.0
+        return 1.0, 0, 0, "unknown", "unknown"
     source_probs = histogram_probabilities(source_hist)
     target_probs = histogram_probabilities(target_hist)
-    n = min(len(source_probs), len(target_probs))
+    n = max(len(source_probs), len(target_probs))
     if n == 0:
-        return 1.0
-    return 0.5 * sum(abs(source_probs[i] - target_probs[i]) for i in range(n))
+        return 1.0, len(source_probs), len(target_probs), source_hist.get("histogram-type", "unknown"), target_hist.get("histogram-type", "unknown")
+    source_probs = source_probs + [0.0] * (n - len(source_probs))
+    target_probs = target_probs + [0.0] * (n - len(target_probs))
+    diff = 0.5 * sum(abs(source_probs[i] - target_probs[i]) for i in range(n))
+    return (
+        diff,
+        len(source_hist.get("buckets", [])),
+        len(target_hist.get("buckets", [])),
+        source_hist.get("histogram-type", "unknown"),
+        target_hist.get("histogram-type", "unknown"),
+    )
 
 
 def get_histograms(cursor, schema, table):
@@ -221,9 +232,24 @@ def get_histogram_summary(cursor, source_schema, target_schema, tables):
             elif col not in target_hist:
                 diff = 1.0
                 reason = "missing in target"
+                source_buckets = len(source_hist[col].get("buckets", []))
+                target_buckets = 0
+                source_histogram_type = source_hist[col].get("histogram-type", "unknown")
+                target_histogram_type = "missing"
             else:
-                diff = histogram_diff(source_hist[col], target_hist[col])
-                reason = "compared"
+                (
+                    diff,
+                    source_buckets,
+                    target_buckets,
+                    source_histogram_type,
+                    target_histogram_type,
+                ) = histogram_diff(source_hist[col], target_hist[col])
+                reason = "distribution compared"
+            if col not in source_hist:
+                source_buckets = 0
+                target_buckets = len(target_hist[col].get("buckets", []))
+                source_histogram_type = "missing"
+                target_histogram_type = target_hist[col].get("histogram-type", "unknown")
             col_type = column_types.get(col, "unknown")
             indexed = col in indexed_cols
             if diff < 0.05:
@@ -239,6 +265,10 @@ def get_histogram_summary(cursor, source_schema, target_schema, tables):
                 "column": col,
                 "column_type": col_type,
                 "indexed": indexed,
+                "source_buckets": source_buckets,
+                "target_buckets": target_buckets,
+                "source_histogram_type": source_histogram_type,
+                "target_histogram_type": target_histogram_type,
                 "histogram_diff": diff,
                 "diff_pct": diff * 100,
                 "reason": reason,

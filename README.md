@@ -217,6 +217,15 @@ Histogram cloning is part of target creation, not validation. `MasterRun.py`
 clones histograms even when validation is skipped, because `validate.py stats`
 expects target histograms to exist.
 
+Histogram validation compares distribution shape, not literal bucket values.
+For each source/target histogram pair, validation extracts per-bucket frequency
+mass from MySQL's cumulative bucket probabilities, sorts those masses, pads
+missing buckets with zero, and compares the resulting bucket-frequency shape.
+This lets synthetic domains differ from source domains while still checking
+bucket count and frequency drift.
+
+More detail: [Histogram Comparison](docs/HISTOGRAM_COMPARISON.md).
+
 If validation reports `missing in target` for histograms, rerun:
 
 ```bash

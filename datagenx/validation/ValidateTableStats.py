@@ -54,15 +54,19 @@ def histogram_difference(h1, h2):
             cumulative = b[-2] if hist_type == "equi-height" else b[1]
             p.append(max(0.0, cumulative - prev))
             prev = cumulative
-        return p
+        # Sort by mass so synthetic bucket values can differ from source values.
+        # This compares distribution shape, not literal bucket endpoints.
+        return sorted(p, reverse=True)
 
     p1 = probs(h1)
     p2 = probs(h2)
 
-    n = min(len(p1), len(p2))
+    n = max(len(p1), len(p2))
     if n == 0:
         return 1.0
 
+    p1 = p1 + [0.0] * (n - len(p1))
+    p2 = p2 + [0.0] * (n - len(p2))
     return 0.5 * sum(abs(p1[i] - p2[i]) for i in range(n))
 
 
@@ -78,7 +82,15 @@ def compare_histograms(h1, h2):
             results.append((col, 1.0, "missing in target"))
         else:
             diff = histogram_difference(h1[col], h2[col])
-            results.append((col, diff, f"diff = {diff:.5f}"))
+            src_buckets = len(h1[col].get("buckets", []))
+            tgt_buckets = len(h2[col].get("buckets", []))
+            src_type = h1[col].get("histogram-type", "unknown")
+            tgt_type = h2[col].get("histogram-type", "unknown")
+            results.append((
+                col,
+                diff,
+                f"distribution_diff = {diff:.5f}, buckets {src_buckets}->{tgt_buckets}, type {src_type}->{tgt_type}",
+            ))
     return results
 
 
