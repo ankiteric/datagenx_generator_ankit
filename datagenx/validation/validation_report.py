@@ -2,6 +2,7 @@
 """Generate an HTML validation report for DataGenX source/target schemas."""
 
 import argparse
+import html
 import json
 from pathlib import Path
 
@@ -135,19 +136,33 @@ def get_row_counts(cursor, source_schema, target_schema, tables):
 def get_distinct_summary(cursor, source_schema, target_schema, tables):
     rows = []
     for table in tables:
+        indexed_cols = get_indexed_columns(cursor, source_schema, table)
+        column_types = get_column_types(cursor, source_schema, table)
         for col in get_columns(cursor, source_schema, table):
             cursor.execute(f"SELECT COUNT(DISTINCT `{col}`) FROM `{source_schema}`.`{table}`")
             source_count = cursor.fetchone()[0]
             cursor.execute(f"SELECT COUNT(DISTINCT `{col}`) FROM `{target_schema}`.`{table}`")
             target_count = cursor.fetchone()[0]
             diff = pct_diff(source_count, target_count)
+            col_type = column_types.get(col, "unknown")
+            indexed = col in indexed_cols
+            if diff < 0.05:
+                status = "PASS"
+            elif is_string_type(col_type) and not indexed:
+                status = "NOTE"
+            elif is_decimal_type(col_type) and not indexed:
+                status = "NOTE"
+            else:
+                status = "FAIL"
             rows.append({
                 "table": table,
                 "column": col,
+                "column_type": col_type,
+                "indexed": indexed,
                 "source_distinct": source_count,
                 "target_distinct": target_count,
                 "diff_pct": diff * 100,
-                "status": "PASS" if diff < 20 else "FAIL",
+                "status": status,
             })
     return pd.DataFrame(rows)
 
@@ -306,8 +321,149 @@ def get_fk_orphans(cursor, source_schema, target_schema):
     return pd.DataFrame(rows)
 
 
+def get_row_overlap(cursor, source_schema, target_schema, tables):
+    rows = []
+    for table in tables:
+        columns = get_columns(cursor, source_schema, table)
+        if not columns:
+            continue
+        hash_expr = "MD5(CONCAT_WS('|', {}))".format(
+            ", ".join(f"COALESCE(CAST(`{col}` AS CHAR), '<NULL>')" for col in columns)
+        )
+        query = f"""
+            WITH source_rows AS (
+                SELECT {hash_expr} AS row_hash
+                FROM `{source_schema}`.`{table}`
+                GROUP BY row_hash
+            ),
+            target_rows AS (
+                SELECT {hash_expr} AS row_hash
+                FROM `{target_schema}`.`{table}`
+                GROUP BY row_hash
+            )
+            SELECT
+                (SELECT COUNT(*) FROM source_rows) AS source_unique_rows,
+                (SELECT COUNT(*) FROM target_rows) AS target_unique_rows,
+                (
+                    SELECT COUNT(*)
+                    FROM source_rows
+                    INNER JOIN target_rows USING (row_hash)
+                ) AS overlapping_unique_rows
+        """
+        cursor.execute(query)
+        source_unique, target_unique, overlap = cursor.fetchone()
+        denom = max(source_unique or 0, target_unique or 0, 1)
+        overlap_pct = (overlap or 0) * 100 / denom
+        rows.append({
+            "table": table,
+            "source_unique_rows": source_unique,
+            "target_unique_rows": target_unique,
+            "overlapping_unique_rows": overlap,
+            "overlap_pct": overlap_pct,
+            "status": "PASS" if overlap_pct < 1 else "NOTE",
+        })
+    return pd.DataFrame(rows)
+
+
 def figure_to_html(fig, include_plotlyjs=False):
     return fig.to_html(full_html=False, include_plotlyjs=include_plotlyjs)
+
+
+def status_rank(status):
+    return {"FAIL": 3, "NOTE": 2, "PASS": 1}.get(status, 0)
+
+
+def worst_status(statuses):
+    statuses = [status for status in statuses if status]
+    if not statuses:
+        return "PASS"
+    return max(statuses, key=status_rank)
+
+
+def status_badge(status):
+    safe = html.escape(str(status))
+    return f"<span class='badge {safe.lower()}'>{safe}</span>"
+
+
+def status_counts(df):
+    if df.empty or "status" not in df:
+        return {"PASS": 0, "NOTE": 0, "FAIL": 0}
+    return {status: int((df["status"] == status).sum()) for status in ("PASS", "NOTE", "FAIL")}
+
+
+def build_summary_cards(row_df, hist_df, distinct_df, orphan_df, overlap_df):
+    groups = [
+        ("Rows", status_counts(row_df), "table row counts"),
+        ("Histograms", status_counts(hist_df), "column distribution shape"),
+        ("Distinct", status_counts(distinct_df), "per-column cardinality"),
+        ("FK Integrity", status_counts(orphan_df), "source and target orphan checks"),
+        ("Privacy", status_counts(overlap_df), "exact row overlap"),
+    ]
+    cards = ["<section><h2>Dashboard</h2><div class='cards'>"]
+    for title, counts, subtitle in groups:
+        overall = "FAIL" if counts["FAIL"] else "NOTE" if counts["NOTE"] else "PASS"
+        cards.append(
+            "<div class='card'>"
+            f"<div class='card-title'>{html.escape(title)}</div>"
+            f"<div class='card-status'>{status_badge(overall)}</div>"
+            f"<div class='card-counts'>"
+            f"<span class='pass'>PASS {counts['PASS']}</span>"
+            f"<span class='note'>NOTE {counts['NOTE']}</span>"
+            f"<span class='fail'>FAIL {counts['FAIL']}</span>"
+            "</div>"
+            f"<div class='card-subtitle'>{html.escape(subtitle)}</div>"
+            "</div>"
+        )
+    cards.append("</div></section>")
+    return "".join(cards)
+
+
+def build_table_matrix(row_df, hist_df, distinct_df, orphan_df, overlap_df, tables):
+    rows = []
+    target_orphans = orphan_df[orphan_df["schema"] == "target"] if not orphan_df.empty else orphan_df
+    for table in tables:
+        row_status = row_df.loc[row_df["table"] == table, "status"].tolist()
+        hist_rows = hist_df[hist_df["table"] == table] if not hist_df.empty else hist_df
+        distinct_rows = distinct_df[distinct_df["table"] == table] if not distinct_df.empty else distinct_df
+        orphan_rows = target_orphans[target_orphans["child_table"] == table] if not target_orphans.empty else target_orphans
+        overlap_rows = overlap_df[overlap_df["table"] == table] if not overlap_df.empty else overlap_df
+
+        hist_status = worst_status(hist_rows["status"].tolist()) if not hist_rows.empty else "PASS"
+        distinct_status = worst_status(distinct_rows["status"].tolist()) if not distinct_rows.empty else "PASS"
+        orphan_status = worst_status(orphan_rows["status"].tolist()) if not orphan_rows.empty else "PASS"
+        overlap_status = worst_status(overlap_rows["status"].tolist()) if not overlap_rows.empty else "PASS"
+        overall = worst_status([
+            row_status[0] if row_status else "PASS",
+            hist_status,
+            distinct_status,
+            orphan_status,
+            overlap_status,
+        ])
+
+        top_hist = ""
+        max_hist = 0.0
+        if not hist_rows.empty:
+            top = hist_rows.sort_values("histogram_diff", ascending=False).iloc[0]
+            top_hist = f"{top['column']} ({top['diff_pct']:.2f}%)"
+            max_hist = float(top["diff_pct"])
+
+        max_distinct = float(distinct_rows["diff_pct"].max()) if not distinct_rows.empty else 0.0
+        overlap_pct = float(overlap_rows["overlap_pct"].iloc[0]) if not overlap_rows.empty else 0.0
+
+        rows.append({
+            "table": table,
+            "overall": overall,
+            "rows": row_status[0] if row_status else "PASS",
+            "histograms": hist_status,
+            "distinct": distinct_status,
+            "fk_integrity": orphan_status,
+            "privacy": overlap_status,
+            "top_histogram_drift": top_hist,
+            "max_histogram_diff_pct": max_hist,
+            "max_distinct_diff_pct": max_distinct,
+            "exact_row_overlap_pct": overlap_pct,
+        })
+    return pd.DataFrame(rows)
 
 
 def build_summary_figure(row_df, hist_df, distinct_df, orphan_df):
@@ -335,6 +491,47 @@ def build_summary_figure(row_df, hist_df, distinct_df, orphan_df):
         barmode="stack",
         height=420,
         margin=dict(l=40, r=20, t=60, b=40),
+    )
+    return fig
+
+
+def build_top_drift_figure(hist_df, distinct_df):
+    rows = []
+    if not hist_df.empty:
+        for _, row in hist_df.iterrows():
+            rows.append({
+                "label": f"{row['table']}.{row['column']}",
+                "type": "histogram",
+                "diff_pct": float(row["diff_pct"]),
+                "status": row["status"],
+            })
+    if not distinct_df.empty:
+        for _, row in distinct_df.iterrows():
+            rows.append({
+                "label": f"{row['table']}.{row['column']}",
+                "type": "distinct",
+                "diff_pct": float(row["diff_pct"]),
+                "status": row["status"],
+            })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return None
+    df = df.sort_values("diff_pct", ascending=False).head(20).sort_values("diff_pct")
+    color_map = {"PASS": "#2ca02c", "NOTE": "#ffbf00", "FAIL": "#d62728"}
+    fig = go.Figure()
+    fig.add_bar(
+        x=df["diff_pct"],
+        y=df["label"],
+        orientation="h",
+        marker_color=[color_map.get(status, "#888") for status in df["status"]],
+        customdata=df[["type", "status"]],
+        hovertemplate="%{y}<br>type=%{customdata[0]}<br>status=%{customdata[1]}<br>diff=%{x:.2f}%<extra></extra>",
+    )
+    fig.update_layout(
+        title="Top Drift Columns",
+        height=max(420, 28 * len(df) + 120),
+        margin=dict(l=180, r=30, t=60, b=40),
+        xaxis_title="difference %",
     )
     return fig
 
@@ -368,6 +565,134 @@ def build_histogram_heatmap(hist_df):
     return fig
 
 
+def build_table_matrix_figure(matrix_df):
+    if matrix_df.empty:
+        return None
+    metrics = ["rows", "histograms", "distinct", "fk_integrity", "privacy"]
+    status_to_value = {"PASS": 0, "NOTE": 1, "FAIL": 2}
+    z = [
+        [status_to_value.get(row[metric], 0) for metric in metrics]
+        for _, row in matrix_df.iterrows()
+    ]
+    text = [
+        [row[metric] for metric in metrics]
+        for _, row in matrix_df.iterrows()
+    ]
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=[m.replace("_", " ") for m in metrics],
+            y=matrix_df["table"],
+            text=text,
+            texttemplate="%{text}",
+            colorscale=[
+                [0.0, "#2ca02c"],
+                [0.49, "#2ca02c"],
+                [0.50, "#ffbf00"],
+                [0.74, "#ffbf00"],
+                [0.75, "#d62728"],
+                [1.0, "#d62728"],
+            ],
+            zmin=0,
+            zmax=2,
+            showscale=False,
+        )
+    )
+    fig.update_layout(
+        title="Table Validation Matrix",
+        height=max(360, 40 * len(matrix_df) + 120),
+        margin=dict(l=120, r=30, t=60, b=70),
+    )
+    return fig
+
+
+def build_overlap_figure(overlap_df):
+    if overlap_df.empty:
+        return None
+    df = overlap_df.sort_values("overlap_pct", ascending=True)
+    fig = go.Figure()
+    fig.add_bar(
+        x=df["overlap_pct"],
+        y=df["table"],
+        orientation="h",
+        marker_color=["#ffbf00" if status == "NOTE" else "#2ca02c" for status in df["status"]],
+        hovertemplate="%{y}<br>exact row overlap=%{x:.4f}%<extra></extra>",
+    )
+    fig.update_layout(
+        title="Exact Row Overlap: Source vs Synthetic",
+        height=max(360, 36 * len(df) + 120),
+        margin=dict(l=120, r=30, t=60, b=40),
+        xaxis_title="overlapping unique rows %",
+    )
+    return fig
+
+
+def build_fk_graph(orphan_df):
+    if orphan_df.empty:
+        return None
+    target_rows = orphan_df[orphan_df["schema"] == "target"].copy()
+    if target_rows.empty:
+        return None
+
+    positions = {
+        "region": (0, 3),
+        "nation": (1, 3),
+        "supplier": (2, 4),
+        "customer": (2, 2),
+        "orders": (3, 2),
+        "part": (2, 5),
+        "partsupp": (3, 5),
+        "lineitem": (4, 3.5),
+    }
+    edge_map = {
+        "nation_region": ("region", "nation"),
+        "supplier_nation": ("nation", "supplier"),
+        "customer_nation": ("nation", "customer"),
+        "orders_customer": ("customer", "orders"),
+        "lineitem_orders": ("orders", "lineitem"),
+        "lineitem_partsupp": ("partsupp", "lineitem"),
+    }
+
+    fig = go.Figure()
+    for _, row in target_rows.iterrows():
+        parent, child = edge_map.get(row["check"], (row["parent_table"], row["child_table"]))
+        if parent not in positions or child not in positions:
+            continue
+        x0, y0 = positions[parent]
+        x1, y1 = positions[child]
+        color = "#2ca02c" if row["status"] == "PASS" else "#d62728"
+        fig.add_trace(go.Scatter(
+            x=[x0, x1],
+            y=[y0, y1],
+            mode="lines",
+            line=dict(color=color, width=4),
+            hovertext=f"{row['check']}: {row['orphan_count']} orphans",
+            hoverinfo="text",
+            showlegend=False,
+        ))
+
+    nodes = sorted(set(target_rows["child_table"]).union(set(target_rows["parent_table"])))
+    fig.add_trace(go.Scatter(
+        x=[positions[node][0] for node in nodes if node in positions],
+        y=[positions[node][1] for node in nodes if node in positions],
+        text=[node for node in nodes if node in positions],
+        mode="markers+text",
+        textposition="middle center",
+        marker=dict(size=54, color="#f5f5f5", line=dict(color="#555", width=1.5)),
+        hoverinfo="text",
+        showlegend=False,
+    ))
+    fig.update_layout(
+        title="TPC-H Referential Integrity Graph",
+        height=430,
+        margin=dict(l=30, r=30, t=60, b=30),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        plot_bgcolor="white",
+    )
+    return fig
+
+
 def build_frequency_figure(freq_map):
     if not freq_map:
         return None
@@ -385,6 +710,23 @@ def build_frequency_figure(freq_map):
             name="source" if idx == 1 else None,
             marker_color="#1f77b4",
             showlegend=idx == 1,
+            row=idx,
+            col=1,
+        )
+        df = df.copy()
+        denom = df[["source_count", "target_count"]].max(axis=1).replace(0, 1)
+        df["drift_pct"] = (df["source_count"] - df["target_count"]).abs() * 100 / denom
+        max_drift = df["drift_pct"].max()
+        fig.add_annotation(
+            text=f"max drift {max_drift:.2f}%",
+            xref=f"x{idx if idx > 1 else ''} domain",
+            yref=f"y{idx if idx > 1 else ''} domain",
+            x=0.98,
+            y=0.92,
+            showarrow=False,
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor="#ddd",
+            font=dict(size=11),
             row=idx,
             col=1,
         )
@@ -406,11 +748,35 @@ def build_frequency_figure(freq_map):
     return fig
 
 
+def table_html_from_records(records, title):
+    if not records:
+        return f"<section><h2>{html.escape(title)}</h2><p>No rows.</p></section>"
+    headers = list(records[0].keys())
+    parts = [f"<section><h2>{html.escape(title)}</h2><table class='data-table'><thead><tr>"]
+    for header in headers:
+        parts.append(f"<th>{html.escape(header.replace('_', ' '))}</th>")
+    parts.append("</tr></thead><tbody>")
+    for record in records:
+        parts.append("<tr>")
+        for header in headers:
+            value = record[header]
+            if isinstance(value, float):
+                value = f"{value:.4f}"
+            if header in {"overall", "rows", "histograms", "distinct", "fk_integrity", "privacy", "status"}:
+                parts.append(f"<td>{status_badge(value)}</td>")
+            else:
+                parts.append(f"<td>{html.escape(str(value))}</td>")
+        parts.append("</tr>")
+    parts.append("</tbody></table></section>")
+    return "".join(parts)
+
+
 def table_html(df, title, max_rows=30):
     if df.empty:
         body = "<p>No rows.</p>"
     else:
-        body = df.head(max_rows).to_html(index=False, classes="data-table")
+        display = df.head(max_rows).copy()
+        body = display.to_html(index=False, classes="data-table", escape=True)
         if len(df) > max_rows:
             body += f"<p class='note'>Showing first {max_rows} of {len(df)} rows.</p>"
     return f"<section><h2>{title}</h2>{body}</section>"
@@ -425,6 +791,8 @@ def generate_report(args):
         distinct_df = get_distinct_summary(cursor, args.source_schema, args.target_schema, tables)
         hist_df = get_histogram_summary(cursor, args.source_schema, args.target_schema, tables)
         orphan_df = get_fk_orphans(cursor, args.source_schema, args.target_schema)
+        overlap_df = get_row_overlap(cursor, args.source_schema, args.target_schema, tables)
+        matrix_df = build_table_matrix(row_df, hist_df, distinct_df, orphan_df, overlap_df, tables)
 
         freq_map = {}
         source_tables = set(get_tables(cursor, args.source_schema))
@@ -443,7 +811,11 @@ def generate_report(args):
 
         figures = [
             build_summary_figure(row_df, hist_df, distinct_df, orphan_df),
+            build_table_matrix_figure(matrix_df),
+            build_top_drift_figure(hist_df, distinct_df),
             build_histogram_heatmap(hist_df),
+            build_fk_graph(orphan_df),
+            build_overlap_figure(overlap_df),
             build_frequency_figure(freq_map),
         ]
 
@@ -451,16 +823,28 @@ def generate_report(args):
             "<!doctype html><html><head><meta charset='utf-8'>",
             "<title>DataGenX Validation Report</title>",
             "<style>",
-            "body{font-family:Arial,sans-serif;margin:32px;color:#222}",
+            "body{font-family:Arial,sans-serif;margin:32px;color:#222;background:#fafafa}",
             "h1,h2{margin-bottom:8px}",
             ".meta,.note{color:#666}",
+            ".cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}",
+            ".card{background:white;border:1px solid #ddd;border-radius:8px;padding:16px}",
+            ".card-title{font-weight:700;font-size:14px;color:#444}",
+            ".card-status{font-size:22px;margin:10px 0}",
+            ".card-counts{display:flex;gap:10px;font-size:12px;margin-bottom:8px;flex-wrap:wrap}",
+            ".card-subtitle{font-size:12px;color:#777}",
+            ".badge{display:inline-block;border-radius:999px;padding:3px 8px;font-weight:700;font-size:12px}",
+            ".badge.pass{background:#e7f5e7;color:#1d6b1d}",
+            ".badge.note{background:#fff4cc;color:#805b00}",
+            ".badge.fail{background:#fde2e2;color:#9b1c1c}",
+            ".pass{color:#1d6b1d}.note{color:#805b00}.fail{color:#9b1c1c}",
             ".data-table{border-collapse:collapse;width:100%;font-size:13px}",
             ".data-table th,.data-table td{border:1px solid #ddd;padding:6px;text-align:left}",
             ".data-table th{background:#f5f5f5}",
-            "section{margin:32px 0}",
+            "section{margin:32px 0;background:white;border:1px solid #eee;border-radius:8px;padding:18px}",
             "</style></head><body>",
             "<h1>DataGenX Validation Report</h1>",
             f"<p class='meta'>Source: <code>{args.source_schema}</code> &nbsp; Target: <code>{args.target_schema}</code></p>",
+            build_summary_cards(row_df, hist_df, distinct_df, orphan_df, overlap_df),
         ]
 
         first_figure = True
@@ -470,10 +854,12 @@ def generate_report(args):
                 first_figure = False
 
         html_parts.extend([
+            table_html_from_records(matrix_df.to_dict("records"), "Table-Level Validation Matrix"),
             table_html(row_df, "Row Count Comparison"),
             table_html(top_hist, "Top Histogram Differences"),
             table_html(top_distinct, "Top Distinct Count Differences"),
             table_html(orphan_df, "Referential Integrity Orphan Checks"),
+            table_html(overlap_df, "Exact Row Overlap Checks"),
             "</body></html>",
         ])
 

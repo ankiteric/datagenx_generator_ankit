@@ -201,11 +201,14 @@ Use the project venv when generating validation visuals:
 The report includes:
 
 ```text
-row-count status summary
+dashboard health cards
+table-level validation matrix
+top drift columns
 histogram-difference heatmap
+TPC-H referential-integrity graph and orphan checks
+exact source-vs-synthetic row overlap checks
 selected source-vs-target frequency distributions
 distinct-count differences
-TPC-H referential-integrity orphan checks
 ```
 
 ## Important Behavior
