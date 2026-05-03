@@ -19,6 +19,7 @@ from mysql.connector import Error
 # Global flags (set by argparse)
 VERBOSE = True
 COMPARE_HISTOGRAMS = False  # Disabled by default - histogram comparison is unreliable
+SKIP_VALIDATION = True
 
 from GenerateDbgen import annotate_table_with_histogram, topological_sort, build_single_fk_expression
 from PopulateNewTableAndValidate import (
@@ -573,7 +574,8 @@ def step_b_run_dbgen(cursor, table):
 
 def step_c_create_insert_validate(cursor, table):
     """Create table in target schema, insert generated data, validate."""
-    print(f"  [C] Creating table, inserting data, validating ...")
+    action = "creating table and inserting data" if SKIP_VALIDATION else "creating table, inserting data, validating"
+    print(f"  [C] {action} ...")
 
     ddl_ok = rows_ok = hist_ok = distinct_ok = True
 
@@ -632,6 +634,18 @@ def step_c_create_insert_validate(cursor, table):
     """
     cursor.execute(load_stmt)
 
+    # Clone optimizer histogram metadata as part of target creation, not
+    # validation. The separate validator expects target histograms to exist.
+    clone_histograms(cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table)
+
+    if SKIP_VALIDATION:
+        print(f"      Loaded generated data into `{TARGET_SCHEMA}`.`{table}`")
+        print(f"      Cloned histograms from `{SOURCE_SCHEMA}`.`{table}`")
+        return {
+            "loaded": True,
+            "validation_skipped": True,
+        }
+
     # --- Validate row count ---
     cursor.execute(f"SELECT COUNT(*) FROM `{SOURCE_SCHEMA}`.`{table}`")
     src_rows = cursor.fetchone()[0]
@@ -662,9 +676,6 @@ def step_c_create_insert_validate(cursor, table):
         report_ddl_mismatch(src_ddl, tgt_ddl)
     else:
         print(f"      DDL match: OK")
-
-    # --- Histogram validation (optional - disabled by default) ---
-    clone_histograms(cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table)
 
     # Get column metadata for categorizing mismatches
     indexed_cols = load_indexed_columns(cursor, SOURCE_SCHEMA, table)
@@ -796,6 +807,8 @@ def main():
         elif "error" in r:
             print(f"  {table}: FAILED — {r['error']}")
             any_failure = True
+        elif r.get("validation_skipped"):
+            print(f"  {table}: LOADED  [validation=SKIP]")
         else:
             # When histogram comparison is disabled, don't count it in pass/fail
             if COMPARE_HISTOGRAMS:
@@ -827,6 +840,8 @@ def main():
     if any_failure:
         print("Some tables had validation failures.")
         sys.exit(2)
+    elif SKIP_VALIDATION:
+        print("All tables loaded. Validation was skipped.")
     else:
         print("All tables passed validation.")
 
@@ -842,7 +857,15 @@ if __name__ == "__main__":
                         help="Verbose output (show all results, not just failures)")
     parser.add_argument("--compare-histograms", action="store_true",
                         help="Enable histogram comparison (disabled by default - unreliable)")
+    validation_group = parser.add_mutually_exclusive_group()
+    validation_group.add_argument("--skip-validation", dest="skip_validation",
+                                  action="store_true", default=True,
+                                  help="Create/load generated tables without running validation checks (default)")
+    validation_group.add_argument("--run-validation", dest="skip_validation",
+                                  action="store_false",
+                                  help="Run built-in validation checks after loading each table")
     args = parser.parse_args()
     VERBOSE = args.verbose
     COMPARE_HISTOGRAMS = args.compare_histograms
+    SKIP_VALIDATION = args.skip_validation
     main()

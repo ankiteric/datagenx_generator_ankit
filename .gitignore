@@ -1,2 +1,6 @@
 __pycache__/
 *.py[cod]
+MYSQL_INSTALL_REPORT.md
+dbgen_files/
+dbgen_tmp_out/
+

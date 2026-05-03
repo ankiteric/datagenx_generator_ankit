@@ -1,19 +1,183 @@
+# DataGenX Generator
 
-To cretate the new data:
+Generate synthetic database data that preserves optimizer-relevant statistics
+from a source schema while avoiding direct use of source data values.
+
+## Current TPC-H Setup
+
+The current local setup uses:
+
+```text
+source schema: tpch_vanilla
+target schema: tpch_dbgenx
+```
+
+`tpch_vanilla` is loaded from TPC-H `dbgen` `.tbl` files. `tpch_dbgenx` is
+created by this project.
+
+Expected small TPC-H source data is scale factor `0.01`, with row counts around:
+
+```text
+region       5
+nation       25
+supplier     100
+customer     1500
+part         2000
+partsupp     8000
+orders       15000
+lineitem     about 60000
+```
+
+## Prerequisites
+
+Install MySQL and make password login work for the configured user:
+
+```bash
+sudo apt update
+sudo apt install mysql-server
+sudo mysql -u root
+```
+
+```sql
+ALTER USER 'root'@'localhost'
+IDENTIFIED WITH caching_sha2_password BY 'newpassword';
+FLUSH PRIVILEGES;
+EXIT;
+```
+
+Verify:
+
+```bash
+mysql -u root -pnewpassword -e "SELECT VERSION();"
+```
+
+Install the Python MySQL connector inside the active virtualenv:
+
+```bash
+python3 -m pip install mysql-connector-python
+```
+
+Build the DataGenX Rust `dbgen` binary:
+
+```bash
+cd /home/hmaduri/contribs/dbgen
+cargo build --release --bin dbgen
+```
+
+Expected binary:
+
+```text
+/home/hmaduri/contribs/dbgen/target/release/dbgen
+```
+
+## Required config.py Values
+
+For the current TPC-H workflow, `config.py` should contain:
+
+```python
+HOST = "localhost"
+USER = "root"
+PASSWORD = "newpassword"
+
+SOURCE_SCHEMA = "tpch_vanilla"
+TARGET_SCHEMA = "tpch_dbgenx"
+
+DBGEN_BINARY = "/home/hmaduri/contribs/dbgen/target/release/dbgen"
+DBGEN_FILES_DIR = "dbgen_files"
+DBGEN_TMP_OUT_DIR = "dbgen_tmp_out"
+```
+
+Change only `SOURCE_SCHEMA`, `TARGET_SCHEMA`, and `DBGEN_BINARY` when switching
+environments.
+
+## Load TPC-H Source Data
+
+Build the official TPC-H data generator:
+
+```bash
+cd /home/hmaduri/contribs/tpch-dbgen
+make MACHINE=LINUX DATABASE=MYSQL WORKLOAD=TPCH
+```
+
+Generate small TPC-H source data:
+
+```bash
+./dbgen -vf -s 0.01
+```
+
+Load it into MySQL as `tpch_vanilla`:
+
+```bash
+cd /home/hmaduri/contribs/datagenx_generator
+mysql --local-infile=1 -u root -pnewpassword < load_tpch_vanilla.sql
+```
+
+The load script creates tables, loads `.tbl` files, adds primary/foreign keys,
+and runs `ANALYZE TABLE`.
+
+## Generate Synthetic Data
+
+Run:
+
+```bash
 python3 MasterRun.py
+```
 
-To compare with tpch queries:
-./run_tpch_comparison.sh
+By default, `MasterRun.py` now:
 
-To run validations from one common entry point:
-python3 validate.py
+```text
+generates .dbgen templates
+runs the DataGenX dbgen binary
+creates and loads target tables
+clones MySQL histograms from source to target
+skips built-in validation
+```
 
-Common validation examples:
+To force the older built-in validation path:
 
-python3 validate.py stats
-python3 validate.py stats --table orders --verbose
-python3 validate.py stats --skip-distinct
+```bash
+python3 MasterRun.py --run-validation
+```
 
+## Validate Separately
+
+Use the unified validation entry point:
+
+```bash
+python3 validate.py stats \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx
+```
+
+Faster stats validation:
+
+```bash
+python3 validate.py stats \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --skip-distinct
+```
+
+Run benchmark-specific SQL validation:
+
+```bash
+python3 validate.py sql tpch \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx
+```
+
+Render SQL without executing:
+
+```bash
+python3 validate.py sql tpch \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --render-only
+```
+
+Other validation helpers:
+
+```bash
 python3 validate.py replay \
   --ddl-file dbgen_tmp_out/orders-schema.sql \
   --insert-file dbgen_tmp_out/orders.1.sql
@@ -21,16 +185,21 @@ python3 validate.py replay \
 python3 validate.py plans
 python3 validate.py query q3
 python3 validate.py all --skip-distinct
+```
 
-Run the benchmark-specific SQL validation file:
+## Important Behavior
 
-python3 validate.py sql tpch
-python3 validate.py sql tpcds
+Histogram cloning is part of target creation, not validation. `MasterRun.py`
+clones histograms even when validation is skipped, because `validate.py stats`
+expects target histograms to exist.
 
-Render the SQL without executing it:
+If validation reports `missing in target` for histograms, rerun:
 
-python3 validate.py sql tpch --render-only
-python3 validate.py sql tpcds --render-only
+```bash
+python3 MasterRun.py
+```
+
+then validate again.
 
 
 
