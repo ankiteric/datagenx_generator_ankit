@@ -159,9 +159,21 @@ def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_tab
         description = f"cycling mod({actual_distinct})+{ref_min} (high distinct ratio {distinct_ratio*100:.0f}%)"
         return (expression, description)
 
+    # Try histogram-aware generation first. Singleton FK histograms are common
+    # for dimension references and should preserve their value weights even
+    # when coverage is high (for example TPC-H nation -> region).
+    sparse_result = _try_sparse_fk_expression(
+        cursor, source_db, target_db, table, col, ref_table, ref_col, source_row_count
+    )
+    if sparse_result:
+        return sparse_result
+
     if coverage_ratio < 0.20:
-        # Try sparse approach for low-cardinality FKs
-        sparse_result = _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col)
+        # Non-singleton sparse approaches only apply to low-coverage FKs.
+        sparse_result = _try_sparse_fk_expression(
+            cursor, source_db, target_db, table, col, ref_table, ref_col, source_row_count,
+            singleton_only=False,
+        )
         if sparse_result:
             return sparse_result
         # Fall through to moderate if sparse doesn't apply
@@ -177,7 +189,10 @@ def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_tab
     return _build_dense_fk_expression(cursor, target_db, ref_table, ref_col)
 
 
-def _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col):
+def _try_sparse_fk_expression(
+    cursor, source_db, target_db, table, col, ref_table, ref_col,
+    source_row_count=None, singleton_only=True,
+):
     """Try to build sparse FK expression using FK column's own histogram.
 
     PRIVACY: This function is privacy-safe because:
@@ -214,10 +229,13 @@ def _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_tabl
         # Singleton histogram - use sparse approach directly
         n_distinct = len(buckets)
         return _build_singleton_fk_expression(
-            cursor, target_db, ref_table, ref_col, buckets, n_distinct
+            cursor, target_db, ref_table, ref_col, buckets, n_distinct, source_row_count
         )
 
     elif hist_type == "equi-height":
+        if singleton_only:
+            return None
+
         # Equi-height histogram - check if FK has low cardinality relative to referenced table
         #
         # IMPORTANT: Histogram's estimated_distinct (sum of bucket[3]) is unreliable.
@@ -249,7 +267,7 @@ def _try_sparse_fk_expression(cursor, source_db, target_db, table, col, ref_tabl
     return None  # High cardinality - use dense approach
 
 
-def _build_singleton_fk_expression(cursor, target_db, ref_table, ref_col, buckets, n_distinct):
+def _build_singleton_fk_expression(cursor, target_db, ref_table, ref_col, buckets, n_distinct, source_row_count=None):
     """Build FK expression for singleton histogram (low cardinality).
 
     Samples N evenly-spaced values from the target table and assigns
@@ -279,6 +297,31 @@ def _build_singleton_fk_expression(cursor, target_db, ref_table, ref_col, bucket
         cum_freq = bucket[1]
         weights.append(round(cum_freq - prev_cum, 6))
         prev_cum = cum_freq
+
+    if source_row_count:
+        # Deterministic searched CASE avoids small-table random drift while
+        # still using only distribution weights from source histograms and
+        # synthetic target values.
+        counts = [int(round(w * source_row_count)) for w in weights]
+        diff = source_row_count - sum(counts)
+        if counts:
+            counts[-1] += diff
+
+        case_lines = []
+        cumulative = 0
+        for count, val in zip(counts, sampled_values):
+            if count <= 0:
+                continue
+            cumulative += count
+            case_lines.append(f"when rownum <= {cumulative} then {val}")
+
+        if case_lines:
+            expression = f"""case
+    {' '.join(case_lines)}
+    else {sampled_values[-1]}
+    end"""
+            description = f"sparse ({n_distinct} distinct values, deterministic weighted)"
+            return (expression, description)
 
     # Generate weighted CASE expression
     case_lines = [f"when {i+1} then {val}" for i, val in enumerate(sampled_values)]
@@ -787,6 +830,30 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
             # Redistribute weights evenly for the actual count
             weights = [1.0 / num_values] * num_values
 
+        if row_count and num_values <= 1000:
+            # Deterministic weighted bands avoid random histogram drift for
+            # low-cardinality numeric columns such as TPC-H part.p_size.
+            counts = [int(round(w * row_count)) for w in weights]
+            diff = row_count - sum(counts)
+            if counts:
+                counts[-1] += diff
+
+            cumulative = 0
+            deterministic_lines = []
+            for i, count in enumerate(counts, start=1):
+                if count <= 0:
+                    continue
+                cumulative += count
+                synthetic_val = i / scale if scale > 1 else float(i)
+                deterministic_lines.append(f"when rownum <= {cumulative} then {synthetic_val}")
+
+            if deterministic_lines:
+                final_val = num_values / scale if scale > 1 else float(num_values)
+                return f"""case
+    {' '.join(deterministic_lines)}
+    else {final_val}
+    end"""
+
         return f"""case rand.weighted(array[{','.join(map(str, weights))}])
     {' '.join(case_lines)}
     end"""
@@ -998,20 +1065,17 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                         synthetic = "rownum"
                 else:
                     # Single-column PK or AUTO_INCREMENT → unique per row
-                    # Check if source data is 0-based by looking at histogram
-                    if col in histograms:
-                        min_val, _ = get_min_max_from_histogram(histograms[col])
-                        if min_val is not None:
-                            try:
-                                if int(float(min_val)) == 0:
-                                    synthetic = "rownum-1"
-                                else:
-                                    synthetic = "rownum"
-                            except (ValueError, TypeError):
-                                synthetic = "rownum"
-                        else:
-                            synthetic = "rownum"
-                    else:
+                    # Preserve the source key base. TPC-H dimension keys such
+                    # as region/nation are 0-based, while many other schemas
+                    # are 1-based. Querying MIN is privacy-safe statistical
+                    # metadata and is more reliable than assuming histograms
+                    # exist for every PK.
+                    cursor.execute(f"SELECT MIN(`{col}`) FROM `{database}`.`{table}`")
+                    source_min = cursor.fetchone()[0]
+                    try:
+                        source_min_int = int(source_min) if source_min is not None else 1
+                        synthetic = "rownum" if source_min_int == 1 else f"rownum-1+{source_min_int}"
+                    except (ValueError, TypeError):
                         synthetic = "rownum"
 
             elif col_type in CHAR_TYPES:

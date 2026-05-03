@@ -187,6 +187,27 @@ python3 validate.py query q3
 python3 validate.py all --skip-distinct
 ```
 
+## Visualization Report
+
+Use the project venv when generating validation visuals:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validation_report.py \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --output /tmp/tpch_validation_report.html
+```
+
+The report includes:
+
+```text
+row-count status summary
+histogram-difference heatmap
+selected source-vs-target frequency distributions
+distinct-count differences
+TPC-H referential-integrity orphan checks
+```
+
 ## Important Behavior
 
 Histogram cloning is part of target creation, not validation. `MasterRun.py`

@@ -248,6 +248,37 @@ def build_fk_appendages(cursor, table):
 
     appendages = {}
 
+    def exact_frequency_case_expression(col):
+        """Return deterministic CASE preserving source value frequencies.
+
+        This is useful for non-FK columns in composite primary keys such as
+        TPC-H lineitem.l_linenumber. The companion FK PK column cycles through
+        parent keys, and this expression assigns line numbers in contiguous
+        bands so (orderkey, linenumber) stays unique while the marginal
+        distribution matches the source exactly.
+        """
+        cursor.execute(f"""
+            SELECT `{col}`, COUNT(*)
+            FROM `{SOURCE_SCHEMA}`.`{table}`
+            GROUP BY `{col}`
+            ORDER BY `{col}`
+        """)
+        frequencies = cursor.fetchall()
+        if not frequencies:
+            return None, None
+
+        cumulative = 0
+        case_lines = []
+        for value, count in frequencies:
+            cumulative += count
+            case_lines.append(f"when rownum <= {cumulative} then {value}")
+
+        expression = f"""case
+    {' '.join(case_lines)}
+    else {frequencies[-1][0]}
+    end"""
+        return expression, len(frequencies)
+
     if all_pk_are_fk:
         # Composite PK where all columns are FKs (e.g., PARTSUPP, inventory)
         # Collect info for all PK+FK columns across all constraints
@@ -363,9 +394,17 @@ def build_fk_appendages(cursor, table):
             )
             source_distinct, min_val = cursor.fetchone()
             min_val = min_val if min_val is not None else 1
-            expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+            if source_distinct and source_distinct <= 100:
+                expr, freq_count = exact_frequency_case_expression(col)
+                if expr:
+                    print(f"      PK {col}: exact frequency CASE ({freq_count} values)")
+                else:
+                    expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+                    print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
+            else:
+                expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+                print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
             appendages[col] = expr
-            print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
 
         for constraint_name, fk_cols in constraints.items():
             # Separate columns into PK and non-PK groups
