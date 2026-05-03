@@ -1294,7 +1294,7 @@ if __name__ == "__main__":
     # Sort tables in dependency order
     sorted_tables = topological_sort(all_tables, dependencies)
 
-    out_dir = "dbgen_files"
+    out_dir = "generated/dbgen_files"
 
     # Clean up old files if directory exists
     if os.path.exists(out_dir):

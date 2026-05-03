@@ -55,13 +55,16 @@ The generated data must be **completely blind to actual source data values**. Th
 
 | File | Purpose |
 |------|---------|
-| `MasterRun.py` | **Entry point**. Orchestrates full pipeline: generate templates → run dbgen → populate → validate |
-| `GenerateDbgen.py` | Library functions for generating `.dbgen` template files from schema + histograms |
-| `PopulateNewTableAndValidate.py` | Creates replay tables and compares stats (single table) |
-| `ValidateTableStats.py` | Multi-table validation with enhanced categorization |
-| `run_tpch_comparison.py` | Compares EXPLAIN plans between orig and replay |
-| `dbgen_files/` | Generated `.dbgen` template files |
-| `dbgen_tmp_out/` | Generated SQL (schema + INSERT statements) |
+| `MasterRun.py` | Root wrapper for the full generation pipeline |
+| `datagenx/orchestration/MasterRun.py` | Orchestrates templates → dbgen → load → optional validation |
+| `datagenx/generation/GenerateDbgen.py` | Library functions for generating `.dbgen` template files from schema + histograms |
+| `datagenx/validation/PopulateNewTableAndValidate.py` | Creates replay tables and compares stats (single table) |
+| `datagenx/validation/ValidateTableStats.py` | Multi-table validation with enhanced categorization |
+| `datagenx/validation/run_tpch_comparison.py` | Compares EXPLAIN plans between orig and replay |
+| `sql/` | Reusable SQL scripts |
+| `docs/` | Design notes, reports, and fix writeups |
+| `generated/dbgen_files/` | Generated `.dbgen` template files |
+| `generated/dbgen_tmp_out/` | Generated schema and CSV outputs |
 
 ## Architecture - Code Flow
 
@@ -125,10 +128,13 @@ Three approaches for FK columns (determined by `build_single_fk_expression()` in
 python3 MasterRun.py
 
 # Compare TPC-H query plans
-./run_tpch_comparison.sh
+scripts/run_tpch_comparison.sh
 
 # Single table validation
-python3 PopulateNewTableAndValidate.py --source-schema=tpcds --table=web_site
+python3 validate.py replay \
+  --source-schema=tpcds \
+  --ddl-file generated/dbgen_tmp_out/web_site-schema.sql \
+  --insert-file generated/dbgen_tmp_out/web_site.1.csv
 ```
 
 ## Why We Use COUNT(DISTINCT) Instead of Histogram Estimates
