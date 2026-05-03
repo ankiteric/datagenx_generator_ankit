@@ -10,7 +10,7 @@ SF = int(sys.argv[1]) if len(sys.argv) > 1 else 1
 HISTOGRAM = int(sys.argv[2]) if len(sys.argv) > 2 else 0
 
 DB = "tpch"
-USER = "root"
+USER = ""
 PASSWORD = ""
 HOST = "localhost"
 
@@ -25,7 +25,7 @@ def run(cmd):
 
 
 # run dbgen to generate dummy data
-print(f"Now generating TPCH data")
+print(f"####Now generating TPCH data###")
 run(f"./dbgen -s {SF}")
 
 # truncate table 
@@ -68,4 +68,5 @@ for t in TABLES:
 
 
 print(f"#### Now running DataGenX####")
-run(f"{sys.executable} MasterRun.py --compare-histograms {HISTOGRAM}")
+flag = "--compare-histograms" if HISTOGRAM else ""
+run(f"{sys.executable} MasterRun.py --compare-histograms {flag}")
