@@ -43,6 +43,9 @@ def decode_histogram_string(raw_value):
     if not isinstance(raw_value, str):
         return str(raw_value).rstrip()
 
+    if raw_value.startswith("base64:"):
+        raw_value = raw_value.rsplit(":", 1)[-1]
+
     # Try base64 decoding
     try:
         # Ensure proper padding (base64 strings should be padded to multiple of 4)
@@ -71,6 +74,38 @@ def char_varchar_appendage(ddl_line):
     if length is None:
         return ""
     return f"rand.regex('[a-zA-Z ]{{{length}}}')"
+
+
+def synthetic_string_value(column_name, ordinal, source_value=None, max_length=None):
+    """Return the synthetic string used for a source histogram bucket.
+
+    source_value is used only for length preservation. The returned value does
+    not include the source literal.
+    """
+    original_len = len(source_value) if source_value else 0
+    if max_length is not None and original_len > max_length:
+        original_len = max_length
+
+    num_suffix = f"_{ordinal}"
+    base = f"{column_name}{num_suffix}"
+
+    if len(base) < original_len:
+        synthetic_value = base + "_" * (original_len - len(base))
+    elif len(base) > original_len:
+        available_for_name = original_len - len(num_suffix)
+        if available_for_name >= 1:
+            synthetic_value = column_name[:available_for_name] + num_suffix
+        elif original_len >= len(str(ordinal)):
+            synthetic_value = str(ordinal).zfill(original_len)
+        else:
+            synthetic_value = str(ordinal)[:original_len] if original_len > 0 else ""
+    else:
+        synthetic_value = base
+
+    if max_length is not None and len(synthetic_value) > max_length:
+        synthetic_value = synthetic_value[:max_length]
+
+    return synthetic_value
 
 
 def get_min_max_from_histogram(histogram):
@@ -517,37 +552,9 @@ def string_values_to_case(values_with_counts, column_name, max_length=None, row_
 
     synthetic_values = []
     for i, (value, _) in enumerate(values_with_counts, start=1):
-        original_len = len(value) if value else 0
-        # Cap at max_length if provided (to handle CHAR/VARCHAR limits)
-        if max_length is not None and original_len > max_length:
-            original_len = max_length
-
-        num_suffix = f"_{i}"
-        base = f"{column_name}{num_suffix}"
-
-        if len(base) < original_len:
-            # Pad with underscores to match original length
-            synthetic_value = base + "_" * (original_len - len(base))
-        elif len(base) > original_len:
-            # Truncate column name but preserve the unique number suffix
-            available_for_name = original_len - len(num_suffix)
-            if available_for_name >= 1:
-                # Keep as much of the column name as possible, plus the number
-                synthetic_value = column_name[:available_for_name] + num_suffix
-            elif original_len >= len(str(i)):
-                # No room for name, use zero-padded number
-                synthetic_value = str(i).zfill(original_len)
-            else:
-                # Extreme case: truncate even the number
-                synthetic_value = str(i)[:original_len] if original_len > 0 else ""
-        else:
-            synthetic_value = base
-
-        # Final safety check - truncate if still too long
-        if max_length is not None and len(synthetic_value) > max_length:
-            synthetic_value = synthetic_value[:max_length]
-
-        synthetic_values.append(synthetic_value)
+        synthetic_values.append(
+            synthetic_string_value(column_name, i, source_value=value, max_length=max_length)
+        )
 
     if row_count and row_count > 0:
         counts = [int(round(weight * row_count)) for weight in weights]

@@ -27,6 +27,7 @@ except ModuleNotFoundError:
 # Configuration
 # ----------------------------------------------------------------
 from config import HOST, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, USER
+from datagenx.validation.literal_mapping import load_mapping, rewrite_sql_literals
 
 QUERIES_DIR = "/Users/sreeharshar/work/db/datagenx/tpch/tpch-dbgen/queries_mysql"
 OUTPUT_FILE = "/Users/sreeharshar/work/db/datagenx/tpch/tpch-dbgen/comparison_results.txt"
@@ -271,6 +272,8 @@ def parse_args():
     parser.add_argument("--target-schema", default=TARGET_SCHEMA)
     parser.add_argument("--queries-dir", default=QUERIES_DIR)
     parser.add_argument("--output-file", default=OUTPUT_FILE)
+    parser.add_argument("--literal-mapping-file",
+                        help="Rewrite target-side string literals using this sensitive mapping file")
     return parser.parse_args()
 
 
@@ -285,6 +288,7 @@ def main():
     TARGET_SCHEMA = args.target_schema
     QUERIES_DIR = args.queries_dir
     OUTPUT_FILE = args.output_file
+    literal_mapping = load_mapping(args.literal_mapping_file) if args.literal_mapping_file else None
 
     # Get all query files
     query_files = sorted(glob.glob(os.path.join(QUERIES_DIR, "*.sql")))
@@ -342,11 +346,15 @@ def main():
 
         with open(query_file) as f:
             query_sql = f.read().strip()
+        target_query_sql = query_sql
+        rewrite_stats = None
+        if literal_mapping:
+            target_query_sql, rewrite_stats = rewrite_sql_literals(query_sql, literal_mapping)
 
         # Get EXPLAIN plans
         try:
             source_explain, explain_cols = run_explain(source_cursor, query_sql)
-            target_explain, _ = run_explain(target_cursor, query_sql)
+            target_explain, _ = run_explain(target_cursor, target_query_sql)
 
             shape_diffs, has_critical = compare_explain_plans(
                 source_explain, target_explain, explain_cols,
@@ -378,9 +386,13 @@ def main():
             "status": plan_status,
             "details": details,
             "diffs": shape_diffs,
+            "rewritten_literals": rewrite_stats["rewritten_literals"] if rewrite_stats else 0,
+            "skipped_ambiguous_literals": rewrite_stats["skipped_ambiguous_literals"] if rewrite_stats else [],
         })
 
         print(f"{query_name.upper():<10} | {plan_status:<12} | {details:<45}")
+        if rewrite_stats and rewrite_stats["rewritten_literals"]:
+            print(f"{'':<10} | {'':<12} | target literals rewritten: {rewrite_stats['rewritten_literals']}")
 
     # Summary
     print()
@@ -454,6 +466,8 @@ def main():
         f.write("-" * 72 + "\n")
         for r in results:
             f.write(f"{r['query'].upper():<10} | {r['status']:<12} | {r['details']:<45}\n")
+            if r.get("rewritten_literals"):
+                f.write(f"{'':<10} | {'':<12} | target literals rewritten: {r['rewritten_literals']}\n")
 
         f.write(f"\n{separator}\n")
         f.write("SUMMARY\n")

@@ -25,6 +25,7 @@ except ModuleNotFoundError:
 # Configuration (same as MasterRun.py)
 # ----------------------------------------------------------------
 from config import HOST, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, USER
+from datagenx.validation.literal_mapping import load_mapping, rewrite_sql_literals
 
 QUERIES_DIR = "/Users/sreeharshar/work/db/datagenx/tpch/tpch-dbgen/queries_mysql"
 
@@ -453,6 +454,8 @@ def parse_args():
     parser.add_argument("--source-schema", default=SOURCE_SCHEMA)
     parser.add_argument("--target-schema", default=TARGET_SCHEMA)
     parser.add_argument("--queries-dir", default=QUERIES_DIR)
+    parser.add_argument("--literal-mapping-file",
+                        help="Rewrite target-side string literals using this sensitive mapping file")
     return parser.parse_args()
 
 
@@ -491,11 +494,24 @@ def main():
     with open(query_file) as f:
         query_sql = f.read().strip()
 
+    target_query_sql = query_sql
+    rewrite_stats = None
+    if args.literal_mapping_file:
+        mapping = load_mapping(args.literal_mapping_file)
+        target_query_sql, rewrite_stats = rewrite_sql_literals(query_sql, mapping)
+
     print_separator(f"Query: {query_name}")
     print(f"File: {query_file}")
     print()
     print("--- SQL ---")
     print(query_sql)
+    if rewrite_stats:
+        print()
+        print("--- Target SQL after literal mapping ---")
+        print(target_query_sql)
+        print(f"Rewritten literals: {rewrite_stats['rewritten_literals']}")
+        if rewrite_stats["skipped_ambiguous_literals"]:
+            print("Skipped ambiguous literals: " + ", ".join(rewrite_stats["skipped_ambiguous_literals"]))
 
     # Connect to both schemas
     try:
@@ -521,7 +537,7 @@ def main():
     print_table(source_explain, explain_cols)
 
     print_separator(f"EXPLAIN PLAN — {TARGET_SCHEMA} (target)")
-    target_explain, _ = run_explain(target_cursor, query_sql)
+    target_explain, _ = run_explain(target_cursor, target_query_sql)
     print_table(target_explain, explain_cols)
 
     # Extract tables involved

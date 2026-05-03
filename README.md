@@ -187,6 +187,41 @@ python3 validate.py query q3
 python3 validate.py all --skip-distinct
 ```
 
+## Literal Mapping for Query Rewrites
+
+Build a sensitive local source-literal to synthetic-literal mapping:
+
+```bash
+python3 validate.py literal-map \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx
+```
+
+Default output:
+
+```text
+generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json
+```
+
+Use it to rewrite target-side query literals:
+
+```bash
+python3 validate.py rewrite-query \
+  --mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json \
+  --sql "select * from lineitem where l_returnflag = 'R';"
+```
+
+Use it during plan/query validation:
+
+```bash
+python3 validate.py query q12 \
+  --queries-dir /path/to/queries_mysql \
+  --literal-mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json
+```
+
+The mapping file contains source literals and must stay local/private. More
+detail: [Literal Mapping](docs/LITERAL_MAPPING.md).
+
 ## Visualization Report
 
 Use the project venv when generating validation visuals:

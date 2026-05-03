@@ -86,6 +86,8 @@ def plan_args(args):
         cmd.extend(["--queries-dir", args.queries_dir])
     if args.output_file:
         cmd.extend(["--output-file", args.output_file])
+    if args.literal_mapping_file:
+        cmd.extend(["--literal-mapping-file", args.literal_mapping_file])
     return cmd
 
 
@@ -100,6 +102,8 @@ def query_args(args):
     ]
     if args.queries_dir:
         cmd.extend(["--queries-dir", args.queries_dir])
+    if args.literal_mapping_file:
+        cmd.extend(["--literal-mapping-file", args.literal_mapping_file])
     return cmd
 
 
@@ -121,6 +125,31 @@ def command_plans(args):
 
 def command_query(args):
     return run_script("run_single_query.py", query_args(args))
+
+
+def command_literal_map(args):
+    cmd = [
+        "build",
+        "--host", args.host,
+        "--user", args.user,
+        "--password", args.password,
+        "--source-schema", args.source_schema,
+        "--target-schema", args.target_schema,
+    ]
+    if args.output:
+        cmd.extend(["--output", args.output])
+    return run_script("literal_mapping.py", cmd)
+
+
+def command_rewrite_query(args):
+    cmd = ["rewrite", "--mapping-file", args.mapping_file]
+    if args.query_file:
+        cmd.extend(["--query-file", args.query_file])
+    else:
+        cmd.extend(["--sql", args.sql])
+    if args.output_file:
+        cmd.extend(["--output-file", args.output_file])
+    return run_script("literal_mapping.py", cmd)
 
 
 def command_all(args):
@@ -308,6 +337,8 @@ def build_parser():
     add_connection_args(plans)
     plans.add_argument("--queries-dir")
     plans.add_argument("--output-file")
+    plans.add_argument("--literal-mapping-file",
+                       help="Rewrite target-side string literals using this sensitive mapping file")
     plans.set_defaults(func=command_plans)
 
     sql = subparsers.add_parser("sql", help="Run benchmark-specific SQL validation checks")
@@ -325,7 +356,28 @@ def build_parser():
     add_connection_args(query)
     query.add_argument("query", help="Query prefix, for example q3 or q11")
     query.add_argument("--queries-dir")
+    query.add_argument("--literal-mapping-file",
+                       help="Rewrite target-side string literals using this sensitive mapping file")
     query.set_defaults(func=command_query)
+
+    literal_map = subparsers.add_parser(
+        "literal-map",
+        help="Build a sensitive source-literal to synthetic-literal mapping file",
+    )
+    add_connection_args(literal_map)
+    literal_map.add_argument("--output")
+    literal_map.set_defaults(func=command_literal_map)
+
+    rewrite_query = subparsers.add_parser(
+        "rewrite-query",
+        help="Rewrite SQL string literals using a sensitive literal mapping file",
+    )
+    rewrite_query.add_argument("--mapping-file", required=True)
+    rewrite_input = rewrite_query.add_mutually_exclusive_group(required=True)
+    rewrite_input.add_argument("--query-file")
+    rewrite_input.add_argument("--sql")
+    rewrite_query.add_argument("--output-file")
+    rewrite_query.set_defaults(func=command_rewrite_query)
 
     all_checks = subparsers.add_parser("all", help="Run stats validation, then plan comparison")
     add_connection_args(all_checks)
@@ -334,6 +386,8 @@ def build_parser():
     all_checks.add_argument("--verbose", "-v", action="store_true")
     all_checks.add_argument("--queries-dir")
     all_checks.add_argument("--output-file")
+    all_checks.add_argument("--literal-mapping-file",
+                            help="Rewrite target-side string literals for plan comparison")
     all_checks.set_defaults(func=command_all)
 
     parser.set_defaults(func=command_stats)
