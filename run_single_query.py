@@ -7,22 +7,24 @@ Usage:
     python run_single_query.py q11
 """
 
+import argparse
 import sys
 import os
 import glob
 import re
 import json
-import mysql.connector
-from mysql.connector import Error
+
+try:
+    import mysql.connector
+    from mysql.connector import Error
+except ModuleNotFoundError:
+    mysql = None
+    Error = RuntimeError
 
 # ----------------------------------------------------------------
 # Configuration (same as MasterRun.py)
 # ----------------------------------------------------------------
-HOST = "localhost"
-USER = "root"
-PASSWORD = "newpassword"
-SOURCE_SCHEMA = "tpch"
-TARGET_SCHEMA = "tpch_harsha"
+from config import HOST, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, USER
 
 QUERIES_DIR = "/Users/sreeharshar/work/db/datagenx/tpch/tpch-dbgen/queries_mysql"
 
@@ -34,6 +36,8 @@ NDV_DIFF_THRESHOLD = 10  # percent - NDV differences below this are acceptable
 
 def get_connection(schema):
     """Create a database connection to the specified schema."""
+    if mysql is None:
+        raise Error("mysql-connector-python is not installed")
     return mysql.connector.connect(
         host=HOST,
         user=USER,
@@ -438,8 +442,32 @@ def print_table(rows, columns, max_rows=None):
         print(f"... ({len(rows) - max_rows} more rows)")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run one TPC-H query on both schemas with explain plans."
+    )
+    parser.add_argument("query_prefix", nargs="?", help="Query prefix, for example q11")
+    parser.add_argument("--host", default=HOST)
+    parser.add_argument("--user", default=USER)
+    parser.add_argument("--password", default=PASSWORD)
+    parser.add_argument("--source-schema", default=SOURCE_SCHEMA)
+    parser.add_argument("--target-schema", default=TARGET_SCHEMA)
+    parser.add_argument("--queries-dir", default=QUERIES_DIR)
+    return parser.parse_args()
+
+
 def main():
-    if len(sys.argv) < 2:
+    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, QUERIES_DIR
+
+    args = parse_args()
+    HOST = args.host
+    USER = args.user
+    PASSWORD = args.password
+    SOURCE_SCHEMA = args.source_schema
+    TARGET_SCHEMA = args.target_schema
+    QUERIES_DIR = args.queries_dir
+
+    if not args.query_prefix:
         print("Usage: python run_single_query.py <query_prefix>")
         print("Example: python run_single_query.py q11")
         print()
@@ -448,7 +476,7 @@ def main():
             print(f"  {q}")
         sys.exit(1)
 
-    query_prefix = sys.argv[1]
+    query_prefix = args.query_prefix
     query_file = find_query_file(query_prefix)
 
     if not query_file:

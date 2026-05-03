@@ -10,21 +10,23 @@ Usage:
     python run_tpch_comparison.py
 """
 
+import argparse
 import os
 import glob
 import json
 from datetime import datetime
-import mysql.connector
-from mysql.connector import Error
+
+try:
+    import mysql.connector
+    from mysql.connector import Error
+except ModuleNotFoundError:
+    mysql = None
+    Error = RuntimeError
 
 # ----------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------
-HOST = "localhost"
-USER = "root"
-PASSWORD = "newpassword"
-SOURCE_SCHEMA = "tpch"
-TARGET_SCHEMA = "tpch_harsha"
+from config import HOST, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, USER
 
 QUERIES_DIR = "/Users/sreeharshar/work/db/datagenx/tpch/tpch-dbgen/queries_mysql"
 OUTPUT_FILE = "/Users/sreeharshar/work/db/datagenx/tpch/tpch-dbgen/comparison_results.txt"
@@ -37,6 +39,8 @@ ROW_ESTIMATE_THRESHOLD = 10  # percent
 
 def get_connection(schema):
     """Create a database connection to the specified schema."""
+    if mysql is None:
+        raise Error("mysql-connector-python is not installed")
     return mysql.connector.connect(
         host=HOST,
         user=USER,
@@ -256,7 +260,32 @@ def collect_table_statistics(source_cursor, target_cursor, tables):
     return {'ndv': ndv_summary, 'histogram': histogram_summary}
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run all TPC-H queries on both schemas and compare EXPLAIN plans."
+    )
+    parser.add_argument("--host", default=HOST)
+    parser.add_argument("--user", default=USER)
+    parser.add_argument("--password", default=PASSWORD)
+    parser.add_argument("--source-schema", default=SOURCE_SCHEMA)
+    parser.add_argument("--target-schema", default=TARGET_SCHEMA)
+    parser.add_argument("--queries-dir", default=QUERIES_DIR)
+    parser.add_argument("--output-file", default=OUTPUT_FILE)
+    return parser.parse_args()
+
+
 def main():
+    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, QUERIES_DIR, OUTPUT_FILE
+
+    args = parse_args()
+    HOST = args.host
+    USER = args.user
+    PASSWORD = args.password
+    SOURCE_SCHEMA = args.source_schema
+    TARGET_SCHEMA = args.target_schema
+    QUERIES_DIR = args.queries_dir
+    OUTPUT_FILE = args.output_file
+
     # Get all query files
     query_files = sorted(glob.glob(os.path.join(QUERIES_DIR, "*.sql")))
 

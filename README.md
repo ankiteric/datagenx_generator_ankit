@@ -5,6 +5,33 @@ python3 MasterRun.py
 To compare with tpch queries:
 ./run_tpch_comparison.sh
 
+To run validations from one common entry point:
+python3 validate.py
+
+Common validation examples:
+
+python3 validate.py stats
+python3 validate.py stats --table orders --verbose
+python3 validate.py stats --skip-distinct
+
+python3 validate.py replay \
+  --ddl-file dbgen_tmp_out/orders-schema.sql \
+  --insert-file dbgen_tmp_out/orders.1.sql
+
+python3 validate.py plans
+python3 validate.py query q3
+python3 validate.py all --skip-distinct
+
+Run the benchmark-specific SQL validation file:
+
+python3 validate.py sql tpch
+python3 validate.py sql tpcds
+
+Render the SQL without executing it:
+
+python3 validate.py sql tpch --render-only
+python3 validate.py sql tpcds --render-only
+
 
 
 -----------------------------------------
