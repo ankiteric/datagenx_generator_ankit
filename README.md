@@ -226,6 +226,10 @@ bucket count and frequency drift.
 
 More detail: [Histogram Comparison](docs/HISTOGRAM_COMPARISON.md).
 
+For low-cardinality string histograms, generation uses deterministic bucket
+assignment instead of random weighted selection. This avoids random collisions
+that can collapse target bucket counts.
+
 If validation reports `missing in target` for histograms, rerun:
 
 ```bash

@@ -424,13 +424,15 @@ def text_appendage():
 
 
 def get_string_column_values(cursor, database, table, column):
-    """Get distinct string values and frequencies from histogram metadata.
+    """Get synthetic string bucket values and frequencies from histogram metadata.
 
     Returns a list of (value, count) tuples sorted by count descending,
-    or None if histogram doesn't exist, is equi-height, or cardinality
-    exceeds STRING_CARDINALITY_THRESHOLD.
+    or None if histogram doesn't exist or cardinality exceeds
+    STRING_CARDINALITY_THRESHOLD.
 
     Note: MySQL stores string values in histograms as base64-encoded strings.
+    We only use decoded values to infer representative lengths. Generated
+    values are synthetic and do not reuse these source literals.
     """
     cursor.execute("""
         SELECT HISTOGRAM
@@ -449,29 +451,32 @@ def get_string_column_values(cursor, database, table, column):
     if not buckets:
         return None
 
-    # Only singleton histograms contain individual values
-    if hist_type != "singleton":
+    if hist_type not in {"singleton", "equi-height"}:
         return None
 
     # Check cardinality threshold
     if len(buckets) > STRING_CARDINALITY_THRESHOLD:
         return None
 
-    # Extract values and convert cumulative frequencies to individual frequencies
+    # Extract representative bucket values and convert cumulative frequencies
+    # to individual frequencies.
     # Singleton buckets: [base64_value, cumulative_frequency]
+    # Equi-height buckets: cumulative frequency is the penultimate element.
     # Scale frequencies to integer counts for compatibility with string_values_to_case
     values_with_counts = []
     prev_cum_freq = 0.0
 
-    for bucket in buckets:
+    for i, bucket in enumerate(buckets, start=1):
         raw_value = bucket[0]
-        cum_freq = bucket[1]
+        cum_freq = bucket[-2] if hist_type == "equi-height" else bucket[1]
         freq = cum_freq - prev_cum_freq
         prev_cum_freq = cum_freq
 
         # Decode base64-encoded string value (MySQL encodes string histogram values)
         # First check if it looks like base64 (contains only valid base64 chars)
         value = decode_histogram_string(raw_value)
+        if not value:
+            value = f"{column}_{i}"
 
         # Scale to pseudo-count (maintains relative weights)
         count = int(freq * 1000000)
@@ -483,7 +488,7 @@ def get_string_column_values(cursor, database, table, column):
     return values_with_counts
 
 
-def string_values_to_case(values_with_counts, column_name, max_length=None):
+def string_values_to_case(values_with_counts, column_name, max_length=None, row_count=None):
     """Generate a weighted CASE expression for string values.
 
     values_with_counts: list of (value, count) tuples
@@ -496,6 +501,10 @@ def string_values_to_case(values_with_counts, column_name, max_length=None):
 
     Uses synthetic values (column_name_N, padded to match original length)
     to avoid data leakage while preserving string length distribution.
+
+    If row_count is available, uses deterministic weighted bands instead of
+    rand.weighted. This avoids random collisions that collapse singleton string
+    buckets on small or near-unique columns.
     """
     if not values_with_counts:
         return ""
@@ -506,7 +515,7 @@ def string_values_to_case(values_with_counts, column_name, max_length=None):
 
     weights = [round(cnt / total, 6) for _, cnt in values_with_counts]
 
-    case_lines = []
+    synthetic_values = []
     for i, (value, _) in enumerate(values_with_counts, start=1):
         original_len = len(value) if value else 0
         # Cap at max_length if provided (to handle CHAR/VARCHAR limits)
@@ -538,7 +547,32 @@ def string_values_to_case(values_with_counts, column_name, max_length=None):
         if max_length is not None and len(synthetic_value) > max_length:
             synthetic_value = synthetic_value[:max_length]
 
-        case_lines.append(f"when {i} then '{synthetic_value}'")
+        synthetic_values.append(synthetic_value)
+
+    if row_count and row_count > 0:
+        counts = [int(round(weight * row_count)) for weight in weights]
+        diff = row_count - sum(counts)
+        if counts:
+            counts[-1] += diff
+
+        cumulative = 0
+        deterministic_lines = []
+        for synthetic_value, count in zip(synthetic_values, counts):
+            if count <= 0:
+                continue
+            cumulative += count
+            deterministic_lines.append(f"when rownum <= {cumulative} then '{synthetic_value}'")
+
+        if deterministic_lines:
+            return f"""case
+    {' '.join(deterministic_lines)}
+    else '{synthetic_values[-1]}'
+    end"""
+
+    case_lines = [
+        f"when {i} then '{synthetic_value}'"
+        for i, synthetic_value in enumerate(synthetic_values, start=1)
+    ]
 
     return f"""case rand.weighted(array[{','.join(map(str, weights))}])
     {' '.join(case_lines)}
@@ -1083,7 +1117,14 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 values = get_string_column_values(cursor, database, table, col)
                 col_max_length = get_string_column_length(line)
                 if values:
-                    synthetic = string_values_to_case(values, col, max_length=col_max_length)
+                    cursor.execute(f"SELECT COUNT(*) FROM `{database}`.`{table}`")
+                    table_row_count = cursor.fetchone()[0]
+                    synthetic = string_values_to_case(
+                        values,
+                        col,
+                        max_length=col_max_length,
+                        row_count=table_row_count,
+                    )
                 else:
                     # High cardinality or empty — fall back to random strings
                     synthetic = char_varchar_appendage(line)

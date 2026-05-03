@@ -163,3 +163,22 @@ Did DataGenX preserve the exact source values?
 Exact source-value preservation is intentionally not the goal. For checking
 whether synthetic data differs from source data, use the report's exact row
 overlap/privacy section.
+
+## Generation Notes
+
+Low-cardinality string histograms are generated with deterministic bucket
+assignment instead of random weighted selection. This avoids random collisions
+where a synthetic value is repeated and another bucket is missed.
+
+For example, if the source has:
+
+```text
+25 buckets, each with 4% frequency
+```
+
+the generated target assigns exactly 4% of rows to each synthetic bucket value,
+rather than drawing randomly from 25 values.
+
+This deterministic behavior is used for both singleton and equi-height string
+histograms when the histogram has at most `STRING_CARDINALITY_THRESHOLD`
+buckets.
