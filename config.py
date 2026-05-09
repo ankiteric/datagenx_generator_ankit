@@ -27,3 +27,6 @@ DBGEN_TMP_OUT_DIR = "generated/dbgen_tmp_out"
 # Generation settings
 FILES_COUNT = "1"
 ROWS_COUNT = "1000"
+
+# Database type (mysql or singlestore)
+DB_TYPE = "mysql"

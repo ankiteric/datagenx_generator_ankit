@@ -3,5 +3,8 @@ __pycache__/
 MYSQL_INSTALL_REPORT.md
 dbgen_files/
 dbgen_tmp_out/
+generated/dbgen_files/
+generated/dbgen_tmp_out/
 generated/literal_mappings/
+lib/__pycache__/
 .codex/

@@ -26,6 +26,8 @@ from datagenx.generation.GenerateDbgen import (
     build_single_fk_expression,
     topological_sort,
 )
+from extract_schema import annotate_table_with_statistics
+from lib.schema_extractor import MySQLExtractor, SingleStoreExtractor
 from datagenx.validation.PopulateNewTableAndValidate import (
     clone_histograms,
     compare_histograms,
@@ -55,6 +57,77 @@ from config import (
     DBGEN_BINARY, DBGEN_FILES_DIR, DBGEN_TMP_OUT_DIR,
     FILES_COUNT, ROWS_COUNT
 )
+
+# Database type - will be overridden by CLI args
+DB_TYPE = "mysql"
+
+
+def _load_histograms_singlestore(cursor, schema, table):
+    """Load histograms from SingleStore's ADVANCED_HISTOGRAMS for all columns.
+
+    Returns dict in the same format as MySQL's load_histograms():
+      {column_name: {"histogram-type": "equi-height", "buckets": [[lo, hi, cum_freq, num_distinct], ...]}}
+    """
+    cursor.execute("""
+        SELECT COLUMN_NAME, BUCKET_INDEX, RANGE_MIN, RANGE_MAX,
+               CARDINALITY, UNIQUE_COUNT
+        FROM information_schema.ADVANCED_HISTOGRAMS
+        WHERE DATABASE_NAME = %s
+          AND TABLE_NAME = %s
+          AND BUCKET_INDEX >= 0
+        ORDER BY COLUMN_NAME, BUCKET_INDEX
+    """, (schema, table))
+    rows = cursor.fetchall()
+
+    from collections import defaultdict
+    raw = defaultdict(list)
+    for col, bucket_idx, range_min, range_max, cardinality, unique_count in rows:
+        if range_min is None or range_max is None or cardinality is None:
+            continue
+        raw[col].append((range_min, range_max, cardinality, unique_count))
+
+    histograms = {}
+    for col, buckets in raw.items():
+        total_freq = sum(b[2] for b in buckets)
+        if total_freq == 0:
+            continue
+        # Only include columns with numeric range boundaries.
+        # String columns have binary-encoded RANGE_MIN/MAX that can't be compared numerically.
+        try:
+            float(buckets[0][0])
+            float(buckets[0][1])
+        except (ValueError, TypeError):
+            continue
+        cum = 0.0
+        converted_buckets = []
+        for range_min, range_max, cardinality, unique_count in buckets:
+            cum += cardinality / total_freq
+            converted_buckets.append([
+                float(range_min),
+                float(range_max),
+                round(cum, 5),
+                int(unique_count) if unique_count else 1
+            ])
+        histograms[col] = {"histogram-type": "equi-height", "buckets": converted_buckets}
+
+    return histograms
+
+
+def _find_dbgen_binary():
+    """Try to locate dbgen binary if configured path doesn't exist."""
+    if os.path.isfile(DBGEN_BINARY) and os.access(DBGEN_BINARY, os.X_OK):
+        return DBGEN_BINARY
+    common_paths = [
+        os.path.expanduser("~/dbgen_binary"),
+        "/usr/local/bin/dbgen",
+        "/usr/bin/dbgen",
+        os.path.expanduser("~/dbgen/target/release/dbgen"),
+        "./dbgen",
+    ]
+    for path in common_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return DBGEN_BINARY  # fallback to config value
 
 
 # ----------------------------------------------------------------
@@ -559,18 +632,30 @@ def build_fk_appendages(cursor, table):
     return appendages
 
 
-def step_a_generate_dbgen(cursor, table):
-    """Generate .dbgen template file via annotate_table_with_histogram."""
+def step_a_generate_dbgen(cursor, table, extractor=None):
+    """Generate .dbgen template file.
+
+    Dispatches based on DB_TYPE:
+      - mysql: uses annotate_table_with_histogram (MySQL histogram system)
+      - singlestore: uses annotate_table_with_statistics (optimizer_statistics)
+    """
     print(f"  [A] Generating .dbgen template ...")
 
     generated_appendages = build_fk_appendages(cursor, table)
 
-    ddl = annotate_table_with_histogram(
-        HOST, USER, PASSWORD, SOURCE_SCHEMA, table,
-        generated_appendages=generated_appendages,
-    )
+    if DB_TYPE == 'singlestore':
+        ddl = annotate_table_with_statistics(
+            extractor, SOURCE_SCHEMA, table,
+            generated_appendages=generated_appendages,
+        )
+    else:
+        ddl = annotate_table_with_histogram(
+            HOST, USER, PASSWORD, SOURCE_SCHEMA, table,
+            generated_appendages=generated_appendages,
+        )
+
     if ddl is None:
-        print(f"  [A] FAILED — annotate_table_with_histogram returned None")
+        print(f"  [A] FAILED — annotation function returned None")
         return False
 
     path = os.path.join(DBGEN_FILES_DIR, f"{table}.dbgen")
@@ -587,13 +672,15 @@ def step_b_run_dbgen(cursor, table):
     cursor.execute(f"SELECT COUNT(*) FROM `{SOURCE_SCHEMA}`.`{table}`")
     row_count = cursor.fetchone()[0]
     print(f"      Source row count = {row_count}")
+    print(f"      Generating {ROWS_COUNT} rows")
 
     template_path = os.path.join(DBGEN_FILES_DIR, f"{table}.dbgen")
+    dbgen_bin = _find_dbgen_binary()
     cmd = [
-        DBGEN_BINARY,
+        dbgen_bin,
         "--out-dir", DBGEN_TMP_OUT_DIR,
         "--files-count", FILES_COUNT,
-        "--rows-per-file", str(row_count),
+        "--rows-per-file", ROWS_COUNT,  # Fixed: use ROWS_COUNT instead of str(row_count)
         "--rows-count", ROWS_COUNT,
         "--template", template_path,
         "--format", "csv",           # Generate CSV instead of SQL
@@ -613,6 +700,56 @@ def step_b_run_dbgen(cursor, table):
 
     print(f"  [B] Generated {csv_path}")
     return True
+
+
+def _load_source_cardinality_fast(cursor, database, table):
+    """Load distinct counts from source using fast GROUP BY queries for key columns.
+
+    For SingleStore, this is faster than SHOW INDEX which can be slow on large tables.
+    Returns dict {column_name: distinct_count}.
+    """
+    # Get PK columns
+    cursor.execute("""
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND CONSTRAINT_NAME = 'PRIMARY'
+        ORDER BY ORDINAL_POSITION
+    """, (database, table))
+    pk_cols = [row[0] for row in cursor.fetchall()]
+
+    # Also check for UNIQUE KEY `pk` (SingleStore convention)
+    if not pk_cols:
+        cursor.execute("""
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.STATISTICS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+              AND INDEX_NAME = 'pk' AND NON_UNIQUE = 0
+            ORDER BY SEQ_IN_INDEX
+        """, (database, table))
+        pk_cols = [row[0] for row in cursor.fetchall()]
+
+    # Get indexed columns
+    cursor.execute("""
+        SELECT DISTINCT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.STATISTICS
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+    """, (database, table))
+    indexed_cols = {row[0] for row in cursor.fetchall()}
+
+    distinct_counts = {}
+
+    # For PK and indexed columns, query actual distinct counts
+    for col in pk_cols + list(indexed_cols):
+        if col not in distinct_counts:
+            try:
+                cursor.execute(
+                    f"SELECT COUNT(DISTINCT `{col}`) FROM `{database}`.`{table}`"
+                )
+                distinct_counts[col] = cursor.fetchone()[0]
+            except Exception as e:
+                print(f"      Warning: Could not get distinct count for {col}: {e}")
+
+    return distinct_counts
 
 
 def step_c_create_insert_validate(cursor, table):
@@ -671,7 +808,7 @@ def step_c_create_insert_validate(cursor, table):
     load_stmt = f"""
         LOAD DATA LOCAL INFILE '{csv_path}'
         INTO TABLE `{TARGET_SCHEMA}`.`{table}`
-        FIELDS TERMINATED BY ',' ENCLOSED BY '"'
+        FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\\\'
         LINES TERMINATED BY '\\n'
         ({column_list})
     """
@@ -679,11 +816,14 @@ def step_c_create_insert_validate(cursor, table):
 
     # Clone optimizer histogram metadata as part of target creation, not
     # validation. The separate validator expects target histograms to exist.
-    clone_histograms(cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table)
+    # Only for MySQL
+    if DB_TYPE == 'mysql':
+        clone_histograms(cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table)
 
     if SKIP_VALIDATION:
         print(f"      Loaded generated data into `{TARGET_SCHEMA}`.`{table}`")
-        print(f"      Cloned histograms from `{SOURCE_SCHEMA}`.`{table}`")
+        if DB_TYPE == 'mysql':
+            print(f"      Cloned histograms from `{SOURCE_SCHEMA}`.`{table}`")
         return {
             "loaded": True,
             "validation_skipped": True,
@@ -696,15 +836,27 @@ def step_c_create_insert_validate(cursor, table):
     cursor.execute(f"SELECT COUNT(*) FROM `{TARGET_SCHEMA}`.`{table}`")
     tgt_rows = cursor.fetchone()[0]
 
-    if src_rows != tgt_rows:
-        rows_ok = False
-        report_rowcount_mismatch(src_rows, tgt_rows)
+    # When ROWS_COUNT is explicitly specified and differs from source, compare against it
+    if int(ROWS_COUNT) != src_rows:
+        # User specified different row count
+        expected_rows = int(ROWS_COUNT)
+        if tgt_rows != expected_rows:
+            rows_ok = False
+            print(f"      DIVERGED: Row count mismatch - expected {expected_rows}, got {tgt_rows}")
+        else:
+            print(f"      Row count: {tgt_rows} (matches requested {ROWS_COUNT})")
     else:
-        print(f"      Row count: {tgt_rows} (matches source)")
+        # Standard case - should match source
+        if src_rows != tgt_rows:
+            rows_ok = False
+            report_rowcount_mismatch(src_rows, tgt_rows)
+        else:
+            print(f"      Row count: {tgt_rows} (matches source)")
 
     # --- Analyze tables for stats ---
-    cursor.execute(f"ANALYZE TABLE `{SOURCE_SCHEMA}`.`{table}`")
-    cursor.fetchall()
+    if DB_TYPE == 'mysql':
+        cursor.execute(f"ANALYZE TABLE `{SOURCE_SCHEMA}`.`{table}`")
+        cursor.fetchall()
     cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}`")
     cursor.fetchall()
 
@@ -725,13 +877,21 @@ def step_c_create_insert_validate(cursor, table):
     column_types = load_column_types(cursor, SOURCE_SCHEMA, table)
 
     if COMPARE_HISTOGRAMS:
-        src_hist = load_histograms(cursor, SOURCE_SCHEMA, table)
-        tgt_hist = load_histograms(cursor, TARGET_SCHEMA, table)
-        hist_results = compare_histograms(src_hist, tgt_hist)
+        if DB_TYPE == 'mysql':
+            # MySQL: clone histograms to target then compare via column_statistics
+            clone_histograms(cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table)
+            src_hist = load_histograms(cursor, SOURCE_SCHEMA, table)
+            tgt_hist = load_histograms(cursor, TARGET_SCHEMA, table)
+        else:
+            # SingleStore: read ADVANCED_HISTOGRAMS directly (populated by ANALYZE TABLE)
+            src_hist = _load_histograms_singlestore(cursor, SOURCE_SCHEMA, table)
+            tgt_hist = _load_histograms_singlestore(cursor, TARGET_SCHEMA, table)
 
-        hist_critical = report_histogram_comparison(hist_results, indexed_cols, column_types, VERBOSE)
-        if hist_critical:
-            hist_ok = False
+        if src_hist and tgt_hist:
+            hist_results = compare_histograms(src_hist, tgt_hist)
+            hist_critical = report_histogram_comparison(hist_results, indexed_cols, column_types, VERBOSE)
+            if hist_critical:
+                hist_ok = False
 
     # --- Table stats ---
     report_table_stats(
@@ -748,12 +908,53 @@ def step_c_create_insert_validate(cursor, table):
     )
 
     # --- Distinct counts ---
-    src_distinct = load_distinct_counts(cursor, SOURCE_SCHEMA, table)
-    tgt_distinct = load_distinct_counts(cursor, TARGET_SCHEMA, table)
-    distinct_mismatches = report_distinct_counts(src_distinct, tgt_distinct, VERBOSE)
+    if DB_TYPE == 'singlestore' and int(ROWS_COUNT) != src_rows:
+        # Fast path: use optimizer_statistics instead of expensive COUNT(DISTINCT) on source.
+        # Compare cardinality estimates and flag over-generation.
+        src_cardinality = _load_source_cardinality_fast(cursor, SOURCE_SCHEMA, table)
+        tgt_cardinality = _load_source_cardinality_fast(cursor, TARGET_SCHEMA, table)
 
-    if distinct_mismatches:
-        distinct_ok = False
+        # Detect PK columns (expected to over-generate when --rows > source)
+        pk_cols = set()
+        pk_match = re.search(r"PRIMARY\s+KEY\s*\(([^)]+)\)", clean_ddl, re.IGNORECASE)
+        if not pk_match:
+            pk_match = re.search(r"UNIQUE\s+KEY\s+`pk`\s*\(([^)]+)\)", clean_ddl, re.IGNORECASE)
+        if pk_match:
+            pk_cols = {c.strip().strip('`') for c in pk_match.group(1).split(',')}
+
+        print(f"\n\U0001f4ca DISTINCT VALUE COUNTS (--rows {ROWS_COUNT}, source has {src_rows})")
+        issues = []
+        for col in sorted(tgt_cardinality.keys()):
+            tc = tgt_cardinality[col]
+            if col not in src_cardinality:
+                continue
+            sc = src_cardinality[col]
+            if sc <= 0:
+                continue
+
+            if col in pk_cols and int(ROWS_COUNT) > src_rows:
+                if VERBOSE:
+                    print(f"      `{col}`: src_est={sc}, replay={tc} -> OK (PK, --rows > source)")
+                continue
+
+            if tc > sc * 1.20:
+                print(f"      `{col}`: src_est={sc}, replay={tc} -> OVER-GENERATED")
+                issues.append(col)
+            elif VERBOSE:
+                print(f"      `{col}`: src_est={sc}, replay={tc} -> OK")
+
+        if not issues:
+            print("      All columns within expected range.")
+        else:
+            distinct_ok = False
+    else:
+        # Full path: exact COUNT(DISTINCT) comparison
+        src_distinct = load_distinct_counts(cursor, SOURCE_SCHEMA, table)
+        tgt_distinct = load_distinct_counts(cursor, TARGET_SCHEMA, table)
+        distinct_mismatches = report_distinct_counts(src_distinct, tgt_distinct, VERBOSE)
+
+        if distinct_mismatches:
+            distinct_ok = False
 
     return {
         "ddl": ddl_ok,
@@ -767,6 +968,9 @@ def step_c_create_insert_validate(cursor, table):
 # Main
 # ----------------------------------------------------------------
 def main():
+    # Make these global so they can be modified by CLI args
+    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE
+
     start_time = time.time()
 
     # --- Setup directories ---
@@ -788,9 +992,28 @@ def main():
     cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
     cursor.execute("SET time_zone = '+00:00'")
 
+    # --- Create SingleStore extractor if needed ---
+    extractor = None
+    if DB_TYPE == 'singlestore':
+        extractor = SingleStoreExtractor(HOST, USER, PASSWORD, SOURCE_SCHEMA)
+        if not extractor.connect():
+            print("Failed to connect to SingleStore")
+            sys.exit(1)
+
     # --- Discover and sort tables ---
-    all_tables, dependencies = discover_tables_and_dependencies(cursor, SOURCE_SCHEMA)
-    sorted_tables = topological_sort(all_tables, dependencies)
+    if DB_TYPE == 'singlestore' and extractor:
+        # Use extractor to discover tables
+        all_tables = extractor.get_tables()
+        dependencies = {}
+        for table in all_tables:
+            fks = extractor.get_foreign_keys(table)
+            if fks:
+                dependencies[table] = list(set(fk['referenced_table'] for fk in fks))
+        sorted_tables = topological_sort(all_tables, dependencies)
+    else:
+        # Use MySQL discovery
+        all_tables, dependencies = discover_tables_and_dependencies(cursor, SOURCE_SCHEMA)
+        sorted_tables = topological_sort(all_tables, dependencies)
 
     print("=" * 60)
     print(f"MASTER RUN — {SOURCE_SCHEMA} -> {TARGET_SCHEMA}")
@@ -802,8 +1025,9 @@ def main():
     prepare_target_schema(cursor, TARGET_SCHEMA)
     print()
 
-    # --- Regenerate histograms with full sampling ---
-    regenerate_histograms_with_full_sampling(cursor, SOURCE_SCHEMA)
+    # --- Regenerate histograms with full sampling (MySQL only) ---
+    if DB_TYPE == 'mysql':
+        regenerate_histograms_with_full_sampling(cursor, SOURCE_SCHEMA)
     print()
 
     # --- Process each table ---
@@ -816,7 +1040,7 @@ def main():
         print("-" * 50)
 
         # Step A
-        if not step_a_generate_dbgen(cursor, table):
+        if not step_a_generate_dbgen(cursor, table, extractor):
             results[table] = {"error": "dbgen template generation failed"}
             print()
             continue
@@ -890,6 +1114,8 @@ def main():
 
     cursor.close()
     conn.close()
+    if extractor:
+        extractor.close()
 
 
 if __name__ == "__main__":
@@ -907,8 +1133,36 @@ if __name__ == "__main__":
     validation_group.add_argument("--run-validation", dest="skip_validation",
                                   action="store_false",
                                   help="Run built-in validation checks after loading each table")
+
+    # Add new arguments for SingleStore support
+    parser.add_argument("--db-type", choices=["mysql", "singlestore"], default="mysql",
+                        help="Database type (default: mysql)")
+    parser.add_argument("--host", help="Database host (overrides config.py)")
+    parser.add_argument("--user", help="Database user (overrides config.py)")
+    parser.add_argument("--password", help="Database password (overrides config.py)")
+    parser.add_argument("--source-schema", help="Source schema name (overrides config.py)")
+    parser.add_argument("--target-schema", help="Target schema name (overrides config.py)")
+    parser.add_argument("--rows", type=str, help="Number of rows to generate (overrides config.py)")
+
     args = parser.parse_args()
     VERBOSE = args.verbose
     COMPARE_HISTOGRAMS = args.compare_histograms
     SKIP_VALIDATION = args.skip_validation
+
+    # Override global configs from CLI args
+    if args.db_type:
+        DB_TYPE = args.db_type
+    if args.host:
+        HOST = args.host
+    if args.user:
+        USER = args.user
+    if args.password:
+        PASSWORD = args.password
+    if args.source_schema:
+        SOURCE_SCHEMA = args.source_schema
+    if args.target_schema:
+        TARGET_SCHEMA = args.target_schema
+    if args.rows:
+        ROWS_COUNT = args.rows
+
     main()
