@@ -387,12 +387,15 @@ def main():
             "details": details,
             "diffs": shape_diffs,
             "rewritten_literals": rewrite_stats["rewritten_literals"] if rewrite_stats else 0,
+            "rewritten_dates": rewrite_stats["rewritten_dates"] if rewrite_stats else 0,
             "skipped_ambiguous_literals": rewrite_stats["skipped_ambiguous_literals"] if rewrite_stats else [],
         })
 
         print(f"{query_name.upper():<10} | {plan_status:<12} | {details:<45}")
         if rewrite_stats and rewrite_stats["rewritten_literals"]:
             print(f"{'':<10} | {'':<12} | target literals rewritten: {rewrite_stats['rewritten_literals']}")
+        if rewrite_stats and rewrite_stats["rewritten_dates"]:
+            print(f"{'':<10} | {'':<12} | target dates rewritten: {rewrite_stats['rewritten_dates']}")
 
     # Summary
     print()
@@ -468,6 +471,8 @@ def main():
             f.write(f"{r['query'].upper():<10} | {r['status']:<12} | {r['details']:<45}\n")
             if r.get("rewritten_literals"):
                 f.write(f"{'':<10} | {'':<12} | target literals rewritten: {r['rewritten_literals']}\n")
+            if r.get("rewritten_dates"):
+                f.write(f"{'':<10} | {'':<12} | target dates rewritten: {r['rewritten_dates']}\n")
 
         f.write(f"\n{separator}\n")
         f.write("SUMMARY\n")

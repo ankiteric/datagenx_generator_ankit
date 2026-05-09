@@ -189,6 +189,15 @@ python3 validate.py all --skip-distinct
 
 ## Literal Mapping for Query Rewrites
 
+Render the original TPC-H query templates into runnable MySQL SQL files. This
+is optional and never runs unless explicitly requested:
+
+```bash
+python3 validate.py tpch-queries \
+  --template-dir /home/hmaduri/contribs/tpch-dbgen/queries \
+  --output-dir generated/tpch_queries_mysql
+```
+
 Build a sensitive local source-literal to synthetic-literal mapping:
 
 ```bash
@@ -215,12 +224,150 @@ Use it during plan/query validation:
 
 ```bash
 python3 validate.py query q12 \
-  --queries-dir /path/to/queries_mysql \
+  --queries-dir generated/tpch_queries_mysql \
   --literal-mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json
+```
+
+Run all rendered TPC-H query plan comparisons:
+
+```bash
+python3 validate.py plans \
+  --queries-dir generated/tpch_queries_mysql \
+  --literal-mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json \
+  --output-file /tmp/tpch_plan_comparison.txt
 ```
 
 The mapping file contains source literals and must stay local/private. More
 detail: [Literal Mapping](docs/LITERAL_MAPPING.md).
+
+## Smoke Tests
+
+Run these from the repository root:
+
+```bash
+cd /home/hmaduri/contribs/datagenx_generator
+```
+
+Check that the CLI commands are wired:
+
+```bash
+/home/hmaduri/myenv/bin/python3 MasterRun.py --help
+/home/hmaduri/myenv/bin/python3 validate.py --help
+/home/hmaduri/myenv/bin/python3 validate.py tpch-queries --help
+/home/hmaduri/myenv/bin/python3 validate.py literal-map --help
+/home/hmaduri/myenv/bin/python3 validation_report.py --help
+```
+
+Check Python syntax/imports:
+
+```bash
+/home/hmaduri/myenv/bin/python3 -m py_compile \
+  MasterRun.py \
+  validate.py \
+  validation_report.py \
+  datagenx/generation/GenerateDbgen.py \
+  datagenx/validation/ValidateTableStats.py \
+  datagenx/validation/literal_mapping.py \
+  datagenx/validation/tpch_queries.py \
+  datagenx/validation/validation_report.py
+```
+
+Validate current source and synthetic schemas:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validate.py stats \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --skip-distinct
+```
+
+Expected result:
+
+```text
+Overall: ✅ ALL PASSED
+```
+
+Render benchmark SQL without executing it:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validate.py sql tpch \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --render-only \
+  --output-sql /tmp/tpch_validation_rendered.sql
+```
+
+Generate the HTML validation report:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validation_report.py \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --output /tmp/tpch_validation_report.html
+```
+
+Render TPC-H query templates and build the sensitive literal mapping:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validate.py tpch-queries \
+  --template-dir /home/hmaduri/contribs/tpch-dbgen/queries \
+  --output-dir generated/tpch_queries_mysql
+
+/home/hmaduri/myenv/bin/python3 validate.py literal-map \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx
+```
+
+Check that query literal rewriting works:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validate.py rewrite-query \
+  --mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json \
+  --sql "select * from lineitem where l_returnflag = 'R' and l_shipmode in ('MAIL','SHIP');"
+```
+
+Expected rewrite includes:
+
+```sql
+l_returnflag = '2'
+l_shipmode in ('l__2','l__7')
+```
+
+Run one TPC-H plan comparison with target-side literal/date rewriting:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validate.py query q12 \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --queries-dir generated/tpch_queries_mysql \
+  --literal-mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json
+```
+
+Expected result:
+
+```text
+Plan Shape:      IDENTICAL
+```
+
+Optional full plan smoke test:
+
+```bash
+/home/hmaduri/myenv/bin/python3 validate.py plans \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_dbgenx \
+  --queries-dir generated/tpch_queries_mysql \
+  --literal-mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json \
+  --output-file /tmp/tpch_plan_comparison.txt
+```
+
+Generated local artifacts from these tests are intentionally ignored by git:
+
+```text
+generated/literal_mappings/
+generated/tpch_queries_mysql/
+/tmp/tpch_validation_report.html
+/tmp/tpch_plan_comparison.txt
+```
 
 ## Visualization Report
 

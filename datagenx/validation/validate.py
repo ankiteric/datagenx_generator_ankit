@@ -152,6 +152,15 @@ def command_rewrite_query(args):
     return run_script("literal_mapping.py", cmd)
 
 
+def command_tpch_queries(args):
+    cmd = []
+    if args.template_dir:
+        cmd.extend(["--template-dir", args.template_dir])
+    if args.output_dir:
+        cmd.extend(["--output-dir", args.output_dir])
+    return run_script("tpch_queries.py", cmd)
+
+
 def command_all(args):
     code = command_stats(args)
     if code != 0:
@@ -378,6 +387,14 @@ def build_parser():
     rewrite_input.add_argument("--sql")
     rewrite_query.add_argument("--output-file")
     rewrite_query.set_defaults(func=command_rewrite_query)
+
+    tpch_queries = subparsers.add_parser(
+        "tpch-queries",
+        help="Render original TPC-H query templates into runnable MySQL SQL files",
+    )
+    tpch_queries.add_argument("--template-dir", default="/home/hmaduri/contribs/tpch-dbgen/queries")
+    tpch_queries.add_argument("--output-dir", default="generated/tpch_queries_mysql")
+    tpch_queries.set_defaults(func=command_tpch_queries)
 
     all_checks = subparsers.add_parser("all", help="Run stats validation, then plan comparison")
     add_connection_args(all_checks)

@@ -9,7 +9,7 @@ import argparse
 import json
 import re
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import mysql.connector
@@ -17,6 +17,8 @@ import mysql.connector
 from config import HOST, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, USER
 from datagenx.generation.GenerateDbgen import (
     CHAR_TYPES,
+    DATETIME_TYPES,
+    SYNTHETIC_BASE_DATE,
     get_string_column_length,
     get_string_column_values,
     synthetic_string_value,
@@ -66,12 +68,31 @@ def get_char_columns(cursor, schema, table):
     return columns
 
 
+def get_date_columns(cursor, schema, table):
+    cursor.execute(
+        """
+        SELECT COLUMN_NAME, COLUMN_TYPE
+        FROM information_schema.columns
+        WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+        ORDER BY ORDINAL_POSITION
+        """,
+        (schema, table),
+    )
+    columns = []
+    for column, col_type in cursor.fetchall():
+        base_type = col_type.split("(", 1)[0].lower()
+        if base_type in DATETIME_TYPES:
+            columns.append((column, base_type))
+    return columns
+
+
 def mapping_output_path(source_schema, target_schema):
     return DEFAULT_OUTPUT_DIR / f"{source_schema}_to_{target_schema}.json"
 
 
 def build_literal_mapping(cursor, source_schema, target_schema):
     mappings = {}
+    date_mappings = {}
     for table in get_tables(cursor, source_schema):
         for column, col_type in get_char_columns(cursor, source_schema, table):
             values = get_string_column_values(cursor, source_schema, table, column)
@@ -99,6 +120,20 @@ def build_literal_mapping(cursor, source_schema, target_schema):
             if entries:
                 mappings[f"{table}.{column}"] = entries
 
+        for column, base_type in get_date_columns(cursor, source_schema, table):
+            if base_type != "date":
+                continue
+            cursor.execute(f"SELECT MIN(`{column}`), MAX(`{column}`) FROM `{source_schema}`.`{table}`")
+            source_min, source_max = cursor.fetchone()
+            if source_min is None or source_max is None:
+                continue
+            date_mappings[f"{table}.{column}"] = {
+                "source_min": str(source_min),
+                "source_max": str(source_max),
+                "target_base": SYNTHETIC_BASE_DATE,
+                "type": base_type,
+            }
+
     return {
         "meta": {
             "source_schema": source_schema,
@@ -108,6 +143,7 @@ def build_literal_mapping(cursor, source_schema, target_schema):
             "warning": "Contains source literals. Use only for local validation/query rewriting.",
         },
         "mappings": mappings,
+        "date_mappings": date_mappings,
     }
 
 
@@ -131,12 +167,73 @@ def unique_literal_index(mapping):
     return unique, ambiguous
 
 
+def date_column_index(mapping):
+    by_column = {}
+    for qualified, info in mapping.get("date_mappings", {}).items():
+        column = qualified.rsplit(".", 1)[-1]
+        by_column.setdefault(column, []).append(info)
+    return {
+        column: infos[0]
+        for column, infos in by_column.items()
+        if len(infos) == 1
+    }
+
+
 def sql_unescape(value):
     return value.replace("''", "'").replace("\\'", "'")
 
 
 def sql_escape(value):
     return value.replace("\\", "\\\\").replace("'", "''")
+
+
+def map_date_literal(date_text, info):
+    source_min = datetime.strptime(info["source_min"][:10], "%Y-%m-%d").date()
+    source_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+    target_base = datetime.strptime(info["target_base"], "%Y-%m-%d").date()
+    offset = (source_date - source_min).days
+    return (target_base + timedelta(days=offset)).isoformat()
+
+
+def rewrite_sql_dates(sql_text, mapping):
+    date_index = date_column_index(mapping)
+    rewritten = 0
+
+    def column_name(raw_column):
+        return raw_column.split(".")[-1].strip("`")
+
+    between_pattern = re.compile(
+        r"(?P<column>`?\w+`?(?:\.`?\w+`?)?)\s+between\s+date\s+'(?P<start>\d{4}-\d{2}-\d{2})'\s+and\s+date\s+'(?P<end>\d{4}-\d{2}-\d{2})'",
+        flags=re.IGNORECASE,
+    )
+
+    def replace_between(match):
+        nonlocal rewritten
+        col = column_name(match.group("column"))
+        if col not in date_index:
+            return match.group(0)
+        rewritten += 2
+        start = map_date_literal(match.group("start"), date_index[col])
+        end = map_date_literal(match.group("end"), date_index[col])
+        return f"{match.group('column')} between date '{start}' and date '{end}'"
+
+    sql_text = between_pattern.sub(replace_between, sql_text)
+
+    comparison_pattern = re.compile(
+        r"(?P<column>`?\w+`?(?:\.`?\w+`?)?)\s*(?P<op>=|<=|>=|<|>)\s*date\s+'(?P<date>\d{4}-\d{2}-\d{2})'",
+        flags=re.IGNORECASE,
+    )
+
+    def replace_comparison(match):
+        nonlocal rewritten
+        col = column_name(match.group("column"))
+        if col not in date_index:
+            return match.group(0)
+        rewritten += 1
+        mapped = map_date_literal(match.group("date"), date_index[col])
+        return f"{match.group('column')} {match.group('op')} date '{mapped}'"
+
+    return comparison_pattern.sub(replace_comparison, sql_text), rewritten
 
 
 def rewrite_sql_literals(sql_text, mapping):
@@ -157,8 +254,11 @@ def rewrite_sql_literals(sql_text, mapping):
         rewritten += 1
         return f"'{sql_escape(literal_map[literal])}'"
 
-    return pattern.sub(replace, sql_text), {
+    rewritten_sql = pattern.sub(replace, sql_text)
+    rewritten_sql, rewritten_dates = rewrite_sql_dates(rewritten_sql, mapping)
+    return rewritten_sql, {
         "rewritten_literals": rewritten,
+        "rewritten_dates": rewritten_dates,
         "skipped_ambiguous_literals": sorted(skipped_ambiguous),
     }
 
@@ -194,6 +294,7 @@ def command_rewrite(args):
         print(rewritten_sql)
 
     print(f"-- rewritten literals: {stats['rewritten_literals']}")
+    print(f"-- rewritten dates: {stats['rewritten_dates']}")
     if stats["skipped_ambiguous_literals"]:
         print(f"-- skipped ambiguous literals: {', '.join(stats['skipped_ambiguous_literals'])}")
     return 0

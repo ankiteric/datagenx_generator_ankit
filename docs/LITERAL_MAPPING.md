@@ -11,6 +11,29 @@ WHERE l_shipmode IN ('MAIL', 'SHIP')
 The synthetic target uses synthetic values, so the target-side query needs the
 corresponding synthetic literals.
 
+Date literals are also rewritten for target-side queries because generated date
+values are shifted to a synthetic base date.
+
+## Render TPC-H Templates
+
+The original TPC-H files under `tpch-dbgen/queries` are templates with
+placeholders such as `:1`, `:2`, and `:3`. Render them explicitly before query
+or plan comparison:
+
+```bash
+python3 validate.py tpch-queries \
+  --template-dir /home/hmaduri/contribs/tpch-dbgen/queries \
+  --output-dir generated/tpch_queries_mysql
+```
+
+This command writes runnable files like:
+
+```text
+generated/tpch_queries_mysql/q12.sql
+```
+
+It is optional and is not run by default.
+
 ## Sensitive Mapping File
 
 Build a local mapping file:
@@ -79,11 +102,12 @@ unmapped source literal    -> left unchanged
 ## Run Query/Plan Validation With Mapping
 
 Use the original query for the source schema and the rewritten query for the
-target schema:
+target schema. String and date literals are rewritten only for the target-side
+SQL:
 
 ```bash
 python3 validate.py query q12 \
-  --queries-dir /path/to/queries_mysql \
+  --queries-dir generated/tpch_queries_mysql \
   --literal-mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json
 ```
 
@@ -91,7 +115,7 @@ Run all plan comparisons with target-side literal rewriting:
 
 ```bash
 python3 validate.py plans \
-  --queries-dir /path/to/queries_mysql \
+  --queries-dir generated/tpch_queries_mysql \
   --literal-mapping-file generated/literal_mappings/tpch_vanilla_to_tpch_dbgenx.json
 ```
 

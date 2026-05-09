@@ -510,6 +510,7 @@ def main():
         print("--- Target SQL after literal mapping ---")
         print(target_query_sql)
         print(f"Rewritten literals: {rewrite_stats['rewritten_literals']}")
+        print(f"Rewritten dates: {rewrite_stats['rewritten_dates']}")
         if rewrite_stats["skipped_ambiguous_literals"]:
             print("Skipped ambiguous literals: " + ", ".join(rewrite_stats["skipped_ambiguous_literals"]))
 
