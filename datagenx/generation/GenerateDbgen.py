@@ -108,6 +108,25 @@ def synthetic_string_value(column_name, ordinal, source_value=None, max_length=N
     return synthetic_value
 
 
+def synthetic_string_expression(column_name, ordinal_expr, total_distinct, max_length=None):
+    """Return a dbgen expression for a synthetic string ordinal.
+
+    The expression intentionally uses only the column name and synthetic ordinal,
+    never source string values. For high-cardinality equi-height histograms this
+    lets us preserve optimizer NDV without emitting one CASE branch per value.
+    """
+    max_digits = len(str(max(total_distinct, 1)))
+    if max_length is not None:
+        suffix_len = max_digits + 1
+        prefix_len = max_length - suffix_len
+        if prefix_len <= 0:
+            return f"'' || ({ordinal_expr})"
+        prefix = column_name[:prefix_len]
+    else:
+        prefix = column_name
+    return f"'{prefix}_' || ({ordinal_expr})"
+
+
 def get_min_max_from_histogram(histogram):
     """Extract min and max values from a MySQL histogram JSON structure.
 
@@ -521,6 +540,139 @@ def get_string_column_values(cursor, database, table, column):
     values_with_counts.sort(key=lambda x: x[1], reverse=True)
 
     return values_with_counts
+
+
+def get_string_generation_histogram(cursor, database, table, column):
+    """Get string histogram metadata for synthetic generation.
+
+    For singleton histograms this returns one value per bucket, matching the
+    low-cardinality literal-mapping behavior. For equi-height histograms this
+    keeps per-bucket optimizer metadata, especially bucket num_distinct, so high
+    cardinality strings do not collapse to the number of histogram buckets.
+    """
+    cursor.execute("""
+        SELECT HISTOGRAM
+        FROM information_schema.column_statistics
+        WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+    """, (database, table, column))
+
+    result = cursor.fetchone()
+    if not result or not result[0]:
+        return None
+
+    histogram = json.loads(result[0])
+    hist_type = histogram.get("histogram-type")
+    buckets = histogram.get("buckets", [])
+
+    if not buckets or hist_type not in {"singleton", "equi-height"}:
+        return None
+
+    if hist_type == "singleton":
+        values = get_string_column_values(cursor, database, table, column)
+        if not values:
+            return None
+        return {
+            "histogram_type": hist_type,
+            "values_with_counts": values,
+        }
+
+    bucket_infos = []
+    prev_cum_freq = 0.0
+    total_distinct = 0
+
+    for bucket in buckets:
+        if len(bucket) < 4:
+            return None
+        cum_freq = bucket[-2]
+        freq = max(0.0, cum_freq - prev_cum_freq)
+        prev_cum_freq = cum_freq
+        distinct_count = max(1, int(round(bucket[3])))
+        bucket_infos.append({
+            "frequency": freq,
+            "distinct_count": distinct_count,
+        })
+        total_distinct += distinct_count
+
+    if total_distinct <= 0:
+        return None
+
+    return {
+        "histogram_type": hist_type,
+        "buckets": bucket_infos,
+        "total_distinct": total_distinct,
+    }
+
+
+def string_histogram_to_case(histogram_info, column_name, max_length=None, row_count=None):
+    """Generate a string expression from histogram metadata.
+
+    Equi-height histograms use optimizer bucket `num_distinct` to preserve
+    high-cardinality string NDV while keeping values synthetic.
+    """
+    if not histogram_info:
+        return ""
+
+    hist_type = histogram_info.get("histogram_type")
+    if hist_type == "singleton":
+        return string_values_to_case(
+            histogram_info.get("values_with_counts"),
+            column_name,
+            max_length=max_length,
+            row_count=row_count,
+        )
+
+    if hist_type != "equi-height" or not row_count or row_count <= 0:
+        return ""
+
+    buckets = histogram_info.get("buckets") or []
+    total_distinct = histogram_info.get("total_distinct") or 0
+    if not buckets or total_distinct <= 0:
+        return ""
+
+    raw_counts = [int(round(bucket["frequency"] * row_count)) for bucket in buckets]
+    diff = row_count - sum(raw_counts)
+    if raw_counts:
+        raw_counts[-1] += diff
+
+    case_lines = []
+    cumulative = 0
+    distinct_offset = 0
+
+    for bucket, row_count_for_bucket in zip(buckets, raw_counts):
+        if row_count_for_bucket <= 0:
+            continue
+
+        bucket_distinct = min(bucket["distinct_count"], row_count_for_bucket)
+        if bucket_distinct <= 0:
+            continue
+
+        previous_cumulative = cumulative
+        cumulative += row_count_for_bucket
+
+        local_row = f"(rownum - {previous_cumulative} - 1)"
+        ordinal_expr = f"{distinct_offset + 1} + mod({local_row}, {bucket_distinct})"
+        synthetic_expr = synthetic_string_expression(
+            column_name,
+            ordinal_expr,
+            total_distinct,
+            max_length=max_length,
+        )
+        case_lines.append(f"when rownum <= {cumulative} then {synthetic_expr}")
+        distinct_offset += bucket_distinct
+
+    if not case_lines:
+        return ""
+
+    fallback = synthetic_string_expression(
+        column_name,
+        max(distinct_offset, 1),
+        total_distinct,
+        max_length=max_length,
+    )
+    return f"""case
+    {' '.join(case_lines)}
+    else {fallback}
+    end"""
 
 
 def string_values_to_case(values_with_counts, column_name, max_length=None, row_count=None):
@@ -1120,14 +1272,17 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                         synthetic = "rownum"
 
             elif col_type in CHAR_TYPES:
-                # Try to get distinct values from histogram metadata
-                values = get_string_column_values(cursor, database, table, col)
+                # Try to get optimizer string histogram metadata. Equi-height
+                # histograms include per-bucket num_distinct, which lets us
+                # preserve high-cardinality string NDV without reading source
+                # literals or running COUNT(DISTINCT).
+                histogram_info = get_string_generation_histogram(cursor, database, table, col)
                 col_max_length = get_string_column_length(line)
-                if values:
+                if histogram_info:
                     cursor.execute(f"SELECT COUNT(*) FROM `{database}`.`{table}`")
                     table_row_count = cursor.fetchone()[0]
-                    synthetic = string_values_to_case(
-                        values,
+                    synthetic = string_histogram_to_case(
+                        histogram_info,
                         col,
                         max_length=col_max_length,
                         row_count=table_row_count,

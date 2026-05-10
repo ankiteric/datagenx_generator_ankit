@@ -20,6 +20,7 @@ from mysql.connector import Error
 VERBOSE = True
 COMPARE_HISTOGRAMS = False  # Disabled by default - histogram comparison is unreliable
 SKIP_VALIDATION = True
+ROWS_OVERRIDE = False
 
 from datagenx.generation.GenerateDbgen import (
     annotate_table_with_histogram,
@@ -671,8 +672,12 @@ def step_b_run_dbgen(cursor, table):
 
     cursor.execute(f"SELECT COUNT(*) FROM `{SOURCE_SCHEMA}`.`{table}`")
     row_count = cursor.fetchone()[0]
+    rows_to_generate = int(ROWS_COUNT) if ROWS_OVERRIDE else row_count
     print(f"      Source row count = {row_count}")
-    print(f"      Generating {ROWS_COUNT} rows")
+    if ROWS_OVERRIDE:
+        print(f"      Generating {rows_to_generate} rows (--rows override)")
+    else:
+        print(f"      Generating {rows_to_generate} rows (matches source)")
 
     template_path = os.path.join(DBGEN_FILES_DIR, f"{table}.dbgen")
     dbgen_bin = _find_dbgen_binary()
@@ -680,8 +685,8 @@ def step_b_run_dbgen(cursor, table):
         dbgen_bin,
         "--out-dir", DBGEN_TMP_OUT_DIR,
         "--files-count", FILES_COUNT,
-        "--rows-per-file", ROWS_COUNT,  # Fixed: use ROWS_COUNT instead of str(row_count)
-        "--rows-count", ROWS_COUNT,
+        "--rows-per-file", str(rows_to_generate),
+        "--rows-count", str(rows_to_generate),
         "--template", template_path,
         "--format", "csv",           # Generate CSV instead of SQL
         "--format-null", "\\N",      # MySQL's default NULL representation
@@ -836,8 +841,8 @@ def step_c_create_insert_validate(cursor, table):
     cursor.execute(f"SELECT COUNT(*) FROM `{TARGET_SCHEMA}`.`{table}`")
     tgt_rows = cursor.fetchone()[0]
 
-    # When ROWS_COUNT is explicitly specified and differs from source, compare against it
-    if int(ROWS_COUNT) != src_rows:
+    # When --rows is explicitly specified and differs from source, compare against it
+    if ROWS_OVERRIDE and int(ROWS_COUNT) != src_rows:
         # User specified different row count
         expected_rows = int(ROWS_COUNT)
         if tgt_rows != expected_rows:
@@ -969,7 +974,7 @@ def step_c_create_insert_validate(cursor, table):
 # ----------------------------------------------------------------
 def main():
     # Make these global so they can be modified by CLI args
-    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE
+    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE, ROWS_OVERRIDE
 
     start_time = time.time()
 
@@ -1164,5 +1169,6 @@ if __name__ == "__main__":
         TARGET_SCHEMA = args.target_schema
     if args.rows:
         ROWS_COUNT = args.rows
+        ROWS_OVERRIDE = True
 
     main()
