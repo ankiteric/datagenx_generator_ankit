@@ -21,23 +21,16 @@ from datagenx.generation.GenerateDbgen import (
 )
 
 # Import our new library
-from lib.schema_extractor import MySQLExtractor, SingleStoreExtractor
+from lib.schema_extractor import available_extractor_types, create_schema_extractor
 
 
-def _load_optimizer_cardinality(cursor, database, table):
-    """Load per-column cardinality from optimizer_statistics (SingleStore).
-    Returns dict: {column_name: cardinality} or empty dict if unavailable.
-    """
+def _load_table_cardinality(extractor, table):
+    """Load table cardinality metadata through the extractor abstraction."""
     try:
-        cursor.execute("""
-            SELECT column_name, cardinality
-            FROM information_schema.optimizer_statistics
-            WHERE database_name = %s AND table_name = %s
-        """, (database, table))
-        return {col: int(card) for col, card in cursor.fetchall() if card is not None}
+        return extractor.get_table_cardinality(table)
     except Exception as e:
-        print(f"    Note: optimizer_statistics unavailable ({e}), skipping cardinality lookup")
-        return {}
+        print(f"    Note: cardinality lookup unavailable ({e}), skipping cardinality lookup")
+        return {"row_count": None, "columns": {}, "indexes": {}}
 
 
 def _get_string_value_weights(cursor, database, table, column, cardinality):
@@ -117,8 +110,10 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
     print(f"    Analyzing table {table}...")
     extractor.analyze_table(table)
 
-    # Load per-column cardinality from optimizer_statistics (fast, covers all columns)
-    col_cardinality = _load_optimizer_cardinality(extractor.cursor, database, table)
+    # Load cardinality metadata through the engine-specific extractor.
+    table_cardinality = _load_table_cardinality(extractor, table)
+    col_cardinality = table_cardinality.get("columns", {})
+    table_row_count = table_cardinality.get("row_count")
 
     new_lines = []
 
@@ -160,9 +155,7 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
                 if distinct_count and distinct_count > 1:
                     # Estimate rows_per_value from source row count
                     try:
-                        extractor.cursor.execute(
-                            f"SELECT COUNT(*) FROM `{database}`.`{table}`")
-                        row_count = extractor.cursor.fetchone()[0]
+                        row_count = table_row_count or extractor.get_table_row_count(table)
                         rows_per_value = max(1, row_count // distinct_count)
                     except Exception:
                         rows_per_value = 1
@@ -242,7 +235,7 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
     return "\n".join(new_lines)
 
 
-def build_fk_appendages_from_source(extractor, database, table):
+def build_fk_appendages_from_source(extractor, table):
     """Build FK expressions by querying distinct counts from source DB.
 
     For each FK column, queries the source (parent) table to find the
@@ -260,10 +253,7 @@ def build_fk_appendages_from_source(extractor, database, table):
     appendages = {}
     for col, (ref_table, ref_col) in foreign_keys.items():
         try:
-            extractor.cursor.execute(
-                f"SELECT COUNT(DISTINCT `{ref_col}`) FROM `{database}`.`{ref_table}`"
-            )
-            distinct_count = extractor.cursor.fetchone()[0]
+            distinct_count = extractor.get_distinct_count(ref_table, ref_col)
             if distinct_count > 0:
                 appendages[col] = f"rand.range(1,{distinct_count + 1})"
                 print(f"    FK {col} -> {ref_table}.{ref_col}: "
@@ -293,7 +283,7 @@ Examples:
         '''
     )
 
-    parser.add_argument('--db-type', required=True, choices=['mysql', 'singlestore'],
+    parser.add_argument('--db-type', required=True, choices=available_extractor_types(),
                         help='Database type')
     parser.add_argument('--host', required=True, help='Database host')
     parser.add_argument('--port', type=int, default=3306, help='Database port (default: 3306)')
@@ -328,10 +318,14 @@ Examples:
     print(f"Output: {args.output_dir}/")
     print()
 
-    if args.db_type == 'mysql':
-        extractor = MySQLExtractor(args.host, args.user, password, args.database, args.port)
-    else:
-        extractor = SingleStoreExtractor(args.host, args.user, password, args.database, args.port)
+    extractor = create_schema_extractor(
+        args.db_type,
+        args.host,
+        args.user,
+        password,
+        args.database,
+        args.port,
+    )
 
     if not extractor.connect():
         sys.exit(1)
@@ -353,9 +347,7 @@ Examples:
             print(f"[{i}/{len(sorted_tables)}] Processing: {table}{dep_str}")
 
             # Build FK expressions from source DB distinct counts
-            fk_appendages = build_fk_appendages_from_source(
-                extractor, args.database, table
-            )
+            fk_appendages = build_fk_appendages_from_source(extractor, table)
 
             ddl = annotate_table_with_statistics(
                 extractor, args.database, table,

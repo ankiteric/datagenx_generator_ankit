@@ -1,16 +1,55 @@
-"""
-Schema extraction adapters for different database systems.
-"""
+"""Schema, statistics, and plan extraction adapters for database systems."""
 
-from abc import ABC, abstractmethod
-import mysql.connector
-from mysql.connector import Error
 import json
 import re
+from abc import ABC, abstractmethod
+
+import mysql.connector
+from mysql.connector import Error
 
 
-class SchemaExtractor(ABC):
-    """Abstract base class for database schema extraction."""
+class StatisticsExtractor(ABC):
+    """Abstract statistics and plan-inspection API for database engines."""
+
+    @abstractmethod
+    def analyze_table(self, table):
+        """Run engine-appropriate ANALYZE to update optimizer statistics."""
+        pass
+
+    @abstractmethod
+    def get_column_histogram(self, table, column):
+        """
+        Get a column histogram in DataGenX's internal format:
+        {
+            "histogram-type": "equi-height" | "singleton",
+            "buckets": [[lower, upper, cumulative_freq, num_distinct], ...]
+        }
+        """
+        pass
+
+    @abstractmethod
+    def get_column_cardinalities(self, table):
+        """Return optimizer cardinality estimates keyed by column name."""
+        pass
+
+    @abstractmethod
+    def get_index_cardinality(self, table):
+        """Return optimizer cardinality estimates keyed by index and column."""
+        pass
+
+    @abstractmethod
+    def get_table_cardinality(self, table):
+        """Return row, column, and index cardinality metadata for a table."""
+        pass
+
+    @abstractmethod
+    def get_explain_plan(self, query, analyze=False):
+        """Return an engine-normalized EXPLAIN result for a query."""
+        pass
+
+
+class SchemaExtractor(StatisticsExtractor):
+    """Abstract base class for schema, statistics, and plan extraction."""
 
     def __init__(self, host, user, password, database, port=3306):
         self.host = host
@@ -112,22 +151,49 @@ class SchemaExtractor(ABC):
 
         return {k: list(v) for k, v in dependencies.items()}
 
-    @abstractmethod
-    def analyze_table(self, table):
-        """Run ANALYZE to update statistics."""
-        pass
+    def get_table_row_count(self, table):
+        """Return exact row count for a table."""
+        self.cursor.execute(f"SELECT COUNT(*) FROM `{self.database}`.`{table}`")
+        return self.cursor.fetchone()[0]
 
-    @abstractmethod
-    def get_column_histogram(self, table, column):
-        """
-        Get histogram for a column.
-        Returns dict with format: {
-            "histogram-type": "equi-height" | "singleton",
-            "buckets": [[lower, upper, cumulative_freq, count], ...]
+    def get_distinct_count(self, table, column):
+        """Return exact distinct count for one column."""
+        self.cursor.execute(
+            f"SELECT COUNT(DISTINCT `{column}`) FROM `{self.database}`.`{table}`"
+        )
+        return self.cursor.fetchone()[0]
+
+    def get_table_cardinality(self, table):
+        """Return row, column, and index cardinality metadata for a table."""
+        return {
+            "row_count": self.get_table_row_count(table),
+            "columns": self.get_column_cardinalities(table),
+            "indexes": self.get_index_cardinality(table),
         }
-        Returns None if no histogram available.
+
+    def get_table_histograms(self, table):
+        """Return all available column histograms for a table."""
+        histograms = {}
+        for column in self.get_columns(table):
+            histogram = self.get_column_histogram(table, column)
+            if histogram:
+                histograms[column] = histogram
+        return histograms
+
+    def get_explain_plan(self, query, analyze=False):
+        """Run row-format EXPLAIN and return columns plus rows.
+
+        Engines with structured explain formats can override this method while
+        callers use the same API.
         """
-        pass
+        prefix = "EXPLAIN ANALYZE" if analyze else "EXPLAIN"
+        self.cursor.execute(f"{prefix} {query}")
+        return {
+            "format": "rows",
+            "analyze": analyze,
+            "columns": list(self.cursor.column_names),
+            "rows": self.cursor.fetchall(),
+        }
 
 
 class MySQLExtractor(SchemaExtractor):
@@ -179,6 +245,29 @@ class MySQLExtractor(SchemaExtractor):
         except Exception as e:
             # column_statistics might not exist in older MySQL versions
             return None
+
+    def get_column_cardinalities(self, table):
+        """Return broad MySQL column cardinalities when available.
+
+        MySQL's portable metadata gives index cardinality, not full table-wide
+        per-column NDV. Keep this empty so callers do not mistake index stats
+        for exact column distributions; use get_index_cardinality() for SHOW
+        INDEX-style estimates.
+        """
+        return {}
+
+    def get_index_cardinality(self, table):
+        """Return MySQL index cardinality estimates by index and column."""
+        try:
+            self.cursor.execute("""
+                SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, CARDINALITY, NON_UNIQUE
+                FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                ORDER BY INDEX_NAME, SEQ_IN_INDEX
+            """, (self.database, table))
+            return _index_rows_to_cardinality(self.cursor.fetchall())
+        except Exception:
+            return {}
 
 
 class SingleStoreExtractor(SchemaExtractor):
@@ -285,6 +374,35 @@ class SingleStoreExtractor(SchemaExtractor):
 
         return None
 
+    def get_column_cardinalities(self, table):
+        """Return SingleStore optimizer cardinality estimates keyed by column."""
+        try:
+            self.cursor.execute("""
+                SELECT column_name, cardinality
+                FROM information_schema.optimizer_statistics
+                WHERE database_name = %s AND table_name = %s
+            """, (self.database, table))
+            return {
+                col: int(cardinality)
+                for col, cardinality in self.cursor.fetchall()
+                if cardinality is not None
+            }
+        except Exception:
+            return {}
+
+    def get_index_cardinality(self, table):
+        """Return SingleStore index cardinality estimates by index and column."""
+        try:
+            self.cursor.execute("""
+                SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, CARDINALITY, NON_UNIQUE
+                FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                ORDER BY INDEX_NAME, SEQ_IN_INDEX
+            """, (self.database, table))
+            return _index_rows_to_cardinality(self.cursor.fetchall())
+        except Exception:
+            return {}
+
     def _convert_singlestore_histogram(self, buckets):
         """
         Convert SingleStore ADVANCED_HISTOGRAMS buckets to standard format.
@@ -325,3 +443,43 @@ class SingleStoreExtractor(SchemaExtractor):
             ])
 
         return histogram
+
+
+def _index_rows_to_cardinality(rows):
+    """Convert information_schema.statistics rows into a stable mapping."""
+    indexes = {}
+    for index_name, column_name, seq_in_index, cardinality, non_unique in rows:
+        entry = indexes.setdefault(
+            index_name,
+            {
+                "unique": not bool(non_unique),
+                "columns": [],
+            },
+        )
+        entry["columns"].append({
+            "column": column_name,
+            "seq_in_index": int(seq_in_index) if seq_in_index is not None else None,
+            "cardinality": int(cardinality) if cardinality is not None else None,
+        })
+    return indexes
+
+
+EXTRACTOR_TYPES = {
+    "mysql": MySQLExtractor,
+    "singlestore": SingleStoreExtractor,
+}
+
+
+def available_extractor_types():
+    """Return supported extractor type names."""
+    return tuple(sorted(EXTRACTOR_TYPES))
+
+
+def create_schema_extractor(db_type, host, user, password, database, port=3306):
+    """Create a schema/statistics extractor for a supported database type."""
+    try:
+        extractor_cls = EXTRACTOR_TYPES[db_type]
+    except KeyError as exc:
+        supported = ", ".join(available_extractor_types())
+        raise ValueError(f"Unsupported database type {db_type!r}; expected one of: {supported}") from exc
+    return extractor_cls(host, user, password, database, port)

@@ -28,7 +28,7 @@ from datagenx.generation.GenerateDbgen import (
     topological_sort,
 )
 from extract_schema import annotate_table_with_statistics
-from lib.schema_extractor import MySQLExtractor, SingleStoreExtractor
+from lib.schema_extractor import create_schema_extractor
 from datagenx.validation.PopulateNewTableAndValidate import (
     clone_histograms,
     compare_histograms,
@@ -1000,7 +1000,7 @@ def main():
     # --- Create SingleStore extractor if needed ---
     extractor = None
     if DB_TYPE == 'singlestore':
-        extractor = SingleStoreExtractor(HOST, USER, PASSWORD, SOURCE_SCHEMA)
+        extractor = create_schema_extractor(DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA)
         if not extractor.connect():
             print("Failed to connect to SingleStore")
             sys.exit(1)
