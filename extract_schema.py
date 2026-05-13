@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract schema from MySQL or SingleStore database and generate .dbgen files.
+Extract schema from a supported database and generate .dbgen files.
 Customer-facing tool for schema extraction.
 """
 
@@ -192,7 +192,12 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
             if 0 < card <= STRING_CARDINALITY_THRESHOLD:
                 values = _get_string_value_weights(
                     extractor.cursor, database, table, col, card)
-                synthetic = string_values_to_case(values, col, max_length=col_max_length)
+                synthetic = string_values_to_case(
+                    values,
+                    col,
+                    max_length=col_max_length,
+                    row_count=table_row_count,
+                )
             else:
                 synthetic = char_varchar_appendage(line)
 
@@ -216,7 +221,12 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
             histogram = extractor.get_column_histogram(table, col)
             if histogram:
                 actual_distinct = col_cardinality.get(col)
-                synthetic = histogram_to_case(histogram, line, actual_distinct)
+                synthetic = histogram_to_case(
+                    histogram,
+                    line,
+                    actual_distinct,
+                    table_row_count,
+                )
             else:
                 synthetic = "rand.range(0,5)"
 
@@ -267,7 +277,7 @@ def build_fk_appendages_from_source(extractor, table):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract schema from MySQL or SingleStore database',
+        description='Extract schema from a supported database',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
@@ -276,6 +286,9 @@ Examples:
 
   # Extract from SingleStore
   %(prog)s --db-type singlestore --host prod.db.com --user admin --database mydb
+
+  # Extract from TiDB
+  %(prog)s --db-type tidb --host gateway01.region.prod.aws.tidbcloud.com --port 4000 --user tidb_user --database test
 
   # With password from environment
   export DB_PASSWORD=secret
@@ -286,7 +299,7 @@ Examples:
     parser.add_argument('--db-type', required=True, choices=available_extractor_types(),
                         help='Database type')
     parser.add_argument('--host', required=True, help='Database host')
-    parser.add_argument('--port', type=int, default=3306, help='Database port (default: 3306)')
+    parser.add_argument('--port', type=int, help='Database port (defaults to the engine default)')
     parser.add_argument('--user', required=True, help='Database user')
     parser.add_argument('--password', help='Database password')
     parser.add_argument('--password-env', help='Environment variable containing password')

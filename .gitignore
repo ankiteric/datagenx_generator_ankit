@@ -9,3 +9,5 @@ generated/literal_mappings/
 lib/__pycache__/
 generated/tpch_queries_mysql/
 .codex/
+
+.env

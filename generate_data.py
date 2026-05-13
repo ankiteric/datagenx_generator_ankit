@@ -112,10 +112,8 @@ Examples:
             "--rows-count", str(args.rows),
             "--template", template_path,
             "--format", args.format,
+            "--quiet",
         ]
-        if args.format == "csv":
-            cmd += ["--format-null", "\\N"]
-
         if args.verbose:
             print(f"  Command: {' '.join(cmd)}")
 

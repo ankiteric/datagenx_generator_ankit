@@ -1,6 +1,7 @@
 """Schema, statistics, and plan extraction adapters for database systems."""
 
 import json
+import os
 import re
 from abc import ABC, abstractmethod
 
@@ -51,7 +52,7 @@ class StatisticsExtractor(ABC):
 class SchemaExtractor(StatisticsExtractor):
     """Abstract base class for schema, statistics, and plan extraction."""
 
-    def __init__(self, host, user, password, database, port=3306):
+    def __init__(self, host, user, password, database, port=None):
         self.host = host
         self.user = user
         self.password = password
@@ -63,19 +64,37 @@ class SchemaExtractor(StatisticsExtractor):
     def connect(self):
         """Establish database connection."""
         try:
-            self.conn = mysql.connector.connect(
-                host=self.host,
-                port=self.port,
-                user=self.user,
-                password=self.password,
-                database=self.database
-            )
+            self.conn = mysql.connector.connect(**self.connection_kwargs())
             self.cursor = self.conn.cursor()
             print(f"✅ Connected to {self.database} at {self.host}")
             return True
         except Error as e:
             print(f"❌ Connection failed: {e}")
             return False
+
+    def connection_kwargs(self, **overrides):
+        """Return mysql.connector connection keyword arguments."""
+        return self.__class__.build_connection_kwargs(
+            self.host,
+            self.user,
+            self.password,
+            self.database,
+            self.port,
+            **overrides,
+        )
+
+    @classmethod
+    def build_connection_kwargs(cls, host, user, password, database, port=None, **overrides):
+        """Build mysql.connector connection keyword arguments."""
+        kwargs = {
+            "host": host,
+            "port": int(port or 3306),
+            "user": user,
+            "password": password,
+            "database": database,
+        }
+        kwargs.update(overrides)
+        return kwargs
 
     def close(self):
         """Close database connection."""
@@ -273,17 +292,23 @@ class MySQLExtractor(SchemaExtractor):
 class SingleStoreExtractor(SchemaExtractor):
     """Schema extractor for SingleStore databases."""
 
+    @classmethod
+    def build_connection_kwargs(cls, host, user, password, database, port=None, **overrides):
+        kwargs = super().build_connection_kwargs(
+            host,
+            user,
+            password,
+            database,
+            port,
+            auth_plugin="mysql_native_password",
+        )
+        kwargs.update(overrides)
+        return kwargs
+
     def connect(self):
         """Establish database connection with SingleStore-compatible auth."""
         try:
-            self.conn = mysql.connector.connect(
-                host=self.host,
-                port=self.port,
-                user=self.user,
-                password=self.password,
-                database=self.database,
-                auth_plugin='mysql_native_password',
-            )
+            self.conn = mysql.connector.connect(**self.connection_kwargs())
             self.cursor = self.conn.cursor()
             print(f"Connected to {self.database} at {self.host}")
             return True
@@ -445,6 +470,269 @@ class SingleStoreExtractor(SchemaExtractor):
         return histogram
 
 
+class TiDBExtractor(SchemaExtractor):
+    """Schema and statistics extractor for TiDB-compatible deployments."""
+
+    DEFAULT_PORT = 4000
+    TIDB_CLOUD_HOST_RE = re.compile(r"(^|\.)tidbcloud\.com$", re.IGNORECASE)
+
+    @classmethod
+    def is_cloud_host(cls, host):
+        """Return True for TiDB Cloud gateway hostnames."""
+        return bool(host and cls.TIDB_CLOUD_HOST_RE.search(host))
+
+    @classmethod
+    def build_connection_kwargs(cls, host, user, password, database, port=None, **overrides):
+        kwargs = super().build_connection_kwargs(
+            host,
+            user,
+            password,
+            database,
+            int(port or cls.DEFAULT_PORT),
+            autocommit=True,
+            allow_local_infile=True,
+        )
+        if cls.is_cloud_host(host):
+            kwargs.update({
+                "ssl_verify_cert": True,
+                "ssl_verify_identity": True,
+            })
+            ssl_ca = os.environ.get("TIDB_SSL_CA")
+            if ssl_ca:
+                kwargs["ssl_ca"] = ssl_ca
+            else:
+                try:
+                    import certifi
+                    kwargs["ssl_ca"] = certifi.where()
+                except ImportError:
+                    pass
+        kwargs.update(overrides)
+        return kwargs
+
+    def connect(self):
+        """Establish a TiDB connection, enabling TLS verification for TiDB Cloud."""
+        try:
+            self.conn = mysql.connector.connect(**self.connection_kwargs())
+            self.cursor = self.conn.cursor()
+            print(f"Connected to TiDB database {self.database} at {self.host}")
+            return True
+        except Error as e:
+            print(f"TiDB connection failed: {e}")
+            return False
+
+    def analyze_table(self, table):
+        """Run TiDB ANALYZE TABLE to collect optimizer statistics."""
+        self.cursor.execute(f"ANALYZE TABLE `{self.database}`.`{table}`")
+        self.cursor.fetchall()
+
+    def get_column_histogram(self, table, column):
+        """Return a TiDB column histogram in DataGenX internal format."""
+        histogram_meta = self._stats_histogram_row(table, column, is_index=False)
+        distinct_count = _safe_int(histogram_meta.get("distinct_count"), default=0)
+        rows = self._show_stats_rows(
+            "SHOW STATS_BUCKETS",
+            table=table,
+            column=column,
+            is_index=False,
+        )
+        histogram = self._convert_tidb_buckets(rows, distinct_count)
+        if histogram:
+            return histogram
+        return self._topn_to_singleton_histogram(table, column)
+
+    def get_column_cardinalities(self, table):
+        """Return TiDB column NDV estimates from SHOW STATS_HISTOGRAMS."""
+        rows = self._show_stats_rows("SHOW STATS_HISTOGRAMS", table=table, is_index=False)
+        cardinalities = {}
+        for row in rows:
+            column = row.get("column_name")
+            distinct_count = row.get("distinct_count")
+            if column and distinct_count is not None:
+                cardinalities[column] = _safe_int(distinct_count, default=0)
+        try:
+            columns = self.get_columns(table)
+        except Exception:
+            columns = {}
+        for column in columns:
+            if not cardinalities.get(column):
+                try:
+                    cardinalities[column] = self.get_distinct_count(table, column)
+                except Exception:
+                    pass
+        return cardinalities
+
+    def get_index_cardinality(self, table):
+        """Return TiDB index NDV estimates keyed by index name."""
+        index_stats = {
+            row.get("column_name"): row
+            for row in self._show_stats_rows("SHOW STATS_HISTOGRAMS", table=table, is_index=True)
+            if row.get("column_name")
+        }
+        try:
+            self.cursor.execute("""
+                SELECT INDEX_NAME, COLUMN_NAME, SEQ_IN_INDEX, CARDINALITY, NON_UNIQUE
+                FROM INFORMATION_SCHEMA.STATISTICS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                ORDER BY INDEX_NAME, SEQ_IN_INDEX
+            """, (self.database, table))
+            base_indexes = _index_rows_to_cardinality(self.cursor.fetchall())
+        except Exception:
+            base_indexes = {}
+        for index_name, entry in base_indexes.items():
+            stats = index_stats.get(index_name)
+            if stats:
+                entry["cardinality"] = _safe_int(stats.get("distinct_count"), default=None)
+                entry["null_count"] = _safe_int(stats.get("null_count"), default=None)
+        return base_indexes
+
+    def get_table_row_count(self, table):
+        """Return TiDB statistics row count, falling back to exact count."""
+        rows = self._show_stats_rows("SHOW STATS_META", table=table)
+        if rows:
+            non_partitioned = [
+                row for row in rows
+                if row.get("partition_name") in (None, "", "global")
+            ]
+            selected = non_partitioned or rows
+            if len(selected) == 1:
+                row_count = _safe_int(selected[0].get("row_count"), default=None)
+            else:
+                row_count = sum(
+                    _safe_int(row.get("row_count"), default=0)
+                    for row in selected
+                    if row.get("partition_name") not in (None, "", "global")
+                )
+            if row_count:
+                return row_count
+        return super().get_table_row_count(table)
+
+    def get_explain_plan(self, query, analyze=False):
+        """Return TiDB EXPLAIN output.
+
+        Non-analyze mode uses TiDB's structured JSON format. Analyze mode uses
+        row output because EXPLAIN ANALYZE executes the query and returns
+        runtime columns.
+        """
+        if analyze:
+            return super().get_explain_plan(query, analyze=True)
+
+        self.cursor.execute(f'EXPLAIN FORMAT = "tidb_json" {query}')
+        rows = self.cursor.fetchall()
+        raw = rows[0][0] if rows else "[]"
+        try:
+            plan = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            plan = raw
+        return {
+            "format": "tidb_json",
+            "analyze": False,
+            "columns": list(self.cursor.column_names),
+            "rows": rows,
+            "plan": plan,
+        }
+
+    def _stats_histogram_row(self, table, column, is_index=False):
+        rows = self._show_stats_rows(
+            "SHOW STATS_HISTOGRAMS",
+            table=table,
+            column=column,
+            is_index=is_index,
+        )
+        return rows[0] if rows else {}
+
+    def _topn_to_singleton_histogram(self, table, column):
+        rows = self._show_stats_rows(
+            "SHOW STATS_TOPN",
+            table=table,
+            column=column,
+            is_index=False,
+        )
+        if not rows:
+            return None
+
+        counts = [
+            _safe_int(row.get("count"), default=0)
+            for row in rows
+        ]
+        total = sum(counts)
+        if total <= 0:
+            return None
+
+        cumulative = 0
+        buckets = []
+        for ordinal, count in enumerate(counts, start=1):
+            if count <= 0:
+                continue
+            cumulative += count
+            # Use synthetic ordinal values, never the real TopN values.
+            buckets.append([ordinal, round(cumulative / total, 5)])
+
+        if not buckets:
+            return None
+        return {
+            "histogram-type": "singleton",
+            "buckets": buckets,
+        }
+
+    def _show_stats_rows(self, statement, table=None, column=None, is_index=None):
+        filters = [f"Db_name = {_sql_literal(self.database)}"]
+        if table is not None:
+            filters.append(f"Table_name = {_sql_literal(table)}")
+        if column is not None:
+            filters.append(f"Column_name = {_sql_literal(column)}")
+        if is_index is not None:
+            filters.append(f"Is_index = {1 if is_index else 0}")
+
+        self.cursor.execute(f"{statement} WHERE {' AND '.join(filters)}")
+        columns = [_normalize_column_name(col) for col in self.cursor.column_names]
+        return [
+            dict(zip(columns, row))
+            for row in self.cursor.fetchall()
+        ]
+
+    @staticmethod
+    def _convert_tidb_buckets(rows, distinct_count=0):
+        """Convert TiDB SHOW STATS_BUCKETS rows to DataGenX histogram format."""
+        if not rows:
+            return None
+
+        sorted_rows = sorted(rows, key=lambda row: _safe_int(row.get("bucket_id"), default=0))
+        total_count = max(_safe_int(sorted_rows[-1].get("count"), default=0), 0)
+        if total_count <= 0:
+            return None
+
+        histogram = {
+            "histogram-type": "equi-height",
+            "buckets": [],
+        }
+
+        previous_count = 0
+        remaining_distinct = max(_safe_int(distinct_count, default=0), 0)
+        remaining_rows = total_count
+
+        for row in sorted_rows:
+            cumulative_count = _safe_int(row.get("count"), default=previous_count)
+            cumulative_count = max(cumulative_count, previous_count)
+            bucket_rows = max(cumulative_count - previous_count, 0)
+            if remaining_distinct > 0 and remaining_rows > 0:
+                bucket_ndv = max(1, round(remaining_distinct * bucket_rows / remaining_rows))
+                bucket_ndv = min(bucket_ndv, remaining_distinct)
+                remaining_distinct -= bucket_ndv
+                remaining_rows = max(remaining_rows - bucket_rows, 0)
+            else:
+                bucket_ndv = 1
+
+            histogram["buckets"].append([
+                _parse_tidb_bound(row.get("lower_bound")),
+                _parse_tidb_bound(row.get("upper_bound")),
+                round(cumulative_count / total_count, 5),
+                bucket_ndv,
+            ])
+            previous_count = cumulative_count
+
+        return histogram
+
+
 def _index_rows_to_cardinality(rows):
     """Convert information_schema.statistics rows into a stable mapping."""
     indexes = {}
@@ -464,9 +752,48 @@ def _index_rows_to_cardinality(rows):
     return indexes
 
 
+def _normalize_column_name(name):
+    return str(name).strip().lower()
+
+
+def _safe_int(value, default=0):
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return default
+
+
+def _parse_tidb_bound(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value).strip()
+    if not text:
+        return text
+    try:
+        as_float = float(text)
+    except ValueError:
+        return text
+    if as_float.is_integer() and "." not in text and "e" not in text.lower():
+        return int(as_float)
+    return as_float
+
+
+def _sql_literal(value):
+    escaped = str(value).replace("\\", "\\\\").replace("'", "''")
+    return f"'{escaped}'"
+
+
 EXTRACTOR_TYPES = {
     "mysql": MySQLExtractor,
     "singlestore": SingleStoreExtractor,
+    "tidb": TiDBExtractor,
 }
 
 
@@ -475,7 +802,7 @@ def available_extractor_types():
     return tuple(sorted(EXTRACTOR_TYPES))
 
 
-def create_schema_extractor(db_type, host, user, password, database, port=3306):
+def create_schema_extractor(db_type, host, user, password, database, port=None):
     """Create a schema/statistics extractor for a supported database type."""
     try:
         extractor_cls = EXTRACTOR_TYPES[db_type]
@@ -483,3 +810,20 @@ def create_schema_extractor(db_type, host, user, password, database, port=3306):
         supported = ", ".join(available_extractor_types())
         raise ValueError(f"Unsupported database type {db_type!r}; expected one of: {supported}") from exc
     return extractor_cls(host, user, password, database, port)
+
+
+def connection_kwargs_for(db_type, host, user, password, database, port=None, **overrides):
+    """Build mysql.connector connection keyword arguments for a supported type."""
+    try:
+        extractor_cls = EXTRACTOR_TYPES[db_type]
+    except KeyError as exc:
+        supported = ", ".join(available_extractor_types())
+        raise ValueError(f"Unsupported database type {db_type!r}; expected one of: {supported}") from exc
+    return extractor_cls.build_connection_kwargs(
+        host,
+        user,
+        password,
+        database,
+        port,
+        **overrides,
+    )

@@ -28,7 +28,7 @@ from datagenx.generation.GenerateDbgen import (
     topological_sort,
 )
 from extract_schema import annotate_table_with_statistics
-from lib.schema_extractor import create_schema_extractor
+from lib.schema_extractor import available_extractor_types, connection_kwargs_for, create_schema_extractor
 from datagenx.validation.PopulateNewTableAndValidate import (
     clone_histograms,
     compare_histograms,
@@ -54,13 +54,10 @@ from datagenx.validation.PopulateNewTableAndValidate import (
 # ----------------------------------------------------------------
 from config import (
     HOST, USER, PASSWORD,
-    SOURCE_SCHEMA, TARGET_SCHEMA,
+    SOURCE_SCHEMA, TARGET_SCHEMA, DB_TYPE, DB_PORT,
     DBGEN_BINARY, DBGEN_FILES_DIR, DBGEN_TMP_OUT_DIR,
     FILES_COUNT, ROWS_COUNT
 )
-
-# Database type - will be overridden by CLI args
-DB_TYPE = "mysql"
 
 
 def _load_histograms_singlestore(cursor, schema, table):
@@ -114,21 +111,20 @@ def _load_histograms_singlestore(cursor, schema, table):
     return histograms
 
 
+def _load_histograms_with_extractor(db_type, schema, table):
+    """Load histograms through a schema extractor for non-MySQL engines."""
+    extractor = create_schema_extractor(db_type, HOST, USER, PASSWORD, schema, DB_PORT)
+    if not extractor.connect():
+        return {}
+    try:
+        return extractor.get_table_histograms(table)
+    finally:
+        extractor.close()
+
+
 def _find_dbgen_binary():
-    """Try to locate dbgen binary if configured path doesn't exist."""
-    if os.path.isfile(DBGEN_BINARY) and os.access(DBGEN_BINARY, os.X_OK):
-        return DBGEN_BINARY
-    common_paths = [
-        os.path.expanduser("~/dbgen_binary"),
-        "/usr/local/bin/dbgen",
-        "/usr/bin/dbgen",
-        os.path.expanduser("~/dbgen/target/release/dbgen"),
-        "./dbgen",
-    ]
-    for path in common_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return DBGEN_BINARY  # fallback to config value
+    """Return the configured dbgen binary path."""
+    return os.path.expanduser(DBGEN_BINARY)
 
 
 # ----------------------------------------------------------------
@@ -638,13 +634,13 @@ def step_a_generate_dbgen(cursor, table, extractor=None):
 
     Dispatches based on DB_TYPE:
       - mysql: uses annotate_table_with_histogram (MySQL histogram system)
-      - singlestore: uses annotate_table_with_statistics (optimizer_statistics)
+      - other extractors: use annotate_table_with_statistics (engine stats)
     """
     print(f"  [A] Generating .dbgen template ...")
 
     generated_appendages = build_fk_appendages(cursor, table)
 
-    if DB_TYPE == 'singlestore':
+    if DB_TYPE != 'mysql':
         ddl = annotate_table_with_statistics(
             extractor, SOURCE_SCHEMA, table,
             generated_appendages=generated_appendages,
@@ -681,6 +677,10 @@ def step_b_run_dbgen(cursor, table):
 
     template_path = os.path.join(DBGEN_FILES_DIR, f"{table}.dbgen")
     dbgen_bin = _find_dbgen_binary()
+    if not os.path.isfile(dbgen_bin) or not os.access(dbgen_bin, os.X_OK):
+        print(f"  [B] FAILED — dbgen binary not found or not executable: {dbgen_bin}")
+        return False
+
     cmd = [
         dbgen_bin,
         "--out-dir", DBGEN_TMP_OUT_DIR,
@@ -689,7 +689,7 @@ def step_b_run_dbgen(cursor, table):
         "--rows-count", str(rows_to_generate),
         "--template", template_path,
         "--format", "csv",           # Generate CSV instead of SQL
-        "--format-null", "\\N",      # MySQL's default NULL representation
+        "--quiet",
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -888,9 +888,8 @@ def step_c_create_insert_validate(cursor, table):
             src_hist = load_histograms(cursor, SOURCE_SCHEMA, table)
             tgt_hist = load_histograms(cursor, TARGET_SCHEMA, table)
         else:
-            # SingleStore: read ADVANCED_HISTOGRAMS directly (populated by ANALYZE TABLE)
-            src_hist = _load_histograms_singlestore(cursor, SOURCE_SCHEMA, table)
-            tgt_hist = _load_histograms_singlestore(cursor, TARGET_SCHEMA, table)
+            src_hist = _load_histograms_with_extractor(DB_TYPE, SOURCE_SCHEMA, table)
+            tgt_hist = _load_histograms_with_extractor(DB_TYPE, TARGET_SCHEMA, table)
 
         if src_hist and tgt_hist:
             hist_results = compare_histograms(src_hist, tgt_hist)
@@ -974,7 +973,7 @@ def step_c_create_insert_validate(cursor, table):
 # ----------------------------------------------------------------
 def main():
     # Make these global so they can be modified by CLI args
-    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE, ROWS_OVERRIDE
+    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE, DB_PORT, ROWS_OVERRIDE
 
     start_time = time.time()
 
@@ -984,36 +983,36 @@ def main():
 
     # --- Connect ---
     try:
-        conn = mysql.connector.connect(
-            host=HOST, user=USER, password=PASSWORD, database=SOURCE_SCHEMA,
+        conn = mysql.connector.connect(**connection_kwargs_for(
+            DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA, DB_PORT,
             autocommit=True,
             allow_local_infile=True,  # Enable LOAD DATA LOCAL INFILE
-        )
+        ))
         cursor = conn.cursor()
     except Error as e:
-        print(f"MySQL connection failed: {e}")
+        print(f"{DB_TYPE} connection failed: {e}")
         sys.exit(1)
 
     cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
     cursor.execute("SET time_zone = '+00:00'")
 
-    # --- Create SingleStore extractor if needed ---
+    # --- Create extractor if needed ---
     extractor = None
-    if DB_TYPE == 'singlestore':
-        extractor = create_schema_extractor(DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA)
+    if DB_TYPE != 'mysql':
+        extractor = create_schema_extractor(DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA, DB_PORT)
         if not extractor.connect():
-            print("Failed to connect to SingleStore")
+            print(f"Failed to connect to {DB_TYPE}")
             sys.exit(1)
 
     # --- Discover and sort tables ---
-    if DB_TYPE == 'singlestore' and extractor:
+    if DB_TYPE != 'mysql' and extractor:
         # Use extractor to discover tables
         all_tables = extractor.get_tables()
         dependencies = {}
         for table in all_tables:
             fks = extractor.get_foreign_keys(table)
             if fks:
-                dependencies[table] = list(set(fk['referenced_table'] for fk in fks))
+                dependencies[table] = list({ref_table for ref_table, _ in fks.values()})
         sorted_tables = topological_sort(all_tables, dependencies)
     else:
         # Use MySQL discovery
@@ -1139,10 +1138,11 @@ if __name__ == "__main__":
                                   action="store_false",
                                   help="Run built-in validation checks after loading each table")
 
-    # Add new arguments for SingleStore support
-    parser.add_argument("--db-type", choices=["mysql", "singlestore"], default="mysql",
-                        help="Database type (default: mysql)")
+    # Add arguments for backend selection and connection overrides
+    parser.add_argument("--db-type", choices=available_extractor_types(), default=DB_TYPE,
+                        help=f"Database type (default: {DB_TYPE})")
     parser.add_argument("--host", help="Database host (overrides config.py)")
+    parser.add_argument("--port", type=int, help="Database port (defaults to the engine default)")
     parser.add_argument("--user", help="Database user (overrides config.py)")
     parser.add_argument("--password", help="Database password (overrides config.py)")
     parser.add_argument("--source-schema", help="Source schema name (overrides config.py)")
@@ -1159,6 +1159,8 @@ if __name__ == "__main__":
         DB_TYPE = args.db_type
     if args.host:
         HOST = args.host
+    if args.port:
+        DB_PORT = args.port
     if args.user:
         USER = args.user
     if args.password:

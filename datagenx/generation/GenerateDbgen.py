@@ -207,8 +207,8 @@ def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_tab
     # - Else if coverage < 80%: use mod() cycling (matches exact distinct count)
     # - Else (coverage >= 80%): use dense rand.range (nearly full coverage anyway)
 
-    # High distinct ratio means random selection causes collisions - use mod() cycling
-    if distinct_ratio > 0.5 and coverage_ratio < 0.80:
+    # High distinct ratio means random selection causes collisions - use mod() cycling.
+    if distinct_ratio > 0.5:
         expression = f"mod(rownum-1, {actual_distinct}) + {ref_min}"
         description = f"cycling mod({actual_distinct})+{ref_min} (high distinct ratio {distinct_ratio*100:.0f}%)"
         return (expression, description)
@@ -258,11 +258,14 @@ def _try_sparse_fk_expression(
     or None if dense approach should be used instead.
     """
     # Get FK column's histogram from source schema
-    cursor.execute("""
-        SELECT HISTOGRAM
-        FROM information_schema.column_statistics
-        WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
-    """, (source_db, table, col))
+    try:
+        cursor.execute("""
+            SELECT HISTOGRAM
+            FROM information_schema.column_statistics
+            WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+        """, (source_db, table, col))
+    except Exception:
+        return None
 
     result = cursor.fetchone()
     if not result or not result[0]:
