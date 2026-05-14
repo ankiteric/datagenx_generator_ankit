@@ -183,6 +183,45 @@ python3 MasterRun.py \
   --rows 50000
 ```
 
+### Internal Architecture
+
+`MasterRun.py` orchestrates these modules:
+
+```text
+MasterRun.py
+│
+├── config.py
+│   └── HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, DBGEN_BINARY, etc.
+│
+├── lib/schema_extractor.py
+│   └── MySQLExtractor, SingleStoreExtractor (database abstraction layer)
+│
+├── datagenx/generation/GenerateDbgen.py
+│   ├── annotate_table_with_histogram()  ← builds .dbgen templates (MySQL)
+│   ├── build_single_fk_expression()     ← FK expression logic
+│   └── topological_sort()               ← dependency ordering
+│
+├── extract_schema.py
+│   └── annotate_table_with_statistics() ← builds .dbgen templates (SingleStore)
+│
+├── datagenx/validation/PopulateNewTableAndValidate.py
+│   ├── clone_histograms()
+│   ├── compare_histograms()
+│   ├── load_histograms(), load_distinct_counts(), load_index_stats()
+│   └── report_*() functions
+│
+└── [External] dbgen binary
+    └── Rust binary at DBGEN_BINARY path, invoked via subprocess
+```
+
+| File | Purpose |
+|------|---------|
+| `config.py` | Connection settings and paths |
+| `lib/schema_extractor.py` | Database abstraction layer (MySQL/SingleStore) |
+| `GenerateDbgen.py` | Core template generation logic |
+| `extract_schema.py` | SingleStore-specific extraction |
+| `PopulateNewTableAndValidate.py` | Validation helpers |
+
 ## Validate Separately
 
 Use the unified validation entry point:
