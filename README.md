@@ -117,26 +117,70 @@ and runs `ANALYZE TABLE`.
 
 ## Generate Synthetic Data
 
-Run:
+The main entry point is `MasterRun.py` in the repository root. It orchestrates
+the full pipeline:
+
+1. **Step A**: Generate `.dbgen` templates from schema + histograms
+2. **Step B**: Run the DataGenX `dbgen` binary to produce CSV data
+3. **Step C**: Create tables in target schema, load data, optionally validate
+
+### Basic Usage
 
 ```bash
 python3 MasterRun.py
 ```
 
-By default, `MasterRun.py` now:
+By default, `MasterRun.py`:
 
-```text
-generates .dbgen templates
-runs the DataGenX dbgen binary
-creates and loads target tables
-clones MySQL histograms from source to target
-skips built-in validation
-```
+- Generates `.dbgen` templates
+- Runs the DataGenX dbgen binary
+- Creates and loads target tables
+- Clones MySQL histograms from source to target
+- Skips built-in validation
 
-To force the older built-in validation path:
+### CLI Options
 
 ```bash
+# Show all available options
+python3 MasterRun.py --help
+
+# Enable verbose output
+python3 MasterRun.py -v
+
+# Run with built-in validation after loading
 python3 MasterRun.py --run-validation
+
+# Enable histogram comparison (disabled by default - can be unreliable)
+python3 MasterRun.py --compare-histograms
+
+# Override row count (generate different number of rows than source)
+python3 MasterRun.py --rows 100000
+```
+
+### SingleStore Support
+
+```bash
+# Run against SingleStore database
+python3 MasterRun.py --db-type singlestore \
+  --host <host> \
+  --user <user> \
+  --password <password> \
+  --source-schema <source_db> \
+  --target-schema <target_db>
+```
+
+### Override config.py Settings
+
+All connection parameters can be overridden via CLI:
+
+```bash
+python3 MasterRun.py \
+  --host localhost \
+  --user root \
+  --password mypassword \
+  --source-schema tpch_vanilla \
+  --target-schema tpch_synthetic \
+  --rows 50000
 ```
 
 ## Validate Separately
