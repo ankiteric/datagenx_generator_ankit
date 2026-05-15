@@ -549,16 +549,6 @@ class TiDBExtractor(SchemaExtractor):
             distinct_count = row.get("distinct_count")
             if column and distinct_count is not None:
                 cardinalities[column] = _safe_int(distinct_count, default=0)
-        try:
-            columns = self.get_columns(table)
-        except Exception:
-            columns = {}
-        for column in columns:
-            if not cardinalities.get(column):
-                try:
-                    cardinalities[column] = self.get_distinct_count(table, column)
-                except Exception:
-                    pass
         return cardinalities
 
     def get_index_cardinality(self, table):

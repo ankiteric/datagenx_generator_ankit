@@ -127,6 +127,10 @@ def _find_dbgen_binary():
     return os.path.expanduser(DBGEN_BINARY)
 
 
+def _sql_string_literal(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
+
+
 # ----------------------------------------------------------------
 # 1. Setup
 # ----------------------------------------------------------------
@@ -260,7 +264,7 @@ def prepare_target_schema(cursor, target_schema):
 # ----------------------------------------------------------------
 # 2. Per-table processing
 # ----------------------------------------------------------------
-def build_fk_appendages(cursor, table):
+def build_fk_appendages(cursor, table, extractor=None):
     """For each FK column in `table`, build dbgen expressions.
 
     Handles three cases:
@@ -321,15 +325,51 @@ def build_fk_appendages(cursor, table):
     all_pk_are_fk = (len(pk_columns) > 1 and pk_columns == pk_fk_columns)
 
     appendages = {}
+    source_column_cardinality = None
 
-    def exact_frequency_case_expression(col):
+    def estimated_source_distinct(col):
+        """Return source NDV, using engine stats for scaled-down non-MySQL runs."""
+        nonlocal source_column_cardinality
+        if DB_TYPE == 'tidb' and ROWS_OVERRIDE:
+            try:
+                if source_column_cardinality is None:
+                    cursor.execute(
+                        "SHOW STATS_HISTOGRAMS "
+                        f"WHERE Db_name = {_sql_string_literal(SOURCE_SCHEMA)} "
+                        f"AND Table_name = {_sql_string_literal(table)} "
+                        "AND Is_index = 0"
+                    )
+                    names = [name.lower() for name in cursor.column_names]
+                    source_column_cardinality = {}
+                    for row in cursor.fetchall():
+                        values = dict(zip(names, row))
+                        column = values.get("column_name")
+                        distinct = values.get("distinct_count")
+                        if column and distinct:
+                            source_column_cardinality[column] = int(distinct)
+                if col in source_column_cardinality:
+                    return source_column_cardinality[col]
+            except Exception as e:
+                print(f"      Warning: Could not read {col} cardinality from {DB_TYPE} stats: {e}")
+
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
+        )
+        return cursor.fetchone()[0]
+
+    def synthetic_pk_base(default=1):
+        """Use a generated-domain base instead of anchoring to source MIN()."""
+        return default
+
+    def synthetic_frequency_case_expression(col):
         """Return deterministic CASE preserving source value frequencies.
 
         This is useful for non-FK columns in composite primary keys such as
         TPC-H lineitem.l_linenumber. The companion FK PK column cycles through
         parent keys, and this expression assigns line numbers in contiguous
         bands so (orderkey, linenumber) stays unique while the marginal
-        distribution matches the source exactly.
+        frequency shape matches the source. The generated values are synthetic
+        ordinals, not the source literals.
         """
         cursor.execute(f"""
             SELECT `{col}`, COUNT(*)
@@ -343,13 +383,13 @@ def build_fk_appendages(cursor, table):
 
         cumulative = 0
         case_lines = []
-        for value, count in frequencies:
+        for ordinal, (_value, count) in enumerate(frequencies, start=1):
             cumulative += count
-            case_lines.append(f"when rownum <= {cumulative} then {value}")
+            case_lines.append(f"when rownum <= {cumulative} then {ordinal}")
 
         expression = f"""case
     {' '.join(case_lines)}
-    else {frequencies[-1][0]}
+    else {len(frequencies)}
     end"""
         return expression, len(frequencies)
 
@@ -372,10 +412,7 @@ def build_fk_appendages(cursor, table):
                     min_val = min_val if min_val is not None else 0
 
                     # Get SOURCE distinct count (actual cardinality we need to match)
-                    cursor.execute(
-                        f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-                    )
-                    source_distinct = cursor.fetchone()[0]
+                    source_distinct = estimated_source_distinct(col)
 
                     pk_fk_info.append((col, actual_ref, ref_col, source_distinct, ref_distinct, min_val))
 
@@ -452,10 +489,7 @@ def build_fk_appendages(cursor, table):
         for constraint_name, fk_cols in constraints.items():
             for col, ref_table, ref_col in fk_cols:
                 if col in pk_columns:
-                    cursor.execute(
-                        f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-                    )
-                    source_distinct = cursor.fetchone()[0]
+                    source_distinct = estimated_source_distinct(col)
                     fk_pk_cycle_length *= source_distinct
 
         # Handle non-FK PK columns with mod() cycling
@@ -463,15 +497,12 @@ def build_fk_appendages(cursor, table):
         # product of all PK column distinct counts >> total rows
         non_fk_pk_cols = pk_columns - pk_fk_columns
         for col in non_fk_pk_cols:
-            cursor.execute(
-                f"SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-            )
-            source_distinct, min_val = cursor.fetchone()
-            min_val = min_val if min_val is not None else 1
-            if source_distinct and source_distinct <= 100:
-                expr, freq_count = exact_frequency_case_expression(col)
+            source_distinct = estimated_source_distinct(col)
+            min_val = synthetic_pk_base()
+            if DB_TYPE == 'mysql' and source_distinct and source_distinct <= 100:
+                expr, freq_count = synthetic_frequency_case_expression(col)
                 if expr:
-                    print(f"      PK {col}: exact frequency CASE ({freq_count} values)")
+                    print(f"      PK {col}: synthetic frequency CASE ({freq_count} values)")
                 else:
                     expr = f"mod(rownum-1, {source_distinct})+{min_val}"
                     print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
@@ -490,10 +521,7 @@ def build_fk_appendages(cursor, table):
                 actual_ref = tgt_canonical.get(ref_table.lower())
                 if actual_ref is None:
                     continue
-                cursor.execute(
-                    f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-                )
-                source_distinct = cursor.fetchone()[0]
+                source_distinct = estimated_source_distinct(col)
                 cursor.execute(
                     f"SELECT MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
                 )
@@ -638,7 +666,7 @@ def step_a_generate_dbgen(cursor, table, extractor=None):
     """
     print(f"  [A] Generating .dbgen template ...")
 
-    generated_appendages = build_fk_appendages(cursor, table)
+    generated_appendages = build_fk_appendages(cursor, table, extractor=extractor)
 
     if DB_TYPE != 'mysql':
         ddl = annotate_table_with_statistics(
@@ -713,6 +741,23 @@ def _load_source_cardinality_fast(cursor, database, table):
     For SingleStore, this is faster than SHOW INDEX which can be slow on large tables.
     Returns dict {column_name: distinct_count}.
     """
+    if DB_TYPE == 'tidb' and database == SOURCE_SCHEMA and ROWS_OVERRIDE:
+        cursor.execute(
+            "SHOW STATS_HISTOGRAMS "
+            f"WHERE Db_name = {_sql_string_literal(database)} "
+            f"AND Table_name = {_sql_string_literal(table)} "
+            "AND Is_index = 0"
+        )
+        names = [name.lower() for name in cursor.column_names]
+        cardinalities = {}
+        for row in cursor.fetchall():
+            values = dict(zip(names, row))
+            column = values.get("column_name")
+            distinct = values.get("distinct_count")
+            if column and distinct:
+                cardinalities[column] = int(distinct)
+        return cardinalities
+
     # Get PK columns
     cursor.execute("""
         SELECT COLUMN_NAME
@@ -912,8 +957,9 @@ def step_c_create_insert_validate(cursor, table):
     )
 
     # --- Distinct counts ---
-    if DB_TYPE == 'singlestore' and int(ROWS_COUNT) != src_rows:
-        # Fast path: use optimizer_statistics instead of expensive COUNT(DISTINCT) on source.
+    if DB_TYPE != 'mysql' and int(ROWS_COUNT) != src_rows:
+        # Fast path for scaled-down replays: avoid expensive full-table
+        # COUNT(DISTINCT) on large non-MySQL source tables.
         # Compare cardinality estimates and flag over-generation.
         src_cardinality = _load_source_cardinality_fast(cursor, SOURCE_SCHEMA, table)
         tgt_cardinality = _load_source_cardinality_fast(cursor, TARGET_SCHEMA, table)
@@ -1163,7 +1209,7 @@ if __name__ == "__main__":
         DB_PORT = args.port
     if args.user:
         USER = args.user
-    if args.password:
+    if args.password is not None:
         PASSWORD = args.password
     if args.source_schema:
         SOURCE_SCHEMA = args.source_schema

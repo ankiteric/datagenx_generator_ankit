@@ -101,6 +101,24 @@ class FakeTopNCursor(FakeCursor):
             super().execute(sql, params)
 
 
+class FakePartialStatsCursor(FakeCursor):
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        if sql.startswith("SHOW STATS_HISTOGRAMS"):
+            self.column_names = [
+                "Db_name", "Table_name", "Partition_name", "Column_name",
+                "Is_index", "Update_time", "Distinct_count", "Null_count",
+                "Avg_col_size", "Correlation",
+            ]
+            self._rows = [
+                ("test", "orders", "", "o_orderkey", 0, None, 4, 0, 8, 1),
+            ]
+        elif "COUNT(DISTINCT" in sql:
+            raise AssertionError("TiDB cardinality should not exact-scan missing stats")
+        else:
+            super().execute(sql, params)
+
+
 class TiDBExtractorTest(unittest.TestCase):
     def test_factory_lists_tidb(self):
         self.assertIn("tidb", available_extractor_types())
@@ -164,6 +182,14 @@ class TiDBExtractorTest(unittest.TestCase):
 
         self.assertEqual(histogram["histogram-type"], "singleton")
         self.assertEqual(histogram["buckets"], [[1, 0.75], [2, 1.0]])
+
+    def test_column_cardinalities_do_not_exact_scan_missing_tidb_stats(self):
+        extractor = TiDBExtractor("127.0.0.1", "root", "", "test")
+        extractor.cursor = FakePartialStatsCursor()
+
+        self.assertEqual(extractor.get_column_cardinalities("orders"), {"o_orderkey": 4})
+        executed_sql = [sql for sql, _params in extractor.cursor.executed]
+        self.assertFalse(any("COUNT(DISTINCT" in sql for sql in executed_sql))
 
 
 if __name__ == "__main__":
