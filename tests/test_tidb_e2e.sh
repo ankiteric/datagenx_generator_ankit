@@ -212,18 +212,18 @@ profile_config() {
             RESULT_FILE="${TPCH_SF1_RESULT_FILE:-$RESULTS_DIR/results_tpch_sf1_tidb.txt}"
             EXPECTED_TABLES=8
             ;;
-        tpch-sf10|tpch_sf10|tpch-10gb|tpch_10gb)
+        tpch-sf10|tpch_sf10)
             PROFILE_LABEL="TPC-H SF=10"
-            SOURCE_SCHEMA="${TPCH_SF10_SOURCE_SCHEMA:-${TPCH_10GB_SOURCE_SCHEMA:-tpch_10gb}}"
-            TARGET_SCHEMA="${TPCH_SF10_TARGET_SCHEMA:-${TPCH_10GB_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}}"
-            RESULT_FILE="${TPCH_SF10_RESULT_FILE:-${TPCH_10GB_RESULT_FILE:-$RESULTS_DIR/results_tpch_sf10_tidb.txt}}"
+            SOURCE_SCHEMA="${TPCH_SF10_SOURCE_SCHEMA:-tpch_10gb}"
+            TARGET_SCHEMA="${TPCH_SF10_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}"
+            RESULT_FILE="${TPCH_SF10_RESULT_FILE:-$RESULTS_DIR/results_tpch_sf10_tidb.txt}"
             EXPECTED_TABLES=8
             ;;
-        tpcds-sf10|tpcds_sf10|tpcds-10gb|tpcds_10gb)
+        tpcds-sf10|tpcds_sf10)
             PROFILE_LABEL="TPC-DS SF=10"
-            SOURCE_SCHEMA="${TPCDS_SF10_SOURCE_SCHEMA:-${TPCDS_10GB_SOURCE_SCHEMA:-tpcds}}"
-            TARGET_SCHEMA="${TPCDS_SF10_TARGET_SCHEMA:-${TPCDS_10GB_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}}"
-            RESULT_FILE="${TPCDS_SF10_RESULT_FILE:-${TPCDS_10GB_RESULT_FILE:-$RESULTS_DIR/results_tpcds_sf10_tidb.txt}}"
+            SOURCE_SCHEMA="${TPCDS_SF10_SOURCE_SCHEMA:-tpcds}"
+            TARGET_SCHEMA="${TPCDS_SF10_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}"
+            RESULT_FILE="${TPCDS_SF10_RESULT_FILE:-$RESULTS_DIR/results_tpcds_sf10_tidb.txt}"
             EXPECTED_TABLES=24
             ;;
         *)
