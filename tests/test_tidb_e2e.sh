@@ -34,7 +34,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-    sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 }
 
 PROFILE="${1:-tpch-sf1}"
