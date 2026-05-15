@@ -6,8 +6,8 @@
 #
 # Usage:
 #   bash tests/test_tidb_e2e.sh tpch-sf1 [rows]
-#   bash tests/test_tidb_e2e.sh tpch-10gb [rows]
-#   bash tests/test_tidb_e2e.sh tpcds-10gb [rows]
+#   bash tests/test_tidb_e2e.sh tpch-sf10 [rows]
+#   bash tests/test_tidb_e2e.sh tpcds-sf10 [rows]
 #   bash tests/test_tidb_e2e.sh all [rows]
 #
 # Connection defaults:
@@ -18,11 +18,11 @@
 #
 # Source schema defaults:
 #   TPCH_SF1_SOURCE_SCHEMA=tpch_sf1_tidb
-#   TPCH_10GB_SOURCE_SCHEMA=tpch_10gb
-#   TPCDS_10GB_SOURCE_SCHEMA=tpcds
+#   TPCH_SF10_SOURCE_SCHEMA=tpch_10gb
+#   TPCDS_SF10_SOURCE_SCHEMA=tpcds
 #
 # Example with an already-running TiDB:
-#   START_TIDB=0 TIDB_PORT=4000 bash tests/test_tidb_e2e.sh tpch-10gb 1000
+#   START_TIDB=0 TIDB_PORT=4000 bash tests/test_tidb_e2e.sh tpch-sf10 1000
 #
 # Optional:
 #   START_TIDB=0              # do not start tests/docker-compose TiDB
@@ -212,18 +212,18 @@ profile_config() {
             RESULT_FILE="${TPCH_SF1_RESULT_FILE:-$RESULTS_DIR/results_tpch_sf1_tidb.txt}"
             EXPECTED_TABLES=8
             ;;
-        tpch-10gb|tpch_10gb|tpch-sf10|tpch_sf10)
-            PROFILE_LABEL="10 GB TPC-H"
-            SOURCE_SCHEMA="${TPCH_10GB_SOURCE_SCHEMA:-tpch_10gb}"
-            TARGET_SCHEMA="${TPCH_10GB_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}"
-            RESULT_FILE="${TPCH_10GB_RESULT_FILE:-$RESULTS_DIR/results_tpch_10gb_tidb.txt}"
+        tpch-sf10|tpch_sf10|tpch-10gb|tpch_10gb)
+            PROFILE_LABEL="TPC-H SF=10"
+            SOURCE_SCHEMA="${TPCH_SF10_SOURCE_SCHEMA:-${TPCH_10GB_SOURCE_SCHEMA:-tpch_10gb}}"
+            TARGET_SCHEMA="${TPCH_SF10_TARGET_SCHEMA:-${TPCH_10GB_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}}"
+            RESULT_FILE="${TPCH_SF10_RESULT_FILE:-${TPCH_10GB_RESULT_FILE:-$RESULTS_DIR/results_tpch_sf10_tidb.txt}}"
             EXPECTED_TABLES=8
             ;;
-        tpcds-10gb|tpcds_10gb|tpcds-sf10|tpcds_sf10)
-            PROFILE_LABEL="10 GB TPC-DS"
-            SOURCE_SCHEMA="${TPCDS_10GB_SOURCE_SCHEMA:-tpcds}"
-            TARGET_SCHEMA="${TPCDS_10GB_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}"
-            RESULT_FILE="${TPCDS_10GB_RESULT_FILE:-$RESULTS_DIR/results_tpcds_10gb_tidb.txt}"
+        tpcds-sf10|tpcds_sf10|tpcds-10gb|tpcds_10gb)
+            PROFILE_LABEL="TPC-DS SF=10"
+            SOURCE_SCHEMA="${TPCDS_SF10_SOURCE_SCHEMA:-${TPCDS_10GB_SOURCE_SCHEMA:-tpcds}}"
+            TARGET_SCHEMA="${TPCDS_SF10_TARGET_SCHEMA:-${TPCDS_10GB_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}}"
+            RESULT_FILE="${TPCDS_SF10_RESULT_FILE:-${TPCDS_10GB_RESULT_FILE:-$RESULTS_DIR/results_tpcds_sf10_tidb.txt}}"
             EXPECTED_TABLES=24
             ;;
         *)
@@ -310,8 +310,8 @@ fi
 case "$PROFILE" in
     all)
         run_profile tpch-sf1
-        run_profile tpch-10gb
-        run_profile tpcds-10gb
+        run_profile tpch-sf10
+        run_profile tpcds-sf10
         ;;
     *)
         run_profile "$PROFILE"

@@ -155,7 +155,18 @@ def get_min_max_from_histogram(histogram):
     return min_val, max_val
 
 
-def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_table, ref_col):
+def build_single_fk_expression(
+    cursor,
+    source_db,
+    target_db,
+    table,
+    col,
+    ref_table,
+    ref_col,
+    source_distinct_override=None,
+    source_row_count_override=None,
+    prefer_cycling=False,
+):
     """Build expression for a single-column FK. Returns (expression, description).
 
     Three approaches based on coverage (actual_distinct / ref_table_size):
@@ -180,11 +191,23 @@ def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_tab
         - expression: dbgen expression string
         - description: human-readable description for logging
     """
-    # Get actual distinct count and row count from source (privacy-safe: just counts)
-    cursor.execute(f"""
-        SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` IS NOT NULL
-    """)
-    actual_distinct, source_row_count = cursor.fetchone()
+    # Get actual distinct count and row count from source (privacy-safe: just counts).
+    # Large scaled TiDB replays may pass optimizer-stat estimates to avoid full
+    # source-table COUNT(DISTINCT) scans.
+    if source_distinct_override is not None:
+        actual_distinct = int(source_distinct_override)
+        if source_row_count_override is not None:
+            source_row_count = int(source_row_count_override)
+        else:
+            cursor.execute(
+                f"SELECT COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` IS NOT NULL"
+            )
+            source_row_count = cursor.fetchone()[0]
+    else:
+        cursor.execute(f"""
+            SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` IS NOT NULL
+        """)
+        actual_distinct, source_row_count = cursor.fetchone()
     actual_distinct = actual_distinct or 0
     source_row_count = source_row_count or 1
 
@@ -200,6 +223,12 @@ def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_tab
     # Calculate distinct ratio (how unique values are in source table)
     # High ratio means random selection will cause collisions (birthday paradox)
     distinct_ratio = actual_distinct / source_row_count if source_row_count > 0 else 1.0
+
+    if prefer_cycling:
+        cycle = max(1, min(actual_distinct, ref_table_size))
+        expression = f"mod(rownum-1, {cycle}) + {ref_min}"
+        description = f"cycling mod({cycle})+{ref_min} (estimated source cardinality)"
+        return (expression, description)
 
     # Decision based on coverage AND distinct_ratio:
     # - If distinct_ratio > 0.5: use mod() cycling (random would cause collisions)

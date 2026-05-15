@@ -352,10 +352,29 @@ def build_fk_appendages(cursor, table, extractor=None):
             except Exception as e:
                 print(f"      Warning: Could not read {col} cardinality from {DB_TYPE} stats: {e}")
 
+            fallback = max(1, min(source_row_count, int(ROWS_COUNT)))
+            print(
+                f"      Warning: {DB_TYPE} stats missing NDV for {table}.{col}; "
+                f"using bounded replay estimate {fallback}"
+            )
+            return fallback
+
         cursor.execute(
             f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
         )
         return cursor.fetchone()[0]
+
+    def build_single_fk_appendage(col, actual_ref, ref_col):
+        kwargs = {}
+        if DB_TYPE == 'tidb' and ROWS_OVERRIDE:
+            kwargs = {
+                "source_distinct_override": estimated_source_distinct(col),
+                "source_row_count_override": source_row_count,
+                "prefer_cycling": True,
+            }
+        return build_single_fk_expression(
+            cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col, **kwargs
+        )
 
     def synthetic_pk_base(default=1):
         """Use a generated-domain base instead of anchoring to source MIN()."""
@@ -463,9 +482,7 @@ def build_fk_appendages(cursor, table, extractor=None):
                     actual_ref = tgt_canonical.get(ref_table.lower())
                     if actual_ref is None:
                         continue
-                    expression, description = build_single_fk_expression(
-                        cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
-                    )
+                    expression, description = build_single_fk_appendage(col, actual_ref, ref_col)
                     appendages[col] = expression
                     print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
@@ -538,9 +555,7 @@ def build_fk_appendages(cursor, table, extractor=None):
                 actual_ref = tgt_canonical.get(ref_table.lower())
                 if actual_ref is None:
                     continue
-                expression, description = build_single_fk_expression(
-                    cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
-                )
+                expression, description = build_single_fk_appendage(col, actual_ref, ref_col)
                 appendages[col] = expression
                 print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
@@ -600,9 +615,7 @@ def build_fk_appendages(cursor, table, extractor=None):
                       f"SKIPPED (referenced table not yet in {TARGET_SCHEMA})")
                 continue
 
-            expression, description = build_single_fk_expression(
-                cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
-            )
+            expression, description = build_single_fk_appendage(col, actual_ref, ref_col)
             appendages[col] = expression
             print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
