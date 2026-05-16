@@ -19,6 +19,7 @@ DATETIME_TYPES = {
 CHAR_TYPES = {"char", "varchar"}
 TEXT_TYPES = {"text", "blob"}
 YEAR = {"year"}
+ENUM_TYPES = {"enum", "set"}
 
 # Maximum distinct values to fetch for string columns.
 # Above this threshold, fall back to random string generation.
@@ -207,8 +208,9 @@ def build_single_fk_expression(cursor, source_db, target_db, table, col, ref_tab
     # - Else if coverage < 80%: use mod() cycling (matches exact distinct count)
     # - Else (coverage >= 80%): use dense rand.range (nearly full coverage anyway)
 
-    # High distinct ratio means random selection causes collisions - use mod() cycling
-    if distinct_ratio > 0.5 and coverage_ratio < 0.80:
+    # High distinct ratio means random selection causes collisions (birthday paradox)
+    # Use deterministic mod() cycling to guarantee exact distinct count
+    if distinct_ratio >= 0.5:
         expression = f"mod(rownum-1, {actual_distinct}) + {ref_min}"
         description = f"cycling mod({actual_distinct})+{ref_min} (high distinct ratio {distinct_ratio*100:.0f}%)"
         return (expression, description)
@@ -736,6 +738,119 @@ def string_values_to_case(values_with_counts, column_name, max_length=None, row_
     return f"""case rand.weighted(array[{','.join(map(str, weights))}])
     {' '.join(case_lines)}
     end"""
+
+
+def enum_to_case(cursor, database, table, column, ddl_line):
+    """Generate CASE expression for ENUM/SET columns.
+
+    Extracts ENUM values from DDL and generates weighted CASE based on
+    actual value frequencies in the source data.
+
+    Args:
+        cursor: Database cursor
+        database: Source database name
+        table: Table name
+        column: Column name
+        ddl_line: DDL line containing ENUM definition
+
+    Returns:
+        dbgen CASE expression string
+    """
+    # Extract ENUM values from DDL: ENUM('G','PG','PG-13','R','NC-17')
+    enum_match = re.search(r"(?:enum|set)\s*\(([^)]+)\)", ddl_line, re.IGNORECASE)
+    if not enum_match:
+        return ""
+
+    # Parse the enum values
+    enum_str = enum_match.group(1)
+    enum_values = re.findall(r"'([^']*)'", enum_str)
+    if not enum_values:
+        return ""
+
+    # Query actual frequencies from source
+    cursor.execute(f"""
+        SELECT `{column}`, COUNT(*) as cnt
+        FROM `{database}`.`{table}`
+        WHERE `{column}` IS NOT NULL
+        GROUP BY `{column}`
+        ORDER BY cnt DESC
+    """)
+    freq_data = cursor.fetchall()
+
+    if not freq_data:
+        # No data - use uniform distribution
+        n = len(enum_values)
+        case_lines = [f"when {i+1} then '{v}'" for i, v in enumerate(enum_values)]
+        return f"""case rand.range(1, {n+1})
+    {' '.join(case_lines)}
+    end"""
+
+    # Build frequency map
+    freq_map = {str(val): cnt for val, cnt in freq_data}
+    total = sum(freq_map.values())
+
+    # Generate weighted CASE using actual frequencies
+    weights = []
+    case_lines = []
+    for i, val in enumerate(enum_values, start=1):
+        cnt = freq_map.get(val, 0)
+        weight = round(cnt / total, 6) if total > 0 else round(1 / len(enum_values), 6)
+        weights.append(weight)
+        case_lines.append(f"when {i} then '{val}'")
+
+    return f"""case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
+    end"""
+
+
+def year_to_case(cursor, database, table, column):
+    """Generate expression for YEAR columns based on actual source values.
+
+    Queries distinct years from source and generates appropriate expression:
+    - Single year: literal value
+    - Few years: weighted CASE expression
+    - Many years: rand.range over actual min/max
+
+    Args:
+        cursor: Database cursor
+        database: Source database name
+        table: Table name
+        column: Column name
+
+    Returns:
+        dbgen expression string
+    """
+    # Query distinct years with frequencies
+    cursor.execute(f"""
+        SELECT `{column}`, COUNT(*) as cnt
+        FROM `{database}`.`{table}`
+        WHERE `{column}` IS NOT NULL
+        GROUP BY `{column}`
+        ORDER BY `{column}`
+    """)
+    year_data = cursor.fetchall()
+
+    if not year_data:
+        return "rand.range(2000, 2025)"
+
+    years = [int(y) for y, _ in year_data]
+    counts = [cnt for _, cnt in year_data]
+    total = sum(counts)
+
+    if len(years) == 1:
+        # Single year - just return that year
+        return str(years[0])
+
+    if len(years) <= 20:
+        # Few distinct years - use weighted CASE
+        weights = [round(cnt / total, 6) for cnt in counts]
+        case_lines = [f"when {i+1} then {y}" for i, y in enumerate(years)]
+        return f"""case rand.weighted(array[{','.join(map(str, weights))}])
+    {' '.join(case_lines)}
+    end"""
+
+    # Many years - use range
+    return f"rand.range({min(years)}, {max(years) + 1})"
 
 
 def _try_sparse_date_expression(cursor, database, table, column, col_type):
@@ -1306,7 +1421,10 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                     synthetic = "rand.u31_timestamp()"
 
             elif col_type in YEAR:
-                synthetic = "rand.range(1975,2025)"
+                synthetic = year_to_case(cursor, database, table, col)
+
+            elif col_type in ENUM_TYPES:
+                synthetic = enum_to_case(cursor, database, table, col, line)
 
             elif col_type in NUMERIC_TYPES:
                 # Use histogram-based generation for numeric columns

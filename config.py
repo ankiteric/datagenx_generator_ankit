@@ -14,13 +14,13 @@ USER = "root"
 PASSWORD = "newpassword"
 
 # Schema configuration
-SOURCE_SCHEMA = "tpch_vanilla"
+SOURCE_SCHEMA = "tpch"
 TARGET_SCHEMA = "tpch_dbgenx"
 
 # Paths
 # This must point to the Rust DataGenX dbgen binary, not the official TPC-H
 # dbgen binary under /home/hmaduri/contribs/tpch-dbgen.
-DBGEN_BINARY = "/home/hmaduri/contribs/dbgen/target/release/dbgen"
+DBGEN_BINARY = "/Users/sreeharshar/work/db/datagenx/code/dbgen/target/release/dbgen"
 DBGEN_FILES_DIR = "generated/dbgen_files"
 DBGEN_TMP_OUT_DIR = "generated/dbgen_tmp_out"
 

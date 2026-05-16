@@ -222,6 +222,53 @@ MasterRun.py
 | `extract_schema.py` | SingleStore-specific extraction |
 | `PopulateNewTableAndValidate.py` | Validation helpers |
 
+## Testing
+
+Run the test suite after any code change to verify the pipeline works:
+
+```bash
+python3 tests/test_agent.py
+```
+
+The test agent uses MySQL's **Sakila** sample database and:
+1. Downloads and installs Sakila if not present
+2. Runs the full generation pipeline
+3. Validates data quality (FK integrity, cardinality, distributions)
+4. Cleans up the test schema
+
+### Test Options
+
+```bash
+# Quick test (default)
+python3 tests/test_agent.py
+
+# Full test with validation
+python3 tests/test_agent.py --full
+
+# Custom row count
+python3 tests/test_agent.py --rows 500
+
+# Just setup Sakila (no tests)
+python3 tests/test_agent.py --setup-only
+
+# Keep target schema after test (for debugging)
+python3 tests/test_agent.py --keep
+
+# Verbose output
+python3 tests/test_agent.py -v
+
+# Force reinstall Sakila
+python3 tests/test_agent.py --force-setup
+```
+
+### Test Configuration
+
+Tests use connection settings from `config.py`. Override via CLI:
+
+```bash
+python3 tests/test_agent.py --host localhost --user root --password mypass
+```
+
 ## Validate Separately
 
 Use the unified validation entry point:
