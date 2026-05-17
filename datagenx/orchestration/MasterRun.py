@@ -9,6 +9,7 @@ for every table in SOURCE_SCHEMA, writing results into TARGET_SCHEMA.
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -815,6 +816,190 @@ def _load_source_cardinality_fast(cursor, database, table):
     return distinct_counts
 
 
+def _parse_size_bytes(value, default):
+    if not value:
+        return default
+
+    text = str(value).strip().lower()
+    multiplier = 1
+    if text[-1:] in {"k", "m", "g"}:
+        suffix = text[-1]
+        text = text[:-1]
+        multiplier = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}[suffix]
+
+    try:
+        return int(float(text) * multiplier)
+    except ValueError:
+        return default
+
+
+def _sql_string(value):
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _mysql_cli_base_command():
+    mysql_bin = shutil.which("mysql")
+    if not mysql_bin:
+        return None
+
+    cmd = [
+        mysql_bin,
+        "--local-infile=1",
+        "--connect-timeout=30",
+        "-h", HOST,
+        "-P", str(DB_PORT),
+        "-u", USER,
+    ]
+    if HOST.endswith("tidbcloud.com"):
+        cmd.append("--ssl")
+    return cmd
+
+
+def _run_mysql_cli_load(schema, sql):
+    cmd = _mysql_cli_base_command()
+    if cmd is None:
+        return False
+
+    env = os.environ.copy()
+    if PASSWORD:
+        env["MYSQL_PWD"] = PASSWORD
+
+    completed = subprocess.run(
+        cmd + [schema, "-e", sql],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(details or f"mysql exited with {completed.returncode}")
+    return True
+
+
+def _load_csv_file(schema, table, csv_path, column_list):
+    load_stmt = f"""
+        LOAD DATA LOCAL INFILE {_sql_string(csv_path)}
+        INTO TABLE `{schema}`.`{table}`
+        FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\\\'
+        LINES TERMINATED BY '\\n'
+        ({column_list})
+    """
+    if _run_mysql_cli_load(schema, load_stmt):
+        return
+    raise RuntimeError("mysql CLI is required for chunked TiDB LOAD DATA")
+
+
+def _load_generated_csv(cursor, table, csv_path, column_list):
+    default_chunk_size = "16m" if DB_TYPE == "tidb" else "128m"
+    default_chunk_bytes = 16 * 1024 * 1024 if DB_TYPE == "tidb" else 128 * 1024 * 1024
+    chunk_bytes = _parse_size_bytes(
+        os.environ.get("DATAGENX_LOAD_CHUNK_BYTES", default_chunk_size),
+        default_chunk_bytes,
+    )
+    attempts = int(os.environ.get("DATAGENX_LOAD_RETRY_ATTEMPTS", "3"))
+    file_size = os.path.getsize(csv_path)
+
+    if file_size <= chunk_bytes:
+        load_stmt = f"""
+            LOAD DATA LOCAL INFILE {_sql_string(csv_path)}
+            INTO TABLE `{TARGET_SCHEMA}`.`{table}`
+            FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\\\'
+            LINES TERMINATED BY '\\n'
+            ({column_list})
+        """
+        cursor.execute(load_stmt)
+        return
+
+    chunk_dir = os.path.join(DBGEN_TMP_OUT_DIR, ".load_chunks", table)
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            cursor.execute(f"TRUNCATE TABLE `{TARGET_SCHEMA}`.`{table}`")
+
+        print(
+            f"      Loading {os.path.basename(csv_path)} in "
+            f"{chunk_bytes // (1024 * 1024)}MiB chunks "
+            f"(attempt {attempt}/{attempts})"
+        )
+
+        try:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            os.makedirs(chunk_dir, exist_ok=True)
+
+            chunk_index = 0
+            current_size = 0
+            current_path = None
+            current = None
+
+            def close_and_load_current():
+                nonlocal current, current_path, current_size
+                if current is None:
+                    return
+                current.close()
+                _load_csv_file(TARGET_SCHEMA, table, current_path, column_list)
+                os.remove(current_path)
+                current = None
+                current_path = None
+                current_size = 0
+
+            with open(csv_path, "rb") as source:
+                for line in source:
+                    if current is None:
+                        current_path = os.path.join(
+                            chunk_dir,
+                            f"{table}_{chunk_index:05d}.csv",
+                        )
+                        current = open(current_path, "wb")
+                        chunk_index += 1
+
+                    if current_size and current_size + len(line) > chunk_bytes:
+                        close_and_load_current()
+                        current_path = os.path.join(
+                            chunk_dir,
+                            f"{table}_{chunk_index:05d}.csv",
+                        )
+                        current = open(current_path, "wb")
+                        chunk_index += 1
+
+                    current.write(line)
+                    current_size += len(line)
+
+            close_and_load_current()
+            cursor._connection.ping(reconnect=True, attempts=3, delay=5)
+            return
+        except Exception as exc:
+            if current is not None:
+                current.close()
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            print(f"      WARN: chunked load failed for {table}: {exc}")
+            if attempt == attempts:
+                raise
+            time.sleep(attempt * 30)
+
+
+def _refresh_cursor(conn, cursor=None):
+    try:
+        conn.ping(reconnect=True, attempts=3, delay=5)
+    except TypeError:
+        conn.ping(reconnect=True)
+    except Error:
+        conn.reconnect(attempts=3, delay=5)
+
+    try:
+        if cursor is not None:
+            cursor.close()
+    except Error:
+        pass
+    return conn.cursor()
+
+
+def _new_schema_extractor():
+    extractor = create_schema_extractor(DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA, DB_PORT)
+    if not extractor.connect():
+        raise RuntimeError(f"Failed to connect to {DB_TYPE}")
+    return extractor
+
+
 def step_c_create_insert_validate(cursor, table):
     """Create table in target schema, insert generated data, validate."""
     action = "creating table and inserting data" if SKIP_VALIDATION else "creating table, inserting data, validating"
@@ -868,14 +1053,7 @@ def step_c_create_insert_validate(cursor, table):
 
     column_list = ", ".join(f"`{col}`" for col in columns)
 
-    load_stmt = f"""
-        LOAD DATA LOCAL INFILE '{csv_path}'
-        INTO TABLE `{TARGET_SCHEMA}`.`{table}`
-        FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\\\'
-        LINES TERMINATED BY '\\n'
-        ({column_list})
-    """
-    cursor.execute(load_stmt)
+    _load_generated_csv(cursor, table, csv_path, column_list)
 
     # Clone optimizer histogram metadata as part of target creation, not
     # validation. The separate validator expects target histograms to exist.
@@ -970,7 +1148,7 @@ def step_c_create_insert_validate(cursor, table):
     )
 
     # --- Distinct counts ---
-    if DB_TYPE != 'mysql' and int(ROWS_COUNT) != src_rows:
+    if DB_TYPE != 'mysql' and ROWS_OVERRIDE and int(ROWS_COUNT) != src_rows:
         # Fast path for scaled-down replays: avoid expensive full-table
         # COUNT(DISTINCT) on large non-MySQL source tables.
         # Compare cardinality estimates and flag over-generation.
@@ -1097,25 +1275,38 @@ def main():
     results = {}
 
     for i, table in enumerate(sorted_tables, 1):
+        cursor = _refresh_cursor(conn, cursor)
+        table_extractor = extractor
+        if DB_TYPE != 'mysql':
+            table_extractor = _new_schema_extractor()
+
         deps = dependencies.get(table, [])
         dep_str = f" (depends on: {', '.join(deps)})" if deps else ""
         print(f"[{i}/{len(sorted_tables)}] Table: {table}{dep_str}")
         print("-" * 50)
 
         # Step A
-        if not step_a_generate_dbgen(cursor, table, extractor):
+        if not step_a_generate_dbgen(cursor, table, table_extractor):
             results[table] = {"error": "dbgen template generation failed"}
             print()
+            if table_extractor is not extractor and table_extractor:
+                table_extractor.close()
             continue
 
         # Step B
+        cursor = _refresh_cursor(conn, cursor)
         if not step_b_run_dbgen(cursor, table):
             results[table] = {"error": "dbgen binary execution failed"}
             print()
+            if table_extractor is not extractor and table_extractor:
+                table_extractor.close()
             continue
 
         # Step C
+        cursor = _refresh_cursor(conn, cursor)
         results[table] = step_c_create_insert_validate(cursor, table)
+        if table_extractor is not extractor and table_extractor:
+            table_extractor.close()
         print()
 
     # --- Cleanup ---

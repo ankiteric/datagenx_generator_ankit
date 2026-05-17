@@ -5,10 +5,10 @@
 # source schema into TiDB first, then run this script against that schema.
 #
 # Usage:
-#   bash tests/test_tidb_e2e.sh tpch-sf1 [rows]
-#   bash tests/test_tidb_e2e.sh tpch-sf10 [rows]
-#   bash tests/test_tidb_e2e.sh tpcds-sf10 [rows]
-#   bash tests/test_tidb_e2e.sh all [rows]
+#   bash tests/test_tidb_e2e.sh tpch-sf1 [rows|full]
+#   bash tests/test_tidb_e2e.sh tpch-sf10 [rows|full]
+#   bash tests/test_tidb_e2e.sh tpcds-sf10 [rows|full]
+#   bash tests/test_tidb_e2e.sh all [rows|full]
 #
 # Connection defaults:
 #   TIDB_HOST=127.0.0.1
@@ -23,6 +23,7 @@
 #
 # Example with an already-running TiDB:
 #   START_TIDB=0 TIDB_PORT=4000 bash tests/test_tidb_e2e.sh tpch-sf10 1000
+#   START_TIDB=0 TIDB_PORT=4000 bash tests/test_tidb_e2e.sh tpch-sf10 full
 #
 # Optional:
 #   START_TIDB=0              # do not start tests/docker-compose TiDB
@@ -39,10 +40,33 @@ usage() {
 
 PROFILE="${1:-tpch-sf1}"
 ROWS="${2:-${ROWS:-1000}}"
+ROWS_OVERRIDE=1
+ROWS_LABEL="$ROWS"
+
+case "$ROWS" in
+    full|source|match-source)
+        ROWS_OVERRIDE=0
+        ROWS_LABEL="match-source"
+        ;;
+    ''|*[!0-9]*)
+        echo "ERROR: rows must be a positive integer or 'full'"
+        echo ""
+        usage
+        exit 1
+        ;;
+    *)
+        if [[ "$ROWS" -le 0 ]]; then
+            echo "ERROR: rows must be a positive integer or 'full'"
+            echo ""
+            usage
+            exit 1
+        fi
+        ;;
+esac
 
 TIDB_HOST="${TIDB_HOST:-127.0.0.1}"
 TIDB_PORT="${TIDB_PORT:-4000}"
-TIDB_USER="${TIDB_USER:-root}"
+TIDB_USER="${TIDB_USER:-${TIDB_USERNAME:-root}}"
 TIDB_PASSWORD="${TIDB_PASSWORD:-${TIDB_PASS:-}}"
 START_TIDB="${START_TIDB:-1}"
 COMPARE_HISTOGRAMS="${COMPARE_HISTOGRAMS:-1}"
@@ -256,7 +280,7 @@ run_profile() {
     echo "Host:    $TIDB_HOST:$TIDB_PORT"
     echo "Source:  $SOURCE_SCHEMA"
     echo "Target:  $TARGET_SCHEMA"
-    echo "Rows:    $ROWS"
+    echo "Rows:    $ROWS_LABEL"
     echo "Output:  $RESULT_FILE"
     echo ""
 
@@ -268,8 +292,17 @@ run_profile() {
         echo "port=$TIDB_PORT"
         echo "source=$SOURCE_SCHEMA"
         echo "target=$TARGET_SCHEMA"
-        echo "rows=$ROWS"
+        echo "rows=$ROWS_LABEL"
         echo ""
+
+        rows_arg=()
+        if [[ "$ROWS_OVERRIDE" == "1" ]]; then
+            rows_arg=(--rows "$ROWS")
+        fi
+        password_arg=()
+        if [[ -z "$TIDB_PASSWORD" ]]; then
+            password_arg=("--password=")
+        fi
 
         PYTHONUNBUFFERED=1 \
         DBGEN_FILES_DIR="$dbgen_files_dir" \
@@ -279,10 +312,10 @@ run_profile() {
             --host "$TIDB_HOST" \
             --port "$TIDB_PORT" \
             --user "$TIDB_USER" \
-            "--password=$TIDB_PASSWORD" \
+            "${password_arg[@]}" \
             --source-schema "$SOURCE_SCHEMA" \
             --target-schema "$TARGET_SCHEMA" \
-            --rows "$ROWS" \
+            "${rows_arg[@]}" \
             --run-validation \
             --verbose \
             "${histogram_arg[@]}"
