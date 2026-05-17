@@ -9,3 +9,11 @@ generated/literal_mappings/
 lib/__pycache__/
 generated/tpch_queries_mysql/
 .codex/
+
+AGENTS.md
+papers/
+.env
+.DS_Store
+
+results/
+messages.md

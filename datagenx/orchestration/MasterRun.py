@@ -9,6 +9,7 @@ for every table in SOURCE_SCHEMA, writing results into TARGET_SCHEMA.
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -28,7 +29,7 @@ from datagenx.generation.GenerateDbgen import (
     topological_sort,
 )
 from extract_schema import annotate_table_with_statistics
-from lib.schema_extractor import create_schema_extractor
+from lib.schema_extractor import available_extractor_types, connection_kwargs_for, create_schema_extractor
 from datagenx.validation.PopulateNewTableAndValidate import (
     clone_histograms,
     compare_histograms,
@@ -54,13 +55,10 @@ from datagenx.validation.PopulateNewTableAndValidate import (
 # ----------------------------------------------------------------
 from config import (
     HOST, USER, PASSWORD,
-    SOURCE_SCHEMA, TARGET_SCHEMA,
+    SOURCE_SCHEMA, TARGET_SCHEMA, DB_TYPE, DB_PORT,
     DBGEN_BINARY, DBGEN_FILES_DIR, DBGEN_TMP_OUT_DIR,
     FILES_COUNT, ROWS_COUNT
 )
-
-# Database type - will be overridden by CLI args
-DB_TYPE = "mysql"
 
 
 def _load_histograms_singlestore(cursor, schema, table):
@@ -114,21 +112,24 @@ def _load_histograms_singlestore(cursor, schema, table):
     return histograms
 
 
+def _load_histograms_with_extractor(db_type, schema, table):
+    """Load histograms through a schema extractor for non-MySQL engines."""
+    extractor = create_schema_extractor(db_type, HOST, USER, PASSWORD, schema, DB_PORT)
+    if not extractor.connect():
+        return {}
+    try:
+        return extractor.get_table_histograms(table)
+    finally:
+        extractor.close()
+
+
 def _find_dbgen_binary():
-    """Try to locate dbgen binary if configured path doesn't exist."""
-    if os.path.isfile(DBGEN_BINARY) and os.access(DBGEN_BINARY, os.X_OK):
-        return DBGEN_BINARY
-    common_paths = [
-        os.path.expanduser("~/dbgen_binary"),
-        "/usr/local/bin/dbgen",
-        "/usr/bin/dbgen",
-        os.path.expanduser("~/dbgen/target/release/dbgen"),
-        "./dbgen",
-    ]
-    for path in common_paths:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return DBGEN_BINARY  # fallback to config value
+    """Return the configured dbgen binary path."""
+    return os.path.expanduser(DBGEN_BINARY)
+
+
+def _sql_string_literal(value):
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "''") + "'"
 
 
 # ----------------------------------------------------------------
@@ -264,7 +265,7 @@ def prepare_target_schema(cursor, target_schema):
 # ----------------------------------------------------------------
 # 2. Per-table processing
 # ----------------------------------------------------------------
-def build_fk_appendages(cursor, table):
+def build_fk_appendages(cursor, table, extractor=None):
     """For each FK column in `table`, build dbgen expressions.
 
     Handles three cases:
@@ -325,15 +326,70 @@ def build_fk_appendages(cursor, table):
     all_pk_are_fk = (len(pk_columns) > 1 and pk_columns == pk_fk_columns)
 
     appendages = {}
+    source_column_cardinality = None
 
-    def exact_frequency_case_expression(col):
+    def estimated_source_distinct(col):
+        """Return source NDV, using engine stats for scaled-down non-MySQL runs."""
+        nonlocal source_column_cardinality
+        if DB_TYPE == 'tidb' and ROWS_OVERRIDE:
+            try:
+                if source_column_cardinality is None:
+                    cursor.execute(
+                        "SHOW STATS_HISTOGRAMS "
+                        f"WHERE Db_name = {_sql_string_literal(SOURCE_SCHEMA)} "
+                        f"AND Table_name = {_sql_string_literal(table)} "
+                        "AND Is_index = 0"
+                    )
+                    names = [name.lower() for name in cursor.column_names]
+                    source_column_cardinality = {}
+                    for row in cursor.fetchall():
+                        values = dict(zip(names, row))
+                        column = values.get("column_name")
+                        distinct = values.get("distinct_count")
+                        if column and distinct:
+                            source_column_cardinality[column] = int(distinct)
+                if col in source_column_cardinality:
+                    return source_column_cardinality[col]
+            except Exception as e:
+                print(f"      Warning: Could not read {col} cardinality from {DB_TYPE} stats: {e}")
+
+            fallback = max(1, min(source_row_count, int(ROWS_COUNT)))
+            print(
+                f"      Warning: {DB_TYPE} stats missing NDV for {table}.{col}; "
+                f"using bounded replay estimate {fallback}"
+            )
+            return fallback
+
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
+        )
+        return cursor.fetchone()[0]
+
+    def build_single_fk_appendage(col, actual_ref, ref_col):
+        kwargs = {}
+        if DB_TYPE == 'tidb' and ROWS_OVERRIDE:
+            kwargs = {
+                "source_distinct_override": estimated_source_distinct(col),
+                "source_row_count_override": source_row_count,
+                "prefer_cycling": True,
+            }
+        return build_single_fk_expression(
+            cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col, **kwargs
+        )
+
+    def synthetic_pk_base(default=1):
+        """Use a generated-domain base instead of anchoring to source MIN()."""
+        return default
+
+    def synthetic_frequency_case_expression(col):
         """Return deterministic CASE preserving source value frequencies.
 
         This is useful for non-FK columns in composite primary keys such as
         TPC-H lineitem.l_linenumber. The companion FK PK column cycles through
         parent keys, and this expression assigns line numbers in contiguous
         bands so (orderkey, linenumber) stays unique while the marginal
-        distribution matches the source exactly.
+        frequency shape matches the source. The generated values are synthetic
+        ordinals, not the source literals.
         """
         cursor.execute(f"""
             SELECT `{col}`, COUNT(*)
@@ -347,13 +403,13 @@ def build_fk_appendages(cursor, table):
 
         cumulative = 0
         case_lines = []
-        for value, count in frequencies:
+        for ordinal, (_value, count) in enumerate(frequencies, start=1):
             cumulative += count
-            case_lines.append(f"when rownum <= {cumulative} then {value}")
+            case_lines.append(f"when rownum <= {cumulative} then {ordinal}")
 
         expression = f"""case
     {' '.join(case_lines)}
-    else {frequencies[-1][0]}
+    else {len(frequencies)}
     end"""
         return expression, len(frequencies)
 
@@ -376,10 +432,7 @@ def build_fk_appendages(cursor, table):
                     min_val = min_val if min_val is not None else 0
 
                     # Get SOURCE distinct count (actual cardinality we need to match)
-                    cursor.execute(
-                        f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-                    )
-                    source_distinct = cursor.fetchone()[0]
+                    source_distinct = estimated_source_distinct(col)
 
                     pk_fk_info.append((col, actual_ref, ref_col, source_distinct, ref_distinct, min_val))
 
@@ -430,9 +483,7 @@ def build_fk_appendages(cursor, table):
                     actual_ref = tgt_canonical.get(ref_table.lower())
                     if actual_ref is None:
                         continue
-                    expression, description = build_single_fk_expression(
-                        cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
-                    )
+                    expression, description = build_single_fk_appendage(col, actual_ref, ref_col)
                     appendages[col] = expression
                     print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
@@ -456,10 +507,7 @@ def build_fk_appendages(cursor, table):
         for constraint_name, fk_cols in constraints.items():
             for col, ref_table, ref_col in fk_cols:
                 if col in pk_columns:
-                    cursor.execute(
-                        f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-                    )
-                    source_distinct = cursor.fetchone()[0]
+                    source_distinct = estimated_source_distinct(col)
                     fk_pk_cycle_length *= source_distinct
 
         # Handle non-FK PK columns with mod() cycling
@@ -467,15 +515,12 @@ def build_fk_appendages(cursor, table):
         # product of all PK column distinct counts >> total rows
         non_fk_pk_cols = pk_columns - pk_fk_columns
         for col in non_fk_pk_cols:
-            cursor.execute(
-                f"SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-            )
-            source_distinct, min_val = cursor.fetchone()
-            min_val = min_val if min_val is not None else 1
-            if source_distinct and source_distinct <= 100:
-                expr, freq_count = exact_frequency_case_expression(col)
+            source_distinct = estimated_source_distinct(col)
+            min_val = synthetic_pk_base()
+            if DB_TYPE == 'mysql' and source_distinct and source_distinct <= 100:
+                expr, freq_count = synthetic_frequency_case_expression(col)
                 if expr:
-                    print(f"      PK {col}: exact frequency CASE ({freq_count} values)")
+                    print(f"      PK {col}: synthetic frequency CASE ({freq_count} values)")
                 else:
                     expr = f"mod(rownum-1, {source_distinct})+{min_val}"
                     print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
@@ -494,10 +539,7 @@ def build_fk_appendages(cursor, table):
                 actual_ref = tgt_canonical.get(ref_table.lower())
                 if actual_ref is None:
                     continue
-                cursor.execute(
-                    f"SELECT COUNT(DISTINCT `{col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
-                )
-                source_distinct = cursor.fetchone()[0]
+                source_distinct = estimated_source_distinct(col)
                 cursor.execute(
                     f"SELECT MIN(`{ref_col}`) FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
                 )
@@ -514,9 +556,7 @@ def build_fk_appendages(cursor, table):
                 actual_ref = tgt_canonical.get(ref_table.lower())
                 if actual_ref is None:
                     continue
-                expression, description = build_single_fk_expression(
-                    cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
-                )
+                expression, description = build_single_fk_appendage(col, actual_ref, ref_col)
                 appendages[col] = expression
                 print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
@@ -576,9 +616,7 @@ def build_fk_appendages(cursor, table):
                       f"SKIPPED (referenced table not yet in {TARGET_SCHEMA})")
                 continue
 
-            expression, description = build_single_fk_expression(
-                cursor, SOURCE_SCHEMA, TARGET_SCHEMA, table, col, actual_ref, ref_col
-            )
+            expression, description = build_single_fk_appendage(col, actual_ref, ref_col)
             appendages[col] = expression
             print(f"      FK {col} -> {actual_ref}.{ref_col}: {description}")
 
@@ -638,13 +676,13 @@ def step_a_generate_dbgen(cursor, table, extractor=None):
 
     Dispatches based on DB_TYPE:
       - mysql: uses annotate_table_with_histogram (MySQL histogram system)
-      - singlestore: uses annotate_table_with_statistics (optimizer_statistics)
+      - other extractors: use annotate_table_with_statistics (engine stats)
     """
     print(f"  [A] Generating .dbgen template ...")
 
-    generated_appendages = build_fk_appendages(cursor, table)
+    generated_appendages = build_fk_appendages(cursor, table, extractor=extractor)
 
-    if DB_TYPE == 'singlestore':
+    if DB_TYPE != 'mysql':
         ddl = annotate_table_with_statistics(
             extractor, SOURCE_SCHEMA, table,
             generated_appendages=generated_appendages,
@@ -681,6 +719,10 @@ def step_b_run_dbgen(cursor, table):
 
     template_path = os.path.join(DBGEN_FILES_DIR, f"{table}.dbgen")
     dbgen_bin = _find_dbgen_binary()
+    if not os.path.isfile(dbgen_bin) or not os.access(dbgen_bin, os.X_OK):
+        print(f"  [B] FAILED — dbgen binary not found or not executable: {dbgen_bin}")
+        return False
+
     cmd = [
         dbgen_bin,
         "--out-dir", DBGEN_TMP_OUT_DIR,
@@ -689,7 +731,7 @@ def step_b_run_dbgen(cursor, table):
         "--rows-count", str(rows_to_generate),
         "--template", template_path,
         "--format", "csv",           # Generate CSV instead of SQL
-        "--format-null", "\\N",      # MySQL's default NULL representation
+        "--quiet",
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -713,6 +755,23 @@ def _load_source_cardinality_fast(cursor, database, table):
     For SingleStore, this is faster than SHOW INDEX which can be slow on large tables.
     Returns dict {column_name: distinct_count}.
     """
+    if DB_TYPE == 'tidb' and database == SOURCE_SCHEMA and ROWS_OVERRIDE:
+        cursor.execute(
+            "SHOW STATS_HISTOGRAMS "
+            f"WHERE Db_name = {_sql_string_literal(database)} "
+            f"AND Table_name = {_sql_string_literal(table)} "
+            "AND Is_index = 0"
+        )
+        names = [name.lower() for name in cursor.column_names]
+        cardinalities = {}
+        for row in cursor.fetchall():
+            values = dict(zip(names, row))
+            column = values.get("column_name")
+            distinct = values.get("distinct_count")
+            if column and distinct:
+                cardinalities[column] = int(distinct)
+        return cardinalities
+
     # Get PK columns
     cursor.execute("""
         SELECT COLUMN_NAME
@@ -755,6 +814,190 @@ def _load_source_cardinality_fast(cursor, database, table):
                 print(f"      Warning: Could not get distinct count for {col}: {e}")
 
     return distinct_counts
+
+
+def _parse_size_bytes(value, default):
+    if not value:
+        return default
+
+    text = str(value).strip().lower()
+    multiplier = 1
+    if text[-1:] in {"k", "m", "g"}:
+        suffix = text[-1]
+        text = text[:-1]
+        multiplier = {"k": 1024, "m": 1024 ** 2, "g": 1024 ** 3}[suffix]
+
+    try:
+        return int(float(text) * multiplier)
+    except ValueError:
+        return default
+
+
+def _sql_string(value):
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _mysql_cli_base_command():
+    mysql_bin = shutil.which("mysql")
+    if not mysql_bin:
+        return None
+
+    cmd = [
+        mysql_bin,
+        "--local-infile=1",
+        "--connect-timeout=30",
+        "-h", HOST,
+        "-P", str(DB_PORT),
+        "-u", USER,
+    ]
+    if HOST.endswith("tidbcloud.com"):
+        cmd.append("--ssl")
+    return cmd
+
+
+def _run_mysql_cli_load(schema, sql):
+    cmd = _mysql_cli_base_command()
+    if cmd is None:
+        return False
+
+    env = os.environ.copy()
+    if PASSWORD:
+        env["MYSQL_PWD"] = PASSWORD
+
+    completed = subprocess.run(
+        cmd + [schema, "-e", sql],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(details or f"mysql exited with {completed.returncode}")
+    return True
+
+
+def _load_csv_file(schema, table, csv_path, column_list):
+    load_stmt = f"""
+        LOAD DATA LOCAL INFILE {_sql_string(csv_path)}
+        INTO TABLE `{schema}`.`{table}`
+        FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\\\'
+        LINES TERMINATED BY '\\n'
+        ({column_list})
+    """
+    if _run_mysql_cli_load(schema, load_stmt):
+        return
+    raise RuntimeError("mysql CLI is required for chunked TiDB LOAD DATA")
+
+
+def _load_generated_csv(cursor, table, csv_path, column_list):
+    default_chunk_size = "16m" if DB_TYPE == "tidb" else "128m"
+    default_chunk_bytes = 16 * 1024 * 1024 if DB_TYPE == "tidb" else 128 * 1024 * 1024
+    chunk_bytes = _parse_size_bytes(
+        os.environ.get("DATAGENX_LOAD_CHUNK_BYTES", default_chunk_size),
+        default_chunk_bytes,
+    )
+    attempts = int(os.environ.get("DATAGENX_LOAD_RETRY_ATTEMPTS", "3"))
+    file_size = os.path.getsize(csv_path)
+
+    if file_size <= chunk_bytes:
+        load_stmt = f"""
+            LOAD DATA LOCAL INFILE {_sql_string(csv_path)}
+            INTO TABLE `{TARGET_SCHEMA}`.`{table}`
+            FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\\\'
+            LINES TERMINATED BY '\\n'
+            ({column_list})
+        """
+        cursor.execute(load_stmt)
+        return
+
+    chunk_dir = os.path.join(DBGEN_TMP_OUT_DIR, ".load_chunks", table)
+
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            cursor.execute(f"TRUNCATE TABLE `{TARGET_SCHEMA}`.`{table}`")
+
+        print(
+            f"      Loading {os.path.basename(csv_path)} in "
+            f"{chunk_bytes // (1024 * 1024)}MiB chunks "
+            f"(attempt {attempt}/{attempts})"
+        )
+
+        try:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            os.makedirs(chunk_dir, exist_ok=True)
+
+            chunk_index = 0
+            current_size = 0
+            current_path = None
+            current = None
+
+            def close_and_load_current():
+                nonlocal current, current_path, current_size
+                if current is None:
+                    return
+                current.close()
+                _load_csv_file(TARGET_SCHEMA, table, current_path, column_list)
+                os.remove(current_path)
+                current = None
+                current_path = None
+                current_size = 0
+
+            with open(csv_path, "rb") as source:
+                for line in source:
+                    if current is None:
+                        current_path = os.path.join(
+                            chunk_dir,
+                            f"{table}_{chunk_index:05d}.csv",
+                        )
+                        current = open(current_path, "wb")
+                        chunk_index += 1
+
+                    if current_size and current_size + len(line) > chunk_bytes:
+                        close_and_load_current()
+                        current_path = os.path.join(
+                            chunk_dir,
+                            f"{table}_{chunk_index:05d}.csv",
+                        )
+                        current = open(current_path, "wb")
+                        chunk_index += 1
+
+                    current.write(line)
+                    current_size += len(line)
+
+            close_and_load_current()
+            cursor._connection.ping(reconnect=True, attempts=3, delay=5)
+            return
+        except Exception as exc:
+            if current is not None:
+                current.close()
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+            print(f"      WARN: chunked load failed for {table}: {exc}")
+            if attempt == attempts:
+                raise
+            time.sleep(attempt * 30)
+
+
+def _refresh_cursor(conn, cursor=None):
+    try:
+        conn.ping(reconnect=True, attempts=3, delay=5)
+    except TypeError:
+        conn.ping(reconnect=True)
+    except Error:
+        conn.reconnect(attempts=3, delay=5)
+
+    try:
+        if cursor is not None:
+            cursor.close()
+    except Error:
+        pass
+    return conn.cursor()
+
+
+def _new_schema_extractor():
+    extractor = create_schema_extractor(DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA, DB_PORT)
+    if not extractor.connect():
+        raise RuntimeError(f"Failed to connect to {DB_TYPE}")
+    return extractor
 
 
 def step_c_create_insert_validate(cursor, table):
@@ -810,14 +1053,7 @@ def step_c_create_insert_validate(cursor, table):
 
     column_list = ", ".join(f"`{col}`" for col in columns)
 
-    load_stmt = f"""
-        LOAD DATA LOCAL INFILE '{csv_path}'
-        INTO TABLE `{TARGET_SCHEMA}`.`{table}`
-        FIELDS TERMINATED BY ',' ENCLOSED BY '"' ESCAPED BY '\\\\'
-        LINES TERMINATED BY '\\n'
-        ({column_list})
-    """
-    cursor.execute(load_stmt)
+    _load_generated_csv(cursor, table, csv_path, column_list)
 
     # Clone optimizer histogram metadata as part of target creation, not
     # validation. The separate validator expects target histograms to exist.
@@ -888,9 +1124,8 @@ def step_c_create_insert_validate(cursor, table):
             src_hist = load_histograms(cursor, SOURCE_SCHEMA, table)
             tgt_hist = load_histograms(cursor, TARGET_SCHEMA, table)
         else:
-            # SingleStore: read ADVANCED_HISTOGRAMS directly (populated by ANALYZE TABLE)
-            src_hist = _load_histograms_singlestore(cursor, SOURCE_SCHEMA, table)
-            tgt_hist = _load_histograms_singlestore(cursor, TARGET_SCHEMA, table)
+            src_hist = _load_histograms_with_extractor(DB_TYPE, SOURCE_SCHEMA, table)
+            tgt_hist = _load_histograms_with_extractor(DB_TYPE, TARGET_SCHEMA, table)
 
         if src_hist and tgt_hist:
             hist_results = compare_histograms(src_hist, tgt_hist)
@@ -913,8 +1148,9 @@ def step_c_create_insert_validate(cursor, table):
     )
 
     # --- Distinct counts ---
-    if DB_TYPE == 'singlestore' and int(ROWS_COUNT) != src_rows:
-        # Fast path: use optimizer_statistics instead of expensive COUNT(DISTINCT) on source.
+    if DB_TYPE != 'mysql' and ROWS_OVERRIDE and int(ROWS_COUNT) != src_rows:
+        # Fast path for scaled-down replays: avoid expensive full-table
+        # COUNT(DISTINCT) on large non-MySQL source tables.
         # Compare cardinality estimates and flag over-generation.
         src_cardinality = _load_source_cardinality_fast(cursor, SOURCE_SCHEMA, table)
         tgt_cardinality = _load_source_cardinality_fast(cursor, TARGET_SCHEMA, table)
@@ -974,7 +1210,7 @@ def step_c_create_insert_validate(cursor, table):
 # ----------------------------------------------------------------
 def main():
     # Make these global so they can be modified by CLI args
-    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE, ROWS_OVERRIDE
+    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE, DB_PORT, ROWS_OVERRIDE
 
     start_time = time.time()
 
@@ -984,36 +1220,36 @@ def main():
 
     # --- Connect ---
     try:
-        conn = mysql.connector.connect(
-            host=HOST, user=USER, password=PASSWORD, database=SOURCE_SCHEMA,
+        conn = mysql.connector.connect(**connection_kwargs_for(
+            DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA, DB_PORT,
             autocommit=True,
             allow_local_infile=True,  # Enable LOAD DATA LOCAL INFILE
-        )
+        ))
         cursor = conn.cursor()
     except Error as e:
-        print(f"MySQL connection failed: {e}")
+        print(f"{DB_TYPE} connection failed: {e}")
         sys.exit(1)
 
     cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
     cursor.execute("SET time_zone = '+00:00'")
 
-    # --- Create SingleStore extractor if needed ---
+    # --- Create extractor if needed ---
     extractor = None
-    if DB_TYPE == 'singlestore':
-        extractor = create_schema_extractor(DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA)
+    if DB_TYPE != 'mysql':
+        extractor = create_schema_extractor(DB_TYPE, HOST, USER, PASSWORD, SOURCE_SCHEMA, DB_PORT)
         if not extractor.connect():
-            print("Failed to connect to SingleStore")
+            print(f"Failed to connect to {DB_TYPE}")
             sys.exit(1)
 
     # --- Discover and sort tables ---
-    if DB_TYPE == 'singlestore' and extractor:
+    if DB_TYPE != 'mysql' and extractor:
         # Use extractor to discover tables
         all_tables = extractor.get_tables()
         dependencies = {}
         for table in all_tables:
             fks = extractor.get_foreign_keys(table)
             if fks:
-                dependencies[table] = list(set(fk['referenced_table'] for fk in fks))
+                dependencies[table] = list({ref_table for ref_table, _ in fks.values()})
         sorted_tables = topological_sort(all_tables, dependencies)
     else:
         # Use MySQL discovery
@@ -1039,25 +1275,38 @@ def main():
     results = {}
 
     for i, table in enumerate(sorted_tables, 1):
+        cursor = _refresh_cursor(conn, cursor)
+        table_extractor = extractor
+        if DB_TYPE != 'mysql':
+            table_extractor = _new_schema_extractor()
+
         deps = dependencies.get(table, [])
         dep_str = f" (depends on: {', '.join(deps)})" if deps else ""
         print(f"[{i}/{len(sorted_tables)}] Table: {table}{dep_str}")
         print("-" * 50)
 
         # Step A
-        if not step_a_generate_dbgen(cursor, table, extractor):
+        if not step_a_generate_dbgen(cursor, table, table_extractor):
             results[table] = {"error": "dbgen template generation failed"}
             print()
+            if table_extractor is not extractor and table_extractor:
+                table_extractor.close()
             continue
 
         # Step B
+        cursor = _refresh_cursor(conn, cursor)
         if not step_b_run_dbgen(cursor, table):
             results[table] = {"error": "dbgen binary execution failed"}
             print()
+            if table_extractor is not extractor and table_extractor:
+                table_extractor.close()
             continue
 
         # Step C
+        cursor = _refresh_cursor(conn, cursor)
         results[table] = step_c_create_insert_validate(cursor, table)
+        if table_extractor is not extractor and table_extractor:
+            table_extractor.close()
         print()
 
     # --- Cleanup ---
@@ -1139,10 +1388,11 @@ if __name__ == "__main__":
                                   action="store_false",
                                   help="Run built-in validation checks after loading each table")
 
-    # Add new arguments for SingleStore support
-    parser.add_argument("--db-type", choices=["mysql", "singlestore"], default="mysql",
-                        help="Database type (default: mysql)")
+    # Add arguments for backend selection and connection overrides
+    parser.add_argument("--db-type", choices=available_extractor_types(), default=DB_TYPE,
+                        help=f"Database type (default: {DB_TYPE})")
     parser.add_argument("--host", help="Database host (overrides config.py)")
+    parser.add_argument("--port", type=int, help="Database port (defaults to the engine default)")
     parser.add_argument("--user", help="Database user (overrides config.py)")
     parser.add_argument("--password", help="Database password (overrides config.py)")
     parser.add_argument("--source-schema", help="Source schema name (overrides config.py)")
@@ -1159,9 +1409,11 @@ if __name__ == "__main__":
         DB_TYPE = args.db_type
     if args.host:
         HOST = args.host
+    if args.port:
+        DB_PORT = args.port
     if args.user:
         USER = args.user
-    if args.password:
+    if args.password is not None:
         PASSWORD = args.password
     if args.source_schema:
         SOURCE_SCHEMA = args.source_schema

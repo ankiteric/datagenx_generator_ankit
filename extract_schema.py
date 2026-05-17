@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Extract schema from MySQL or SingleStore database and generate .dbgen files.
+Extract schema from a supported database and generate .dbgen files.
 Customer-facing tool for schema extraction.
 """
 
@@ -9,15 +9,16 @@ import os
 import sys
 import re
 import json
+import math
 from datetime import datetime
 
 # Import existing code
 from datagenx.generation.GenerateDbgen import (
     histogram_to_case, char_varchar_appendage, text_appendage,
     string_values_to_case, get_string_column_length,
-    get_min_max_from_histogram, STRING_CARDINALITY_THRESHOLD,
+    STRING_CARDINALITY_THRESHOLD,
     topological_sort, NUMERIC_TYPES, DATETIME_TYPES, CHAR_TYPES,
-    TEXT_TYPES, YEAR
+    TEXT_TYPES, YEAR, SYNTHETIC_BASE_DATETIME
 )
 
 # Import our new library
@@ -31,6 +32,215 @@ def _load_table_cardinality(extractor, table):
     except Exception as e:
         print(f"    Note: cardinality lookup unavailable ({e}), skipping cardinality lookup")
         return {"row_count": None, "columns": {}, "indexes": {}}
+
+
+def _positive_int(value):
+    if value is None:
+        return None
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        try:
+            value = int(float(value))
+        except (TypeError, ValueError):
+            return None
+    return value if value > 0 else None
+
+
+def _exact_table_row_count(extractor, database, table):
+    """Return exact source row count, avoiding optimizer estimates for generation."""
+    extractor.cursor.execute(f"SELECT COUNT(*) FROM `{database}`.`{table}`")
+    value = extractor.cursor.fetchone()[0]
+    return int(value) if value is not None else None
+
+
+def _column_distinct_count(
+    extractor,
+    table,
+    column,
+    col_cardinality,
+    exact_distinct_cache,
+    *,
+    prefer_exact=False,
+):
+    """Return source NDV for a column without reading source literals."""
+    if column in exact_distinct_cache:
+        return exact_distinct_cache[column]
+
+    if not prefer_exact:
+        stats_count = _positive_int(col_cardinality.get(column))
+        if stats_count:
+            return stats_count
+
+    try:
+        exact_count = _positive_int(extractor.get_distinct_count(table, column))
+        if exact_count:
+            exact_distinct_cache[column] = exact_count
+            return exact_count
+    except Exception as e:
+        print(f"    Note: exact NDV lookup unavailable for {table}.{column} ({e})")
+
+    stats_count = _positive_int(col_cardinality.get(column))
+    if stats_count:
+        return stats_count
+    return None
+
+
+def _numeric_ndv_expression(ddl_line, distinct_count):
+    """Generate synthetic numeric values preserving NDV, not source literals."""
+    distinct_count = _positive_int(distinct_count)
+    if not distinct_count:
+        return None
+
+    decimal_match = re.search(
+        r"decimal\(\s*\d+\s*,\s*(\d+)\s*\)",
+        ddl_line,
+        re.IGNORECASE,
+    )
+    scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
+    ordinal = f"mod(rownum-1, {distinct_count}) + 1"
+    if scale == 1:
+        return ordinal
+    return f"({ordinal}) / {scale}"
+
+
+def _temporal_ndv_expression(col_type, distinct_count):
+    """Generate synthetic temporal values preserving NDV."""
+    distinct_count = _positive_int(distinct_count)
+    if not distinct_count:
+        return None
+
+    offset = f"mod(rownum-1, {distinct_count})"
+    if col_type == "date":
+        return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {offset} DAY"
+    if col_type in ("datetime", "timestamp"):
+        return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {offset} SECOND"
+    if col_type == "time":
+        return f"INTERVAL {offset} SECOND"
+    return None
+
+
+def _year_ndv_expression(distinct_count):
+    distinct_count = _positive_int(distinct_count)
+    if not distinct_count:
+        return None
+    return f"mod(rownum-1, {distinct_count}) + 2000"
+
+
+def _grouped_ndv_expression(distinct_count, row_count):
+    """Use grouped cycling for composite PK components with repeated values."""
+    distinct_count = _positive_int(distinct_count)
+    row_count = _positive_int(row_count)
+    if not distinct_count:
+        return None
+    if not row_count:
+        return f"mod(rownum-1, {distinct_count}) + 1"
+
+    rows_per_value = max(1, row_count // distinct_count)
+    if rows_per_value >= 2:
+        return f"mod(div(rownum-1, {rows_per_value}), {distinct_count}) + 1"
+    return f"mod(rownum-1, {distinct_count}) + 1"
+
+
+def _lcm(values):
+    result = 1
+    for value in values:
+        value = _positive_int(value)
+        if not value:
+            continue
+        result = result * value // math.gcd(result, value)
+    return result
+
+
+def _product(values):
+    result = 1
+    for value in values:
+        value = _positive_int(value)
+        if not value:
+            continue
+        result *= value
+    return result
+
+
+def _build_composite_pk_appendages(
+    extractor,
+    table,
+    primary_key_columns,
+    foreign_keys,
+    generated_appendages,
+    col_cardinality,
+    table_row_count,
+    exact_distinct_cache,
+):
+    """Precompute synthetic expressions for composite PK columns.
+
+    The generic per-column fallback of rownum over-generates marginal NDV for
+    composite keys. These expressions preserve per-column NDV while keeping the
+    generated domain synthetic.
+    """
+    if len(primary_key_columns) <= 1:
+        return {}
+
+    pk_info = []
+    for col in sorted(primary_key_columns):
+        if col in generated_appendages or col in foreign_keys:
+            continue
+        distinct_count = _column_distinct_count(
+            extractor,
+            table,
+            col,
+            col_cardinality,
+            exact_distinct_cache,
+            prefer_exact=True,
+        )
+        distinct_count = _positive_int(distinct_count)
+        if distinct_count:
+            pk_info.append((col, distinct_count))
+
+    if not pk_info:
+        return {}
+
+    row_count = _positive_int(table_row_count)
+    if len(pk_info) >= 2 and row_count:
+        distinct_counts = [distinct_count for _col, distinct_count in pk_info]
+        cycle_length = _lcm(distinct_counts)
+        if cycle_length >= row_count:
+            return {
+                col: f"mod(rownum-1, {distinct_count}) + 1"
+                for col, distinct_count in pk_info
+            }
+
+        value_space = _product(distinct_counts)
+        if value_space >= row_count:
+            ordered = sorted(pk_info, key=lambda item: item[1])
+            largest_col, largest_distinct = ordered[-1]
+            small_info = ordered[:-1]
+            small_product = _product(distinct for _col, distinct in small_info)
+            repeats_per_small_key = (row_count + small_product - 1) // small_product
+
+            if small_product > 0 and repeats_per_small_key <= largest_distinct:
+                appendages = {}
+                prefix = 1
+                for col, distinct_count in small_info:
+                    appendages[col] = (
+                        f"mod(div(mod(rownum-1, {small_product}), {prefix}), "
+                        f"{distinct_count}) + 1"
+                    )
+                    prefix *= distinct_count
+
+                appendages[largest_col] = (
+                    f"mod(div(rownum-1, {small_product}) + "
+                    f"mod(rownum-1, {small_product}) * {repeats_per_small_key}, "
+                    f"{largest_distinct}) + 1"
+                )
+                return appendages
+
+    appendages = {}
+    for col, distinct_count in pk_info:
+        expression = _grouped_ndv_expression(distinct_count, table_row_count)
+        if expression:
+            appendages[col] = expression
+    return appendages
 
 
 def _get_string_value_weights(cursor, database, table, column, cardinality):
@@ -56,34 +266,6 @@ def _get_string_value_weights(cursor, database, table, column, cardinality):
 
     # Fallback: equal weights
     return [(f"val_{i}", 1) for i in range(1, cardinality + 1)]
-
-
-def get_date_range_expression(cursor, database, table, column, col_type):
-    """Query min/max values for DATE/DATETIME/TIMESTAMP column."""
-    cursor.execute(
-        f"SELECT MIN(`{column}`), MAX(`{column}`) FROM `{database}`.`{table}`"
-    )
-    min_val, max_val = cursor.fetchone()
-
-    if min_val is None or max_val is None:
-        return None
-
-    if col_type == "date":
-        base_date = min_val.strftime("%Y-%m-%d 00:00:00")
-        day_span = (max_val - min_val).days
-        return f"TIMESTAMP '{base_date}' + INTERVAL rand.range(0, {day_span}) DAY"
-
-    elif col_type in ("datetime", "timestamp"):
-        base_ts = min_val.strftime("%Y-%m-%d %H:%M:%S")
-        second_span = int((max_val - min_val).total_seconds())
-        return f"TIMESTAMP '{base_ts}' + INTERVAL rand.range(0, {second_span}) SECOND"
-
-    elif col_type == "time":
-        min_secs = int(min_val.total_seconds())
-        max_secs = int(max_val.total_seconds())
-        return f"INTERVAL rand.range({min_secs}, {max_secs}) SECOND"
-
-    return None
 
 
 def annotate_table_with_statistics(extractor, database, table, generated_appendages=None):
@@ -113,7 +295,23 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
     # Load cardinality metadata through the engine-specific extractor.
     table_cardinality = _load_table_cardinality(extractor, table)
     col_cardinality = table_cardinality.get("columns", {})
-    table_row_count = table_cardinality.get("row_count")
+    try:
+        table_row_count = _exact_table_row_count(extractor, database, table)
+    except Exception as e:
+        print(f"    Note: exact row count unavailable for {table} ({e}); using stats row count")
+        table_row_count = table_cardinality.get("row_count")
+
+    exact_distinct_cache = {}
+    composite_pk_appendages = _build_composite_pk_appendages(
+        extractor,
+        table,
+        primary_key_columns,
+        foreign_keys,
+        generated_appendages,
+        col_cardinality,
+        table_row_count,
+        exact_distinct_cache,
+    )
 
     new_lines = []
 
@@ -127,17 +325,21 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
         col_type = column_types.get(col)
         synthetic = ""
 
-        # FOREIGN KEY → use generated appendage if provided
-        if col in foreign_keys:
-            if col in generated_appendages:
-                synthetic = generated_appendages[col]
+        # MasterRun.py may precompute expressions for FK, PK, or composite keys.
+        if col in generated_appendages:
+            synthetic = generated_appendages[col]
+
+        elif col in composite_pk_appendages:
+            synthetic = composite_pk_appendages[col]
+
+        # FOREIGN KEY → use referenced generated domain
+        elif col in foreign_keys:
+            ref_table, ref_col = foreign_keys[col]
+            comment = f"/*{{{{ @{col} := @{ref_col} }}}}*/"
+            if line.rstrip().endswith(","):
+                line = line.rstrip()[:-1] + f" {comment},"
             else:
-                ref_table, ref_col = foreign_keys[col]
-                comment = f"/*{{{{ @{col} := @{ref_col} }}}}*/"
-                if line.rstrip().endswith(","):
-                    line = line.rstrip()[:-1] + f" {comment},"
-                else:
-                    line = line + f" {comment}"
+                line = line + f" {comment}"
 
         # PRIMARY KEY or AUTO_INCREMENT
         elif (
@@ -149,41 +351,18 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
             is_fk = col in foreign_keys
 
             if is_composite_pk and not is_fk and not is_auto_increment:
-                # Composite PK non-FK: generate repeating values to match source cardinality
-                # (mirrors MySQL path's div/mod grouping logic)
-                distinct_count = col_cardinality.get(col, 0)
-                if distinct_count and distinct_count > 1:
-                    # Estimate rows_per_value from source row count
-                    try:
-                        row_count = table_row_count or extractor.get_table_row_count(table)
-                        rows_per_value = max(1, row_count // distinct_count)
-                    except Exception:
-                        rows_per_value = 1
-
-                    if rows_per_value >= 2:
-                        synthetic = f"div(rownum-1, {rows_per_value}) + 1"
-                    else:
-                        synthetic = f"mod(rownum-1, {distinct_count}) + 1"
-                else:
-                    synthetic = "rownum"
+                distinct_count = _column_distinct_count(
+                    extractor,
+                    table,
+                    col,
+                    col_cardinality,
+                    exact_distinct_cache,
+                    prefer_exact=True,
+                )
+                synthetic = _grouped_ndv_expression(distinct_count, table_row_count) or "rownum"
             else:
-                # Single-column PK or AUTO_INCREMENT
-                # Check if 0-based via histogram
-                histogram = extractor.get_column_histogram(table, col)
-                if histogram:
-                    min_val, _ = get_min_max_from_histogram(histogram)
-                    if min_val is not None:
-                        try:
-                            if int(float(min_val)) == 0:
-                                synthetic = "rownum-1"
-                            else:
-                                synthetic = "rownum"
-                        except (ValueError, TypeError):
-                            synthetic = "rownum"
-                    else:
-                        synthetic = "rownum"
-                else:
-                    synthetic = "rownum"
+                # Single-column PK or AUTO_INCREMENT: synthetic dense key domain.
+                synthetic = "rownum"
 
         elif col_type in CHAR_TYPES:
             # Check cardinality — low-cardinality strings get weighted CASE expression
@@ -192,7 +371,12 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
             if 0 < card <= STRING_CARDINALITY_THRESHOLD:
                 values = _get_string_value_weights(
                     extractor.cursor, database, table, col, card)
-                synthetic = string_values_to_case(values, col, max_length=col_max_length)
+                synthetic = string_values_to_case(
+                    values,
+                    col,
+                    max_length=col_max_length,
+                    row_count=table_row_count,
+                )
             else:
                 synthetic = char_varchar_appendage(line)
 
@@ -200,25 +384,49 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
             synthetic = text_appendage()
 
         elif col_type in DATETIME_TYPES:
-            date_expr = get_date_range_expression(
-                extractor.cursor, database, table, col, col_type
+            distinct_count = _column_distinct_count(
+                extractor,
+                table,
+                col,
+                col_cardinality,
+                exact_distinct_cache,
+                prefer_exact=True,
             )
-            if date_expr:
-                synthetic = date_expr
-            else:
-                synthetic = "rand.u31_timestamp()"
+            synthetic = _temporal_ndv_expression(col_type, distinct_count) or "rand.u31_timestamp()"
 
         elif col_type in YEAR:
-            synthetic = "rand.range(1975,2025)"
+            distinct_count = _column_distinct_count(
+                extractor,
+                table,
+                col,
+                col_cardinality,
+                exact_distinct_cache,
+                prefer_exact=True,
+            )
+            synthetic = _year_ndv_expression(distinct_count) or "rand.range(1975,2025)"
 
         elif col_type in NUMERIC_TYPES:
             # Try to get histogram, with actual_distinct_count correction
             histogram = extractor.get_column_histogram(table, col)
+            actual_distinct = _column_distinct_count(
+                extractor,
+                table,
+                col,
+                col_cardinality,
+                exact_distinct_cache,
+                prefer_exact=True,
+            )
             if histogram:
-                actual_distinct = col_cardinality.get(col)
-                synthetic = histogram_to_case(histogram, line, actual_distinct)
+                synthetic = histogram_to_case(
+                    histogram,
+                    line,
+                    actual_distinct,
+                    table_row_count,
+                )
+                if not synthetic:
+                    synthetic = _numeric_ndv_expression(line, actual_distinct)
             else:
-                synthetic = "rand.range(0,5)"
+                synthetic = _numeric_ndv_expression(line, actual_distinct) or "rand.range(0,5)"
 
         else:
             synthetic = ""
@@ -267,7 +475,7 @@ def build_fk_appendages_from_source(extractor, table):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract schema from MySQL or SingleStore database',
+        description='Extract schema from a supported database',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
@@ -276,6 +484,9 @@ Examples:
 
   # Extract from SingleStore
   %(prog)s --db-type singlestore --host prod.db.com --user admin --database mydb
+
+  # Extract from TiDB
+  %(prog)s --db-type tidb --host gateway01.region.prod.aws.tidbcloud.com --port 4000 --user tidb_user --database test
 
   # With password from environment
   export DB_PASSWORD=secret
@@ -286,7 +497,7 @@ Examples:
     parser.add_argument('--db-type', required=True, choices=available_extractor_types(),
                         help='Database type')
     parser.add_argument('--host', required=True, help='Database host')
-    parser.add_argument('--port', type=int, default=3306, help='Database port (default: 3306)')
+    parser.add_argument('--port', type=int, help='Database port (defaults to the engine default)')
     parser.add_argument('--user', required=True, help='Database user')
     parser.add_argument('--password', help='Database password')
     parser.add_argument('--password-env', help='Environment variable containing password')
