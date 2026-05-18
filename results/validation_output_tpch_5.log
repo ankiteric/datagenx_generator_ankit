@@ -1,0 +1,65 @@
+============================================================
+MASTER RUN — tpch_sf5 -> tpch_sf5_dbgenx
+============================================================
+Tables (8): part -> region -> nation -> customer -> orders -> supplier -> partsupp -> lineitem
+
+Dropping 1 existing table(s) in `tpch_sf5_dbgenx`...
+
+Regenerating histograms with full sampling...
+  Warning: Failed to regenerate histogram for partsupp: 2013 (HY000): Lost connection to MySQL server during query
+  Warning: Failed to regenerate histogram for region: 2013 (HY000): Lost connection to MySQL server during query
+  Warning: Failed to regenerate histogram for supplier: 2013 (HY000): Lost connection to MySQL server during query
+Traceback (most recent call last):
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/venv/lib/python3.13/site-packages/mysql/connector/connection_cext.py", line 772, in cmd_query
+    self._cmysql.query(
+    ~~~~~~~~~~~~~~~~~~^
+        query,
+        ^^^^^^
+    ...<3 lines>...
+        query_attrs=self.query_attrs,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+_mysql_connector.MySQLInterfaceError: Lost connection to MySQL server during query
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/MasterRun.py", line 8, in <module>
+    runpy.run_module("datagenx.orchestration.MasterRun", run_name="__main__")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen runpy>", line 229, in run_module
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/datagenx/orchestration/MasterRun.py", line 1441, in <module>
+    main()
+    ~~~~^^
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/datagenx/orchestration/MasterRun.py", line 1283, in main
+    regenerate_histograms_with_full_sampling(cursor, SOURCE_SCHEMA)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/datagenx/orchestration/MasterRun.py", line 222, in regenerate_histograms_with_full_sampling
+    cursor.execute("""
+    ~~~~~~~~~~~~~~^^^^
+        SELECT TABLE_NAME, MIN(HISTOGRAM->>'$."sampling-rate"') as min_rate
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+        HAVING min_rate < 1.0
+        ^^^^^^^^^^^^^^^^^^^^^
+    """, (database,))
+    ^^^^^^^^^^^^^^^^^
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/venv/lib/python3.13/site-packages/mysql/connector/cursor_cext.py", line 353, in execute
+    self._connection.cmd_query(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self._stmt_partition["mappable_stmt"],
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<2 lines>...
+        raw_as_string=self._raw_as_string,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/venv/lib/python3.13/site-packages/mysql/connector/opentelemetry/context_propagation.py", line 97, in wrapper
+    return method(cnx, *args, **kwargs)
+  File "/Users/sreeharshar/work/db/datagenx/datagenx_generator/datagenx_generator/venv/lib/python3.13/site-packages/mysql/connector/connection_cext.py", line 781, in cmd_query
+    raise get_mysql_exception(
+        err.errno, msg=err.msg, sqlstate=err.sqlstate
+    ) from err
+mysql.connector.errors.OperationalError: 2013 (HY000): Lost connection to MySQL server during query

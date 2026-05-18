@@ -15,5 +15,4 @@ papers/
 .env
 .DS_Store
 
-results/
 messages.md

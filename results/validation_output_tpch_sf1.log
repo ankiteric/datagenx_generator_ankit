@@ -1,0 +1,143 @@
+============================================================
+MASTER RUN — tpch -> tpch_dbgenx
+============================================================
+Tables (8): part -> region -> NATION -> CUSTOMER -> ORDERS -> SUPPLIER -> PARTSUPP -> LINEITEM
+
+Dropping 5 existing table(s) in `tpch_dbgenx`...
+
+Regenerating histograms with full sampling...
+  Warning: 2 tables still have sampling_rate < 1.0:
+    lineitem: 0.07155212018829207
+    orders: 0.49709394505295323
+
+[1/8] Table: part
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+  [A] Wrote generated/dbgen_files/part.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 200000
+      Generating 200000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/part.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`part`
+      Row count: 200000 (matches source)
+      DDL match: OK
+
+[2/8] Table: region
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+  [A] Wrote generated/dbgen_files/region.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 5
+      Generating 5 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/region.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`region`
+      Row count: 5 (matches source)
+      DDL match: OK
+
+[3/8] Table: NATION (depends on: region)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK n_regionkey -> region.r_regionkey: sparse (5 distinct values, deterministic weighted)
+  [A] Wrote generated/dbgen_files/NATION.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 25
+      Generating 25 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/NATION.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`NATION`
+      Row count: 25 (matches source)
+      DDL match: OK
+
+[4/8] Table: CUSTOMER (depends on: NATION)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK c_nationkey -> NATION.n_nationkey: sparse (25 distinct values, deterministic weighted)
+  [A] Wrote generated/dbgen_files/CUSTOMER.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 150000
+      Generating 150000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/CUSTOMER.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`CUSTOMER`
+      Row count: 150000 (matches source)
+      DDL match: OK
+
+[5/8] Table: ORDERS (depends on: CUSTOMER)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK o_custkey -> CUSTOMER.c_custkey: cycling mod(99996)+1 (66.7% coverage)
+  [A] Wrote generated/dbgen_files/ORDERS.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 1500000
+      Generating 1500000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/ORDERS.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`ORDERS`
+      Loading ORDERS.1.csv in 128MiB chunks (attempt 1/3)
+      Row count: 1500000 (matches source)
+      DDL match: OK
+
+[6/8] Table: SUPPLIER (depends on: NATION)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK s_nationkey -> NATION.n_nationkey: sparse (25 distinct values, deterministic weighted)
+  [A] Wrote generated/dbgen_files/SUPPLIER.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 10000
+      Generating 10000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/SUPPLIER.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`SUPPLIER`
+      Row count: 10000 (matches source)
+      DDL match: OK
+
+[7/8] Table: PARTSUPP (depends on: SUPPLIER, part)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK+PK ps_partkey -> part.p_partkey: source=200000, rows_per_value=4, min=1 -> div(rownum-1, 4)+1
+      FK+PK ps_suppkey -> SUPPLIER.s_suppkey: source=10000, cycling, min=1 -> mod(rownum-1, 10000)+1
+  [A] Wrote generated/dbgen_files/PARTSUPP.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 800000
+      Generating 800000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/PARTSUPP.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`PARTSUPP`
+      Row count: 800000 (matches source)
+      DDL match: OK
+
+[8/8] Table: LINEITEM (depends on: ORDERS, PARTSUPP)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      PK l_linenumber: synthetic frequency CASE (7 values)
+      FK+PK l_orderkey -> ORDERS.o_orderkey: cycling mod(1500000)+1
+      Composite FK l_partkey -> PARTSUPP.ps_partkey: n-cycling 800000 pairs, rows_per_value=4 -> div(mod(rownum-1, 800000), 4)+1
+      Composite FK l_suppkey -> PARTSUPP.ps_suppkey: n-cycling 800000 pairs, cycling mod 10000 -> mod(mod(rownum-1, 800000), 10000)+1
+  [A] Wrote generated/dbgen_files/LINEITEM.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 6001215
+      Generating 6001215 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/LINEITEM.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_dbgenx`.`LINEITEM`
+      Loading LINEITEM.1.csv in 128MiB chunks (attempt 1/3)
+      Row count: 6001215 (matches source)
+      DDL match: OK
+
+============================================================
+FINAL SUMMARY
+============================================================
+  part: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  region: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  NATION: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  CUSTOMER: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  ORDERS: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  SUPPLIER: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  PARTSUPP: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  LINEITEM: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+============================================================
+
+Total elapsed time: 6m 47.3s
+All tables passed validation.

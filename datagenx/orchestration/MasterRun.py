@@ -22,6 +22,7 @@ VERBOSE = True
 COMPARE_HISTOGRAMS = False  # Disabled by default - histogram comparison is unreliable
 SKIP_VALIDATION = True
 ROWS_OVERRIDE = False
+TABLES_FILTER = None  # Optional: comma-separated list of tables to process
 
 from datagenx.generation.GenerateDbgen import (
     annotate_table_with_histogram,
@@ -175,11 +176,13 @@ def discover_tables_and_dependencies(cursor, database):
     return all_tables, dependencies
 
 
-def regenerate_histograms_with_full_sampling(cursor, database):
+def regenerate_histograms_with_full_sampling(conn, cursor, database):
     """Regenerate all histograms with sampling_rate=1.0 for accurate num_distinct values.
 
     MySQL samples data when histogram_generation_max_mem_size is exceeded.
     We set it high enough to read all data, ensuring bucket[3] (num_distinct) is accurate.
+
+    Returns the (possibly refreshed) cursor.
     """
     print("Regenerating histograms with full sampling...")
 
@@ -197,7 +200,7 @@ def regenerate_histograms_with_full_sampling(cursor, database):
 
     if not columns_with_histograms:
         print("  No existing histograms found.")
-        return
+        return cursor
 
     # Group by table
     table_columns = {}
@@ -207,32 +210,47 @@ def regenerate_histograms_with_full_sampling(cursor, database):
         table_columns[table].append(column)
 
     # Regenerate histograms for each table
+    connection_lost = False
     for table, columns in table_columns.items():
         cols_str = ", ".join(f"`{c}`" for c in columns)
         sql = f"ANALYZE TABLE `{database}`.`{table}` UPDATE HISTOGRAM ON {cols_str} WITH 100 BUCKETS"
         try:
             cursor.execute(sql)
             cursor.fetchall()  # consume results
+            print(f"  {table}: OK")
         except Exception as e:
             print(f"  Warning: Failed to regenerate histogram for {table}: {e}")
+            if "Lost connection" in str(e) or "2013" in str(e):
+                connection_lost = True
             continue
 
-    # Verify sampling rates
-    cursor.execute("""
-        SELECT TABLE_NAME, MIN(HISTOGRAM->>'$."sampling-rate"') as min_rate
-        FROM information_schema.COLUMN_STATISTICS
-        WHERE SCHEMA_NAME = %s
-        GROUP BY TABLE_NAME
-        HAVING min_rate < 1.0
-    """, (database,))
-    low_sampling = cursor.fetchall()
+    # Reconnect if connection was lost during histogram regeneration
+    if connection_lost:
+        print("  Reconnecting after connection loss...")
+        cursor = _refresh_cursor(conn, cursor)
 
-    if low_sampling:
-        print(f"  Warning: {len(low_sampling)} tables still have sampling_rate < 1.0:")
-        for table, rate in low_sampling:
-            print(f"    {table}: {rate}")
-    else:
-        print(f"  All {len(table_columns)} tables now have sampling_rate = 1.0")
+    # Verify sampling rates
+    try:
+        cursor.execute("""
+            SELECT TABLE_NAME, MIN(HISTOGRAM->>'$."sampling-rate"') as min_rate
+            FROM information_schema.COLUMN_STATISTICS
+            WHERE SCHEMA_NAME = %s
+            GROUP BY TABLE_NAME
+            HAVING min_rate < 1.0
+        """, (database,))
+        low_sampling = cursor.fetchall()
+
+        if low_sampling:
+            print(f"  Warning: {len(low_sampling)} tables still have sampling_rate < 1.0:")
+            for table, rate in low_sampling:
+                print(f"    {table}: {rate}")
+        else:
+            print(f"  All {len(table_columns)} tables now have sampling_rate = 1.0")
+    except Exception as e:
+        print(f"  Warning: Could not verify sampling rates: {e}")
+        cursor = _refresh_cursor(conn, cursor)
+
+    return cursor
 
 
 def prepare_target_schema(cursor, target_schema):
@@ -511,22 +529,15 @@ def build_fk_appendages(cursor, table, extractor=None):
                     fk_pk_cycle_length *= source_distinct
 
         # Handle non-FK PK columns with mod() cycling
-        # Using mod() gives exact distinct count; no collision risk since
-        # product of all PK column distinct counts >> total rows
+        # MUST use mod() cycling (not frequency CASE) to ensure unique PK combinations
+        # when combined with FK+PK columns that also cycle
         non_fk_pk_cols = pk_columns - pk_fk_columns
         for col in non_fk_pk_cols:
             source_distinct = estimated_source_distinct(col)
             min_val = synthetic_pk_base()
-            if DB_TYPE == 'mysql' and source_distinct and source_distinct <= 100:
-                expr, freq_count = synthetic_frequency_case_expression(col)
-                if expr:
-                    print(f"      PK {col}: synthetic frequency CASE ({freq_count} values)")
-                else:
-                    expr = f"mod(rownum-1, {source_distinct})+{min_val}"
-                    print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
-            else:
-                expr = f"mod(rownum-1, {source_distinct})+{min_val}"
-                print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
+            # Always use mod() for composite PK to ensure uniqueness
+            expr = f"mod(rownum-1, {source_distinct})+{min_val}"
+            print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
             appendages[col] = expr
 
         for constraint_name, fk_cols in constraints.items():
@@ -847,9 +858,10 @@ def _mysql_cli_base_command():
         "--local-infile=1",
         "--connect-timeout=30",
         "-h", HOST,
-        "-P", str(DB_PORT),
         "-u", USER,
     ]
+    if DB_PORT is not None:
+        cmd.extend(["-P", str(DB_PORT)])
     if HOST.endswith("tidbcloud.com"):
         cmd.append("--ssl")
     return cmd
@@ -1210,7 +1222,7 @@ def step_c_create_insert_validate(cursor, table):
 # ----------------------------------------------------------------
 def main():
     # Make these global so they can be modified by CLI args
-    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE, DB_PORT, ROWS_OVERRIDE
+    global HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, ROWS_COUNT, DB_TYPE, DB_PORT, ROWS_OVERRIDE, TABLES_FILTER
 
     start_time = time.time()
 
@@ -1232,6 +1244,12 @@ def main():
 
     cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
     cursor.execute("SET time_zone = '+00:00'")
+
+    # Enable LOAD DATA LOCAL INFILE on server side (requires SUPER privilege)
+    try:
+        cursor.execute("SET GLOBAL local_infile = 1")
+    except Error:
+        pass  # May not have permission - will fail later if needed
 
     # --- Create extractor if needed ---
     extractor = None
@@ -1256,6 +1274,23 @@ def main():
         all_tables, dependencies = discover_tables_and_dependencies(cursor, SOURCE_SCHEMA)
         sorted_tables = topological_sort(all_tables, dependencies)
 
+    # --- Apply table filter if specified ---
+    if TABLES_FILTER:
+        requested_tables = {t.strip().lower() for t in TABLES_FILTER.split(',')}
+        available_tables = {t.lower(): t for t in sorted_tables}
+
+        # Check for non-existent tables
+        missing = requested_tables - set(available_tables.keys())
+        if missing:
+            print(f"WARNING: Requested tables not found in schema: {', '.join(sorted(missing))}")
+
+        # Filter sorted_tables while preserving order
+        sorted_tables = [t for t in sorted_tables if t.lower() in requested_tables]
+
+        if not sorted_tables:
+            print("ERROR: No valid tables to process after filtering.")
+            sys.exit(1)
+
     print("=" * 60)
     print(f"MASTER RUN — {SOURCE_SCHEMA} -> {TARGET_SCHEMA}")
     print("=" * 60)
@@ -1268,7 +1303,7 @@ def main():
 
     # --- Regenerate histograms with full sampling (MySQL only) ---
     if DB_TYPE == 'mysql':
-        regenerate_histograms_with_full_sampling(cursor, SOURCE_SCHEMA)
+        cursor = regenerate_histograms_with_full_sampling(conn, cursor, SOURCE_SCHEMA)
     print()
 
     # --- Process each table ---
@@ -1398,6 +1433,7 @@ if __name__ == "__main__":
     parser.add_argument("--source-schema", help="Source schema name (overrides config.py)")
     parser.add_argument("--target-schema", help="Target schema name (overrides config.py)")
     parser.add_argument("--rows", type=str, help="Number of rows to generate (overrides config.py)")
+    parser.add_argument("--tables", type=str, help="Comma-separated list of tables to process (default: all tables)")
 
     args = parser.parse_args()
     VERBOSE = args.verbose
@@ -1422,5 +1458,7 @@ if __name__ == "__main__":
     if args.rows:
         ROWS_COUNT = args.rows
         ROWS_OVERRIDE = True
+    if args.tables:
+        TABLES_FILTER = args.tables
 
     main()

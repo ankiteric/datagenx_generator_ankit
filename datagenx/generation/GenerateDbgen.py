@@ -1331,6 +1331,40 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             if hist
         }
 
+        # Pre-compute coordinated expressions for composite PKs (without FK info)
+        # This ensures unique PK combinations by having one column cycle and others group
+        composite_pk_expressions = {}
+        non_fk_pk_columns = primary_key_columns - set(foreign_keys.keys())
+        if len(non_fk_pk_columns) >= 2:
+            # Composite PK with multiple non-FK columns - need coordination
+            cursor.execute(f"SELECT COUNT(*) FROM `{database}`.`{table}`")
+            total_rows = cursor.fetchone()[0]
+
+            # Get distinct counts for each non-FK PK column
+            pk_info = []
+            for col in non_fk_pk_columns:
+                cursor.execute(f"SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`) FROM `{database}`.`{table}`")
+                distinct, min_val = cursor.fetchone()
+                min_val = min_val if min_val is not None else 1
+                try:
+                    min_val = int(min_val)
+                except (ValueError, TypeError):
+                    min_val = 1
+                pk_info.append((col, distinct, min_val))
+
+            # Sort by distinct count ASCENDING (smallest first cycles, largest groups)
+            pk_info.sort(key=lambda x: x[1])
+
+            # First column (smallest distinct) uses mod() cycling
+            cycling_col, cycling_distinct, cycling_min = pk_info[0]
+            composite_pk_expressions[cycling_col] = f"mod(rownum-1, {cycling_distinct}) + {cycling_min}"
+
+            # Remaining columns use div() grouping, coordinated with cycling column
+            # Use ceiling division to avoid over-generating distinct values
+            for col, distinct, min_val in pk_info[1:]:
+                rows_per_value = max(1, (total_rows + distinct - 1) // distinct)  # ceiling division
+                composite_pk_expressions[col] = f"div(rownum-1, {rows_per_value}) + {min_val}"
+
         new_lines = []
 
         for line in ddl.splitlines():
@@ -1347,6 +1381,10 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             # MasterRun.py may have generated expressions for FK, PK, or composite FK columns
             if col in generated_appendages:
                 synthetic = generated_appendages[col]
+
+            # 🟢 CHECK composite_pk_expressions for coordinated composite PK columns
+            elif col in composite_pk_expressions:
+                synthetic = composite_pk_expressions[col]
 
             # 🔴 FOREIGN KEY → use sparse or dense approach based on histogram type
             elif col in foreign_keys:
