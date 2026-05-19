@@ -3,7 +3,6 @@
 
 import argparse
 import html
-import json
 from pathlib import Path
 
 import mysql.connector
@@ -11,7 +10,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from config import HOST, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, USER
+from config import DB_PORT, DB_TYPE, HOST, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, USER
+from lib.schema_extractor import create_schema_extractor, connection_kwargs_for
 
 
 DEFAULT_COLUMNS = [
@@ -28,12 +28,30 @@ DEFAULT_COLUMNS = [
 
 
 def connect(args):
-    return mysql.connector.connect(
-        host=args.host,
-        user=args.user,
-        password=args.password,
+    database = args.database or args.source_schema
+    kwargs = connection_kwargs_for(
+        args.db_type,
+        args.host,
+        args.user,
+        args.password,
+        database,
+        args.port,
         autocommit=True,
     )
+    return mysql.connector.connect(**kwargs)
+
+
+def extractor_for_cursor(args, cursor, schema):
+    extractor = create_schema_extractor(
+        args.db_type,
+        args.host,
+        args.user,
+        args.password,
+        schema,
+        args.port,
+    )
+    extractor.cursor = cursor
+    return extractor
 
 
 def fetch_df(cursor, query, params=None):
@@ -105,6 +123,22 @@ def get_indexed_columns(cursor, schema, table):
     return set(df["COLUMN_NAME"].tolist())
 
 
+def get_primary_key_columns(cursor, schema, table):
+    df = fetch_df(
+        cursor,
+        """
+        SELECT COLUMN_NAME
+        FROM information_schema.key_column_usage
+        WHERE TABLE_SCHEMA = %s
+          AND TABLE_NAME = %s
+          AND CONSTRAINT_NAME = 'PRIMARY'
+        ORDER BY ORDINAL_POSITION
+        """,
+        (schema, table),
+    )
+    return df["COLUMN_NAME"].tolist()
+
+
 def is_string_type(col_type):
     col_type = (col_type or "").lower()
     return any(kind in col_type for kind in ("char", "varchar", "text", "blob"))
@@ -113,6 +147,14 @@ def is_string_type(col_type):
 def is_decimal_type(col_type):
     col_type = (col_type or "").lower()
     return any(kind in col_type for kind in ("decimal", "numeric"))
+
+
+def is_numeric_type(col_type):
+    col_type = (col_type or "").lower()
+    return any(
+        kind in col_type
+        for kind in ("int", "decimal", "numeric", "float", "double", "real", "bit")
+    )
 
 
 def get_row_counts(cursor, source_schema, target_schema, tables):
@@ -201,37 +243,84 @@ def histogram_diff(source_hist, target_hist):
     )
 
 
-def get_histograms(cursor, schema, table):
-    df = fetch_df(
-        cursor,
-        """
-        SELECT COLUMN_NAME, HISTOGRAM
-        FROM information_schema.column_statistics
-        WHERE SCHEMA_NAME = %s AND TABLE_NAME = %s
-        """,
-        (schema, table),
-    )
-    return {
-        row["COLUMN_NAME"]: json.loads(row["HISTOGRAM"])
-        for _, row in df.iterrows()
-        if row["HISTOGRAM"]
-    }
+def frequency_shape_diff(source_counts, target_counts):
+    source_total = sum(source_counts)
+    target_total = sum(target_counts)
+    if source_total <= 0 or target_total <= 0:
+        return 1.0
+    source_probs = sorted((count / source_total for count in source_counts), reverse=True)
+    target_probs = sorted((count / target_total for count in target_counts), reverse=True)
+    n = max(len(source_probs), len(target_probs))
+    source_probs = source_probs + [0.0] * (n - len(source_probs))
+    target_probs = target_probs + [0.0] * (n - len(target_probs))
+    return 0.5 * sum(abs(source_probs[i] - target_probs[i]) for i in range(n))
 
 
-def get_histogram_summary(cursor, source_schema, target_schema, tables):
+def get_frequency_counts(cursor, schema, table, column):
+    cursor.execute(f"""
+        SELECT COUNT(*) AS frequency
+        FROM `{schema}`.`{table}`
+        GROUP BY `{column}`
+    """)
+    return [int(row[0]) for row in cursor.fetchall()]
+
+
+def lookup_metric(df, table, column, value_col):
+    if df is None or df.empty:
+        return None
+    rows = df[(df["table"] == table) & (df["column"] == column)]
+    if rows.empty:
+        return None
+    value = rows[value_col].iloc[0]
+    if pd.isna(value):
+        return None
+    return int(value)
+
+
+def lookup_table_rows(df, table, value_col):
+    if df is None or df.empty:
+        return None
+    rows = df[df["table"] == table]
+    if rows.empty:
+        return None
+    value = rows[value_col].iloc[0]
+    if pd.isna(value):
+        return None
+    return int(value)
+
+
+def get_histograms(cursor, args, schema, table):
+    """Return histograms using the backend abstraction.
+
+    MySQL exposes INFORMATION_SCHEMA.COLUMN_STATISTICS. TiDB and SingleStore
+    expose different optimizer-statistics surfaces, so the report should not
+    read the MySQL table directly.
+    """
+    try:
+        extractor = extractor_for_cursor(args, cursor, schema)
+        return extractor.get_table_histograms(table)
+    except Exception as exc:
+        print(f"Warning: could not read histograms for {schema}.{table}: {exc}")
+        return {}
+
+
+def get_histogram_summary(cursor, args, source_schema, target_schema, tables, row_df=None, distinct_df=None):
     rows = []
     for table in tables:
-        source_hist = get_histograms(cursor, source_schema, table)
-        target_hist = get_histograms(cursor, target_schema, table)
+        source_hist = get_histograms(cursor, args, source_schema, table)
+        target_hist = get_histograms(cursor, args, target_schema, table)
         indexed_cols = get_indexed_columns(cursor, source_schema, table)
         column_types = get_column_types(cursor, source_schema, table)
         for col in sorted(set(source_hist) | set(target_hist)):
+            missing_histogram = False
             if col not in source_hist:
                 diff = 1.0
                 reason = "missing in source"
+                missing_histogram = True
             elif col not in target_hist:
                 diff = 1.0
                 reason = "missing in target"
+                missing_histogram = True
                 source_buckets = len(source_hist[col].get("buckets", []))
                 target_buckets = 0
                 source_histogram_type = source_hist[col].get("histogram-type", "unknown")
@@ -250,6 +339,25 @@ def get_histogram_summary(cursor, source_schema, target_schema, tables):
                 target_buckets = len(target_hist[col].get("buckets", []))
                 source_histogram_type = "missing"
                 target_histogram_type = target_hist[col].get("histogram-type", "unknown")
+            if missing_histogram:
+                source_rows = lookup_table_rows(row_df, table, "source_rows")
+                target_rows = lookup_table_rows(row_df, table, "target_rows")
+                source_distinct = lookup_metric(distinct_df, table, col, "source_distinct")
+                target_distinct = lookup_metric(distinct_df, table, col, "target_distinct")
+                max_rows = max(value for value in (source_rows, target_rows, 0) if value is not None)
+                max_distinct = max(value for value in (source_distinct, target_distinct, 0) if value is not None)
+                if (
+                    max_rows <= args.histogram_fallback_max_rows
+                    and max_distinct <= args.histogram_fallback_max_distinct
+                ):
+                    source_counts = get_frequency_counts(cursor, source_schema, table, col)
+                    target_counts = get_frequency_counts(cursor, target_schema, table, col)
+                    diff = frequency_shape_diff(source_counts, target_counts)
+                    source_buckets = len(source_counts)
+                    target_buckets = len(target_counts)
+                    source_histogram_type = "frequency-shape"
+                    target_histogram_type = "frequency-shape"
+                    reason = "histogram missing; exact frequency shape fallback"
             col_type = column_types.get(col, "unknown")
             indexed = col in indexed_cols
             if diff < 0.05:
@@ -351,37 +459,177 @@ def get_fk_orphans(cursor, source_schema, target_schema):
     return pd.DataFrame(rows)
 
 
-def get_row_overlap(cursor, source_schema, target_schema, tables):
+def get_row_overlap(
+    cursor,
+    source_schema,
+    target_schema,
+    tables,
+    db_type="mysql",
+    overlap_chunk_rows=500000,
+    tidb_overlap_strategy="auto",
+):
     rows = []
     for table in tables:
         columns = get_columns(cursor, source_schema, table)
         if not columns:
             continue
-        hash_expr = "MD5(CONCAT_WS('|', {}))".format(
-            ", ".join(f"COALESCE(CAST(`{col}` AS CHAR), '<NULL>')" for col in columns)
-        )
-        query = f"""
-            WITH source_rows AS (
-                SELECT {hash_expr} AS row_hash
-                FROM `{source_schema}`.`{table}`
-                GROUP BY row_hash
-            ),
-            target_rows AS (
-                SELECT {hash_expr} AS row_hash
-                FROM `{target_schema}`.`{table}`
-                GROUP BY row_hash
+        source_pk = get_primary_key_columns(cursor, source_schema, table)
+        target_pk = get_primary_key_columns(cursor, target_schema, table)
+        if source_pk and source_pk == target_pk:
+            cursor.execute(f"SELECT COUNT(*) FROM `{source_schema}`.`{table}`")
+            source_unique = cursor.fetchone()[0]
+            cursor.execute(f"SELECT COUNT(*) FROM `{target_schema}`.`{table}`")
+            target_unique = cursor.fetchone()[0]
+            column_types = get_column_types(cursor, source_schema, table)
+            join_expr = " AND ".join(
+                f"s.`{col}` <=> t.`{col}`"
+                for col in source_pk
             )
-            SELECT
-                (SELECT COUNT(*) FROM source_rows) AS source_unique_rows,
-                (SELECT COUNT(*) FROM target_rows) AS target_unique_rows,
-                (
-                    SELECT COUNT(*)
-                    FROM source_rows
-                    INNER JOIN target_rows USING (row_hash)
-                ) AS overlapping_unique_rows
-        """
-        cursor.execute(query)
-        source_unique, target_unique, overlap = cursor.fetchone()
+            equality_expr = " AND ".join(
+                f"s.`{col}` <=> t.`{col}`"
+                for col in columns
+            )
+            overlap = None
+            use_numeric_chunks = (
+                db_type == "tidb"
+                and source_unique > overlap_chunk_rows
+                and is_numeric_type(column_types.get(source_pk[0]))
+            )
+            if db_type == "tidb" and tidb_overlap_strategy == "mpp" and use_numeric_chunks:
+                pk_col = source_pk[0]
+                cursor.execute(f"SELECT MIN(`{pk_col}`), MAX(`{pk_col}`) FROM `{source_schema}`.`{table}`")
+                min_pk, max_pk = cursor.fetchone()
+                overlap = 0
+                if min_pk is not None and max_pk is not None:
+                    min_pk = int(min_pk)
+                    max_pk = int(max_pk)
+                    span = max_pk - min_pk + 1
+                    chunk_count = max(1, (int(source_unique) + overlap_chunk_rows - 1) // overlap_chunk_rows)
+                    chunk_width = max(1, (span + chunk_count - 1) // chunk_count)
+                    print(
+                        f"Running exact row overlap for {table} with TiFlash MPP in {chunk_count} primary-key chunks",
+                        flush=True,
+                    )
+                    chunk_index = 0
+                    chunk_start = min_pk
+                    while chunk_start <= max_pk:
+                        chunk_end = min(chunk_start + chunk_width, max_pk + 1)
+                        cursor.execute(
+                            f"""
+                            SELECT /*+ READ_FROM_STORAGE(TIFLASH[s,t]) HASH_JOIN(t) */ COUNT(*)
+                            FROM `{source_schema}`.`{table}` AS s
+                            INNER JOIN `{target_schema}`.`{table}` AS t
+                              ON {join_expr}
+                            WHERE {equality_expr}
+                              AND s.`{pk_col}` >= %s
+                              AND s.`{pk_col}` < %s
+                              AND t.`{pk_col}` >= %s
+                              AND t.`{pk_col}` < %s
+                            """,
+                            (chunk_start, chunk_end, chunk_start, chunk_end),
+                        )
+                        overlap += cursor.fetchone()[0] or 0
+                        chunk_index += 1
+                        if chunk_index == chunk_count or chunk_index % 10 == 0:
+                            print(
+                                f"  {table}: completed {chunk_index}/{chunk_count} MPP overlap chunks",
+                                flush=True,
+                            )
+                        chunk_start = chunk_end
+                reason = "primary-key TiFlash MPP chunked exact row comparison"
+            elif db_type == "tidb" and tidb_overlap_strategy == "mpp":
+                print(f"Running exact row overlap for {table} with TiFlash MPP", flush=True)
+                cursor.execute(f"""
+                    SELECT /*+ READ_FROM_STORAGE(TIFLASH[s,t]) HASH_JOIN(t) */ COUNT(*)
+                    FROM `{source_schema}`.`{table}` AS s
+                    INNER JOIN `{target_schema}`.`{table}` AS t
+                      ON {join_expr}
+                    WHERE {equality_expr}
+                """)
+                reason = "primary-key TiFlash MPP exact row comparison"
+            elif use_numeric_chunks:
+                pk_col = source_pk[0]
+                cursor.execute(f"SELECT MIN(`{pk_col}`), MAX(`{pk_col}`) FROM `{source_schema}`.`{table}`")
+                min_pk, max_pk = cursor.fetchone()
+                overlap = 0
+                if min_pk is not None and max_pk is not None:
+                    min_pk = int(min_pk)
+                    max_pk = int(max_pk)
+                    span = max_pk - min_pk + 1
+                    chunk_count = max(1, (int(source_unique) + overlap_chunk_rows - 1) // overlap_chunk_rows)
+                    chunk_width = max(1, (span + chunk_count - 1) // chunk_count)
+                    print(
+                        f"Running exact row overlap for {table} in {chunk_count} primary-key chunks",
+                        flush=True,
+                    )
+                    chunk_index = 0
+                    chunk_start = min_pk
+                    while chunk_start <= max_pk:
+                        chunk_end = min(chunk_start + chunk_width, max_pk + 1)
+                        cursor.execute(
+                            f"""
+                            SELECT /*+ INL_JOIN(t) */ COUNT(*)
+                            FROM `{source_schema}`.`{table}` AS s
+                            STRAIGHT_JOIN `{target_schema}`.`{table}` AS t USE INDEX (PRIMARY)
+                              ON {join_expr}
+                            WHERE {equality_expr}
+                              AND s.`{pk_col}` >= %s
+                              AND s.`{pk_col}` < %s
+                            """,
+                            (chunk_start, chunk_end),
+                        )
+                        overlap += cursor.fetchone()[0] or 0
+                        chunk_index += 1
+                        if chunk_index == chunk_count or chunk_index % 10 == 0:
+                            print(
+                                f"  {table}: completed {chunk_index}/{chunk_count} overlap chunks",
+                                flush=True,
+                            )
+                        chunk_start = chunk_end
+                reason = "primary-key chunked exact row comparison"
+            else:
+                if db_type == "tidb":
+                    print(f"Running exact row overlap for {table} without chunking", flush=True)
+                    cursor.execute(f"""
+                        SELECT /*+ INL_JOIN(t) */ COUNT(*)
+                        FROM `{source_schema}`.`{table}` AS s
+                        STRAIGHT_JOIN `{target_schema}`.`{table}` AS t USE INDEX (PRIMARY)
+                          ON {join_expr}
+                        WHERE {equality_expr}
+                    """)
+                    reason = "primary-key index nested-loop exact row comparison"
+                else:
+                    cursor.execute(f"""
+                        SELECT COUNT(*)
+                        FROM `{source_schema}`.`{table}` AS s
+                        INNER JOIN `{target_schema}`.`{table}` AS t
+                          ON {join_expr}
+                        WHERE {equality_expr}
+                    """)
+                    reason = "primary-key join exact row comparison"
+            if overlap is None:
+                overlap = cursor.fetchone()[0]
+        else:
+            reason = "hash exact row comparison"
+            hash_expr = "MD5(CONCAT_WS('|', {}))".format(
+                ", ".join(f"COALESCE(CAST(`{col}` AS CHAR), '<NULL>')" for col in columns)
+            )
+            cursor.execute(f"SELECT COUNT(DISTINCT {hash_expr}) FROM `{source_schema}`.`{table}`")
+            source_unique = cursor.fetchone()[0]
+            cursor.execute(f"SELECT COUNT(DISTINCT {hash_expr}) FROM `{target_schema}`.`{table}`")
+            target_unique = cursor.fetchone()[0]
+            cursor.execute(f"""
+                SELECT COUNT(*)
+                FROM (
+                    SELECT DISTINCT {hash_expr} AS row_hash
+                    FROM `{source_schema}`.`{table}`
+                ) AS source_rows
+                INNER JOIN (
+                    SELECT DISTINCT {hash_expr} AS row_hash
+                    FROM `{target_schema}`.`{table}`
+                ) AS target_rows USING (row_hash)
+            """)
+            overlap = cursor.fetchone()[0]
         denom = max(source_unique or 0, target_unique or 0, 1)
         overlap_pct = (overlap or 0) * 100 / denom
         rows.append({
@@ -391,8 +639,24 @@ def get_row_overlap(cursor, source_schema, target_schema, tables):
             "overlapping_unique_rows": overlap,
             "overlap_pct": overlap_pct,
             "status": "PASS" if overlap_pct < 1 else "NOTE",
+            "reason": reason,
         })
     return pd.DataFrame(rows)
+
+
+def get_skipped_overlap(tables, reason):
+    return pd.DataFrame([
+        {
+            "table": table,
+            "source_unique_rows": None,
+            "target_unique_rows": None,
+            "overlapping_unique_rows": None,
+            "overlap_pct": 0.0,
+            "status": "SKIP",
+            "reason": reason,
+        }
+        for table in tables
+    ])
 
 
 def figure_to_html(fig, include_plotlyjs=False):
@@ -400,7 +664,7 @@ def figure_to_html(fig, include_plotlyjs=False):
 
 
 def status_rank(status):
-    return {"FAIL": 3, "NOTE": 2, "PASS": 1}.get(status, 0)
+    return {"FAIL": 3, "NOTE": 2, "PASS": 1, "SKIP": 0}.get(status, 0)
 
 
 def worst_status(statuses):
@@ -417,8 +681,8 @@ def status_badge(status):
 
 def status_counts(df):
     if df.empty or "status" not in df:
-        return {"PASS": 0, "NOTE": 0, "FAIL": 0}
-    return {status: int((df["status"] == status).sum()) for status in ("PASS", "NOTE", "FAIL")}
+        return {"PASS": 0, "NOTE": 0, "FAIL": 0, "SKIP": 0}
+    return {status: int((df["status"] == status).sum()) for status in ("PASS", "NOTE", "FAIL", "SKIP")}
 
 
 def build_summary_cards(row_df, hist_df, distinct_df, orphan_df, overlap_df):
@@ -432,6 +696,7 @@ def build_summary_cards(row_df, hist_df, distinct_df, orphan_df, overlap_df):
     cards = ["<section><h2>Dashboard</h2><div class='cards'>"]
     for title, counts, subtitle in groups:
         overall = "FAIL" if counts["FAIL"] else "NOTE" if counts["NOTE"] else "PASS"
+        skip_html = f"<span class='skip'>SKIP {counts['SKIP']}</span>" if counts["SKIP"] else ""
         cards.append(
             "<div class='card'>"
             f"<div class='card-title'>{html.escape(title)}</div>"
@@ -440,6 +705,7 @@ def build_summary_cards(row_df, hist_df, distinct_df, orphan_df, overlap_df):
             f"<span class='pass'>PASS {counts['PASS']}</span>"
             f"<span class='note'>NOTE {counts['NOTE']}</span>"
             f"<span class='fail'>FAIL {counts['FAIL']}</span>"
+            f"{skip_html}"
             "</div>"
             f"<div class='card-subtitle'>{html.escape(subtitle)}</div>"
             "</div>"
@@ -599,7 +865,7 @@ def build_table_matrix_figure(matrix_df):
     if matrix_df.empty:
         return None
     metrics = ["rows", "histograms", "distinct", "fk_integrity", "privacy"]
-    status_to_value = {"PASS": 0, "NOTE": 1, "FAIL": 2}
+    status_to_value = {"SKIP": 0, "PASS": 1, "NOTE": 2, "FAIL": 3}
     z = [
         [status_to_value.get(row[metric], 0) for metric in metrics]
         for _, row in matrix_df.iterrows()
@@ -616,7 +882,9 @@ def build_table_matrix_figure(matrix_df):
             text=text,
             texttemplate="%{text}",
             colorscale=[
-                [0.0, "#2ca02c"],
+                [0.0, "#eeeeee"],
+                [0.24, "#eeeeee"],
+                [0.25, "#2ca02c"],
                 [0.49, "#2ca02c"],
                 [0.50, "#ffbf00"],
                 [0.74, "#ffbf00"],
@@ -624,7 +892,7 @@ def build_table_matrix_figure(matrix_df):
                 [1.0, "#d62728"],
             ],
             zmin=0,
-            zmax=2,
+            zmax=3,
             showscale=False,
         )
     )
@@ -645,8 +913,12 @@ def build_overlap_figure(overlap_df):
         x=df["overlap_pct"],
         y=df["table"],
         orientation="h",
-        marker_color=["#ffbf00" if status == "NOTE" else "#2ca02c" for status in df["status"]],
-        hovertemplate="%{y}<br>exact row overlap=%{x:.4f}%<extra></extra>",
+        marker_color=[
+            "#bdbdbd" if status == "SKIP" else "#ffbf00" if status == "NOTE" else "#2ca02c"
+            for status in df["status"]
+        ],
+        customdata=df[["status"]],
+        hovertemplate="%{y}<br>status=%{customdata[0]}<br>exact row overlap=%{x:.4f}%<extra></extra>",
     )
     fig.update_layout(
         title="Exact Row Overlap: Source vs Synthetic",
@@ -816,12 +1088,45 @@ def generate_report(args):
     conn = connect(args)
     cursor = conn.cursor()
     try:
+        if args.db_type == "tidb" and args.tidb_mem_quota_query:
+            cursor.execute("SET SESSION tidb_mem_quota_query = %s", (args.tidb_mem_quota_query,))
         tables = sorted(set(get_tables(cursor, args.source_schema)) & set(get_tables(cursor, args.target_schema)))
         row_df = get_row_counts(cursor, args.source_schema, args.target_schema, tables)
         distinct_df = get_distinct_summary(cursor, args.source_schema, args.target_schema, tables)
-        hist_df = get_histogram_summary(cursor, args.source_schema, args.target_schema, tables)
+        hist_df = get_histogram_summary(
+            cursor,
+            args,
+            args.source_schema,
+            args.target_schema,
+            tables,
+            row_df=row_df,
+            distinct_df=distinct_df,
+        )
         orphan_df = get_fk_orphans(cursor, args.source_schema, args.target_schema)
-        overlap_df = get_row_overlap(cursor, args.source_schema, args.target_schema, tables)
+        if args.skip_overlap:
+            overlap_df = get_skipped_overlap(
+                tables,
+                "skipped by --skip-overlap; exact row overlap hashes every row",
+            )
+        else:
+            tidb_mpp_enabled = False
+            try:
+                if args.db_type == "tidb" and args.tidb_overlap_strategy == "mpp":
+                    cursor.execute("SET SESSION tidb_allow_mpp = 1")
+                    cursor.execute("SET SESSION tidb_enforce_mpp = 1")
+                    tidb_mpp_enabled = True
+                overlap_df = get_row_overlap(
+                    cursor,
+                    args.source_schema,
+                    args.target_schema,
+                    tables,
+                    db_type=args.db_type,
+                    overlap_chunk_rows=args.overlap_chunk_rows,
+                    tidb_overlap_strategy=args.tidb_overlap_strategy,
+                )
+            finally:
+                if tidb_mpp_enabled:
+                    cursor.execute("SET SESSION tidb_enforce_mpp = 0")
         matrix_df = build_table_matrix(row_df, hist_df, distinct_df, orphan_df, overlap_df, tables)
 
         freq_map = {}
@@ -832,6 +1137,16 @@ def generate_report(args):
             cols = set(get_columns(cursor, args.source_schema, table))
             if column not in cols:
                 continue
+            distinct_rows = distinct_df[
+                (distinct_df["table"] == table) & (distinct_df["column"] == column)
+            ] if not distinct_df.empty else distinct_df
+            if not distinct_rows.empty:
+                max_distinct = max(
+                    int(distinct_rows["source_distinct"].iloc[0] or 0),
+                    int(distinct_rows["target_distinct"].iloc[0] or 0),
+                )
+                if max_distinct > args.max_frequency_values:
+                    continue
             df = get_frequency_df(cursor, args.source_schema, args.target_schema, table, column)
             if not df.empty and len(df) <= args.max_frequency_values:
                 freq_map[f"{table}.{column}"] = df
@@ -866,14 +1181,19 @@ def generate_report(args):
             ".badge.pass{background:#e7f5e7;color:#1d6b1d}",
             ".badge.note{background:#fff4cc;color:#805b00}",
             ".badge.fail{background:#fde2e2;color:#9b1c1c}",
-            ".pass{color:#1d6b1d}.note{color:#805b00}.fail{color:#9b1c1c}",
+            ".badge.skip{background:#eeeeee;color:#555}",
+            ".pass{color:#1d6b1d}.note{color:#805b00}.fail{color:#9b1c1c}.skip{color:#555}",
             ".data-table{border-collapse:collapse;width:100%;font-size:13px}",
             ".data-table th,.data-table td{border:1px solid #ddd;padding:6px;text-align:left}",
             ".data-table th{background:#f5f5f5}",
             "section{margin:32px 0;background:white;border:1px solid #eee;border-radius:8px;padding:18px}",
             "</style></head><body>",
             "<h1>DataGenX Validation Report</h1>",
-            f"<p class='meta'>Source: <code>{args.source_schema}</code> &nbsp; Target: <code>{args.target_schema}</code></p>",
+            (
+                f"<p class='meta'>Backend: <code>{html.escape(args.db_type)}</code> "
+                f"&nbsp; Source: <code>{html.escape(args.source_schema)}</code> "
+                f"&nbsp; Target: <code>{html.escape(args.target_schema)}</code></p>"
+            ),
             build_summary_cards(row_df, hist_df, distinct_df, orphan_df, overlap_df),
         ]
 
@@ -894,6 +1214,7 @@ def generate_report(args):
         ])
 
         output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("\n".join(html_parts))
         return output
     finally:
@@ -903,13 +1224,51 @@ def generate_report(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate an HTML DataGenX validation report.")
+    parser.add_argument("--db-type", default=DB_TYPE, choices=("mysql", "singlestore", "tidb"))
     parser.add_argument("--host", default=HOST)
+    parser.add_argument("--port", type=int, default=DB_PORT)
+    parser.add_argument("--database", default=None, help="Default database for the connection; defaults to source schema.")
     parser.add_argument("--user", default=USER)
     parser.add_argument("--password", default=PASSWORD)
     parser.add_argument("--source-schema", default=SOURCE_SCHEMA)
     parser.add_argument("--target-schema", default=TARGET_SCHEMA)
     parser.add_argument("--output", default="/tmp/tpch_validation_report.html")
     parser.add_argument("--max-frequency-values", type=int, default=100)
+    parser.add_argument(
+        "--histogram-fallback-max-rows",
+        type=int,
+        default=10000,
+        help="Maximum table rows for exact frequency-shape fallback when backend histograms are missing.",
+    )
+    parser.add_argument(
+        "--histogram-fallback-max-distinct",
+        type=int,
+        default=10000,
+        help="Maximum column NDV for exact frequency-shape fallback when backend histograms are missing.",
+    )
+    parser.add_argument(
+        "--tidb-mem-quota-query",
+        type=int,
+        default=None,
+        help="Optional TiDB session tidb_mem_quota_query override for heavy report queries.",
+    )
+    parser.add_argument(
+        "--skip-overlap",
+        action="store_true",
+        help="Skip exact source-vs-target row hash overlap checks for large schemas.",
+    )
+    parser.add_argument(
+        "--overlap-chunk-rows",
+        type=int,
+        default=500000,
+        help="Approximate TiDB primary-key range chunk size for exact row overlap checks.",
+    )
+    parser.add_argument(
+        "--tidb-overlap-strategy",
+        choices=("auto", "mpp"),
+        default="auto",
+        help="TiDB execution strategy for exact row overlap checks.",
+    )
     return parser.parse_args()
 
 
