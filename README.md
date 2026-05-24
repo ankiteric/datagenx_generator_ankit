@@ -194,7 +194,8 @@ MasterRun.py
 │   └── HOST, USER, PASSWORD, SOURCE_SCHEMA, TARGET_SCHEMA, DBGEN_BINARY, etc.
 │
 ├── lib/schema_extractor.py
-│   └── MySQLExtractor, SingleStoreExtractor (database abstraction layer)
+│   └── MySQLExtractor, SingleStoreExtractor, TiDBExtractor
+│       plus normalized optimizer-statistics model
 │
 ├── datagenx/generation/GenerateDbgen.py
 │   ├── annotate_table_with_histogram()  ← builds .dbgen templates (MySQL)
@@ -217,10 +218,30 @@ MasterRun.py
 | File | Purpose |
 |------|---------|
 | `config.py` | Connection settings and paths |
-| `lib/schema_extractor.py` | Database abstraction layer (MySQL/SingleStore) |
+| `lib/schema_extractor.py` | Database abstraction layer (MySQL/SingleStore/TiDB) and optimizer stats model |
 | `GenerateDbgen.py` | Core template generation logic |
 | `extract_schema.py` | SingleStore-specific extraction |
 | `PopulateNewTableAndValidate.py` | Validation helpers |
+
+### Optimizer Statistics Abstraction
+
+DataGenX normalizes backend-specific optimizer metadata before generation and
+validation. The shared objects are:
+
+```text
+ColumnOptimizerStats
+HistogramBucket
+TopNEntry
+```
+
+`TopNEntry` represents TopN/MCV-style frequent-value statistics as synthetic
+ordinals plus probability mass/count. It does not carry source literal values.
+MySQL singleton histograms are exposed as TopN-like entries, TiDB native
+`SHOW STATS_TOPN` rows map directly to `TopNEntry`, and SingleStore currently
+uses histogram metadata with room for a native MCV adapter when available.
+
+See [DataGenX Design](docs/DATAGENX_DESIGN.md) and
+[Implementation Guide](docs/DATAGENX_IMPLEMENTATION.md) for the detailed model.
 
 ## Testing
 
@@ -529,12 +550,20 @@ Histogram cloning is part of target creation, not validation. `MasterRun.py`
 clones histograms even when validation is skipped, because `validate.py stats`
 expects target histograms to exist.
 
+Composite keys of the form `PRIMARY KEY(parent_fk, sequence_col)` use grouped
+child generation. For example, TPC-H `lineitem(l_orderkey, l_linenumber)` is
+generated from the source line-count-per-order distribution so `l_linenumber`
+matches the source histogram while `(l_orderkey, l_linenumber)` remains unique.
+
 Histogram validation compares distribution shape, not literal bucket values.
 For each source/target histogram pair, validation extracts per-bucket frequency
 mass from MySQL's cumulative bucket probabilities, sorts those masses, pads
 missing buckets with zero, and compares the resulting bucket-frequency shape.
 This lets synthetic domains differ from source domains while still checking
 bucket count and frequency drift.
+
+TopN/MCV statistics follow the same privacy rule: compare or generate from
+probability mass and rank/ordinal, not from original literal values.
 
 More detail: [Histogram Comparison](docs/HISTOGRAM_COMPARISON.md).
 

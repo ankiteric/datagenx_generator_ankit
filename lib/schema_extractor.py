@@ -4,9 +4,54 @@ import json
 import os
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 import mysql.connector
 from mysql.connector import Error
+
+
+@dataclass(frozen=True)
+class HistogramBucket:
+    """Database-neutral optimizer histogram bucket.
+
+    The optional bounds are optimizer metadata and must be treated as source
+    statistics, not as values to emit into generated synthetic data.
+    """
+
+    ordinal: int
+    frequency: float
+    cumulative_frequency: float
+    num_distinct: Optional[int] = None
+    lower_bound: Optional[Any] = None
+    upper_bound: Optional[Any] = None
+
+
+@dataclass(frozen=True)
+class TopNEntry:
+    """Database-neutral TopN/MCV entry.
+
+    `ordinal` is the stable synthetic identity used by DataGenX. Adapter
+    implementations intentionally do not expose source literal values here.
+    """
+
+    ordinal: int
+    frequency: float
+    count: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ColumnOptimizerStats:
+    """Optimizer-visible statistics for one column, normalized across engines."""
+
+    database_type: str
+    table: str
+    column: str
+    row_count: Optional[int] = None
+    ndv: Optional[int] = None
+    histogram_type: Optional[str] = None
+    histogram_buckets: Optional[List[HistogramBucket]] = None
+    topn: Optional[List[TopNEntry]] = None
 
 
 class StatisticsExtractor(ABC):
@@ -32,6 +77,45 @@ class StatisticsExtractor(ABC):
     def get_column_cardinalities(self, table):
         """Return optimizer cardinality estimates keyed by column name."""
         pass
+
+    def get_column_topn(self, table, column):
+        """Return TopN/MCV entries as source-value-free optimizer stats.
+
+        Engines with explicit TopN/MCV catalogs should override this. The
+        default maps singleton histograms to TopN-like entries because a
+        singleton histogram stores one bucket per frequent/distinct value.
+        """
+        histogram = self.get_column_histogram(table, column)
+        return _topn_entries_from_histogram(histogram)
+
+    def get_column_optimizer_stats(self, table, column):
+        """Return normalized optimizer statistics for one column."""
+        histogram = self.get_column_histogram(table, column)
+        histogram_buckets = _histogram_buckets_from_histogram(histogram)
+        cardinalities = self.get_column_cardinalities(table)
+        ndv = cardinalities.get(column)
+        if ndv is None and histogram_buckets:
+            ndv = sum(
+                bucket.num_distinct or 1
+                for bucket in histogram_buckets
+            )
+        return ColumnOptimizerStats(
+            database_type=self.__class__.__name__.replace("Extractor", "").lower(),
+            table=table,
+            column=column,
+            row_count=self.get_table_cardinality(table).get("row_count"),
+            ndv=ndv,
+            histogram_type=(histogram or {}).get("histogram-type"),
+            histogram_buckets=histogram_buckets,
+            topn=self.get_column_topn(table, column),
+        )
+
+    def get_table_optimizer_stats(self, table):
+        """Return normalized optimizer statistics for all columns in a table."""
+        return {
+            column: self.get_column_optimizer_stats(table, column)
+            for column in self.get_columns(table)
+        }
 
     @abstractmethod
     def get_index_cardinality(self, table):
@@ -551,6 +635,36 @@ class TiDBExtractor(SchemaExtractor):
                 cardinalities[column] = _safe_int(distinct_count, default=0)
         return cardinalities
 
+    def get_column_topn(self, table, column):
+        """Return TiDB TopN entries without exposing source literal values."""
+        rows = self._show_stats_rows(
+            "SHOW STATS_TOPN",
+            table=table,
+            column=column,
+            is_index=False,
+        )
+        if not rows:
+            return super().get_column_topn(table, column)
+
+        counts = [
+            _safe_int(row.get("count"), default=0)
+            for row in rows
+        ]
+        total = sum(counts)
+        if total <= 0:
+            return []
+
+        entries = []
+        for ordinal, count in enumerate(counts, start=1):
+            if count <= 0:
+                continue
+            entries.append(TopNEntry(
+                ordinal=ordinal,
+                frequency=count / total,
+                count=count,
+            ))
+        return entries
+
     def get_index_cardinality(self, table):
         """Return TiDB index NDV estimates keyed by index name."""
         index_stats = {
@@ -742,8 +856,75 @@ def _index_rows_to_cardinality(rows):
     return indexes
 
 
+def _histogram_buckets_from_histogram(histogram):
+    """Convert a native-ish histogram dict to neutral bucket objects."""
+    if not histogram:
+        return []
+
+    hist_type = histogram.get("histogram-type")
+    buckets = histogram.get("buckets") or []
+    converted = []
+    previous = 0.0
+
+    for ordinal, bucket in enumerate(buckets, start=1):
+        if hist_type == "singleton":
+            if len(bucket) < 2:
+                continue
+            cumulative = _safe_float(bucket[1], default=previous)
+            converted.append(HistogramBucket(
+                ordinal=ordinal,
+                lower_bound=bucket[0],
+                upper_bound=bucket[0],
+                frequency=max(0.0, cumulative - previous),
+                cumulative_frequency=cumulative,
+                num_distinct=1,
+            ))
+            previous = cumulative
+            continue
+
+        if hist_type == "equi-height":
+            if len(bucket) < 4:
+                continue
+            cumulative = _safe_float(bucket[-2], default=previous)
+            converted.append(HistogramBucket(
+                ordinal=ordinal,
+                lower_bound=bucket[0],
+                upper_bound=bucket[1],
+                frequency=max(0.0, cumulative - previous),
+                cumulative_frequency=cumulative,
+                num_distinct=_safe_int(bucket[-1], default=1),
+            ))
+            previous = cumulative
+
+    return converted
+
+
+def _topn_entries_from_histogram(histogram):
+    """Expose singleton histograms as TopN-like entries without raw values."""
+    buckets = _histogram_buckets_from_histogram(histogram)
+    if not buckets or (histogram or {}).get("histogram-type") != "singleton":
+        return []
+    return [
+        TopNEntry(
+            ordinal=bucket.ordinal,
+            frequency=bucket.frequency,
+            count=None,
+        )
+        for bucket in buckets
+    ]
+
+
 def _normalize_column_name(name):
     return str(name).strip().lower()
+
+
+def _safe_float(value, default=0.0):
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _safe_int(value, default=0):

@@ -253,8 +253,12 @@ def regenerate_histograms_with_full_sampling(conn, cursor, database):
     return cursor
 
 
-def prepare_target_schema(cursor, target_schema):
-    """Create target schema; drop all existing tables if any."""
+def prepare_target_schema(cursor, target_schema, tables_to_drop=None):
+    """Create target schema and drop existing target tables.
+
+    When a table filter is active, only drop those target tables so referenced
+    parent tables remain available for FK creation and expression generation.
+    """
     cursor.execute(
         "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = %s",
         (target_schema,),
@@ -268,6 +272,9 @@ def prepare_target_schema(cursor, target_schema):
             WHERE TABLE_SCHEMA = %s AND TABLE_TYPE = 'BASE TABLE'
         """, (target_schema,))
         tables = [t[0] for t in cursor.fetchall()]
+        if tables_to_drop is not None:
+            requested = {table.lower() for table in tables_to_drop}
+            tables = [table for table in tables if table.lower() in requested]
 
         if tables:
             print(f"Dropping {len(tables)} existing table(s) in `{target_schema}`...")
@@ -431,6 +438,138 @@ def build_fk_appendages(cursor, table, extractor=None):
     end"""
         return expression, len(frequencies)
 
+    def build_grouped_parent_sequence_appendages():
+        """Build expressions for parent-FK plus sequence composite PKs.
+
+        Pattern:
+            PRIMARY KEY(parent_fk, sequence_col)
+            parent_fk references a parent table
+            sequence_col is a small integer position within each parent group
+
+        TPC-H lineitem is the canonical example:
+            PRIMARY KEY(l_orderkey, l_linenumber)
+
+        Independent cycling preserves uniqueness but makes l_linenumber uniform.
+        Grouped generation preserves the source distribution of child rows per
+        parent, which naturally preserves the sequence-column histogram.
+        """
+        if not is_composite_pk or not has_pk_fk_columns or not has_non_fk_pk_columns:
+            return None
+        if len(pk_fk_columns) != 1 or len(pk_columns - pk_fk_columns) != 1:
+            return None
+
+        parent_col = next(iter(pk_fk_columns))
+        sequence_col = next(iter(pk_columns - pk_fk_columns))
+
+        # Only apply this to integer-like sequence columns. Other non-FK PK
+        # columns can keep the existing generic composite-PK fallback.
+        cursor.execute("""
+            SELECT DATA_TYPE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s AND COLUMN_NAME = %s
+        """, (SOURCE_SCHEMA, table, sequence_col))
+        row = cursor.fetchone()
+        sequence_type = row[0].lower() if row and row[0] else ""
+        if sequence_type not in {"tinyint", "smallint", "mediumint", "int", "bigint"}:
+            return None
+
+        parent_fk = None
+        for fk_cols in constraints.values():
+            if len(fk_cols) == 1 and fk_cols[0][0] == parent_col:
+                parent_fk = fk_cols[0]
+                break
+        if parent_fk is None:
+            return None
+
+        _, ref_table, ref_col = parent_fk
+        actual_ref = tgt_canonical.get(ref_table.lower())
+        if actual_ref is None:
+            return None
+
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT `{ref_col}`), MIN(`{ref_col}`) "
+            f"FROM `{TARGET_SCHEMA}`.`{actual_ref}`"
+        )
+        parent_count, parent_min = cursor.fetchone()
+        parent_count = parent_count or 0
+        parent_min = parent_min if parent_min is not None else synthetic_pk_base()
+        if parent_count <= 0:
+            return None
+
+        cursor.execute(f"""
+            SELECT group_size, COUNT(*) AS parent_groups
+            FROM (
+                SELECT `{parent_col}`, COUNT(*) AS group_size
+                FROM `{SOURCE_SCHEMA}`.`{table}`
+                WHERE `{parent_col}` IS NOT NULL
+                  AND `{sequence_col}` IS NOT NULL
+                GROUP BY `{parent_col}`
+            ) grouped
+            GROUP BY group_size
+            ORDER BY group_size
+        """)
+        group_distribution = [
+            (int(group_size), int(parent_groups))
+            for group_size, parent_groups in cursor.fetchall()
+            if group_size and parent_groups
+        ]
+        if not group_distribution:
+            return None
+
+        total_groups = sum(parent_groups for _, parent_groups in group_distribution)
+        total_rows = sum(group_size * parent_groups for group_size, parent_groups in group_distribution)
+        if total_rows != source_row_count:
+            print(
+                f"      Grouped PK {parent_col},{sequence_col}: "
+                f"SKIPPED (group rows {total_rows} != source rows {source_row_count})"
+            )
+            return None
+        if total_groups > parent_count:
+            print(
+                f"      Grouped PK {parent_col},{sequence_col}: "
+                f"SKIPPED (needs {total_groups} parent keys, target has {parent_count})"
+            )
+            return None
+
+        parent_case_lines = []
+        sequence_case_lines = []
+        cumulative_rows = 0
+        parent_offset = 0
+        max_group_size = 1
+
+        for group_size, parent_groups in group_distribution:
+            max_group_size = max(max_group_size, group_size)
+            band_start = cumulative_rows + 1
+            band_rows = group_size * parent_groups
+            cumulative_rows += band_rows
+            parent_start = parent_min + parent_offset
+            parent_offset += parent_groups
+            local_row = f"rownum-{band_start}"
+
+            parent_expr = f"{parent_start}+div({local_row},{group_size})"
+            sequence_expr = f"mod({local_row},{group_size})+{synthetic_pk_base()}"
+            parent_case_lines.append(f"when rownum <= {cumulative_rows} then {parent_expr}")
+            sequence_case_lines.append(f"when rownum <= {cumulative_rows} then {sequence_expr}")
+
+        parent_fallback = parent_min + max(total_groups - 1, 0)
+        sequence_fallback = max_group_size
+        result = {
+            parent_col: f"""case
+    {' '.join(parent_case_lines)}
+    else {parent_fallback}
+    end""",
+            sequence_col: f"""case
+    {' '.join(sequence_case_lines)}
+    else {sequence_fallback}
+    end""",
+        }
+        print(
+            f"      Grouped PK {parent_col},{sequence_col}: "
+            f"{total_groups} parent groups, group sizes "
+            f"{', '.join(f'{size}x{groups}' for size, groups in group_distribution)}"
+        )
+        return result
+
     if all_pk_are_fk:
         # Composite PK where all columns are FKs (e.g., PARTSUPP, inventory)
         # Collect info for all PK+FK columns across all constraints
@@ -520,6 +659,10 @@ def build_fk_appendages(cursor, table, extractor=None):
         # Non-FK PK columns use div() grouping to coordinate (avoid PK collisions)
         # Composite FKs (not in PK) use n-cycling to generate valid pairs
 
+        grouped_appendages = build_grouped_parent_sequence_appendages()
+        if grouped_appendages:
+            appendages.update(grouped_appendages)
+
         # First, calculate the cycle length for FK+PK columns (product of their distinct counts)
         fk_pk_cycle_length = 1
         for constraint_name, fk_cols in constraints.items():
@@ -533,6 +676,8 @@ def build_fk_appendages(cursor, table, extractor=None):
         # when combined with FK+PK columns that also cycle
         non_fk_pk_cols = pk_columns - pk_fk_columns
         for col in non_fk_pk_cols:
+            if col in appendages:
+                continue
             source_distinct = estimated_source_distinct(col)
             min_val = synthetic_pk_base()
             # Always use mod() for composite PK to ensure uniqueness
@@ -547,6 +692,8 @@ def build_fk_appendages(cursor, table, extractor=None):
 
             # Handle FK+PK columns with mod() cycling
             for col, ref_table, ref_col in pk_cols_in_constraint:
+                if col in appendages:
+                    continue
                 actual_ref = tgt_canonical.get(ref_table.lower())
                 if actual_ref is None:
                     continue
@@ -1298,7 +1445,11 @@ def main():
     print()
 
     # --- Prepare target schema ---
-    prepare_target_schema(cursor, TARGET_SCHEMA)
+    prepare_target_schema(
+        cursor,
+        TARGET_SCHEMA,
+        tables_to_drop=sorted_tables if TABLES_FILTER else None,
+    )
     print()
 
     # --- Regenerate histograms with full sampling (MySQL only) ---

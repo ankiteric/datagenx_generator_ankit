@@ -13,7 +13,7 @@ For implementation details, see [DATAGENX_IMPLEMENTATION.md](DATAGENX_IMPLEMENTA
 │   INPUT: Metadata   │ ──▶  │  PROCESS: Annotate  │ ──▶  │  OUTPUT: .dbgen     │
 │                     │      │                     │      │                     │
 │ • Schema DDL        │      │ • Column classify   │      │ • Valid SQL DDL     │
-│ • Histograms        │      │ • Expression gen    │      │ • Inline expressions│
+│ • Optimizer stats   │      │ • Expression gen    │      │ • Inline expressions│
 │ • Row counts        │      │ • Privacy filter    │      │ • Ready for dbgen   │
 │ • Distinct counts   │      │                     │      │                     │
 └─────────────────────┘      └─────────────────────┘      └─────────────────────┘
@@ -24,12 +24,27 @@ For implementation details, see [DATAGENX_IMPLEMENTATION.md](DATAGENX_IMPLEMENTA
 | Metadata Type | Source | Purpose |
 |---------------|--------|---------|
 | Schema DDL | `SHOW CREATE TABLE` | Column types, constraints, PKs, FKs |
-| Histograms | `information_schema.column_statistics` | Distribution shapes and weights |
-| Row counts | `SELECT COUNT(*)` | Scaling, small-table detection |
-| Distinct counts | `SELECT COUNT(DISTINCT col)` | FK coverage, cardinality matching |
+| Histograms | Optimizer statistics adapter | Distribution shapes, bucket weights, bucket NDV |
+| TopN / MCV | Optimizer statistics adapter | Frequent-value probability mass without exposing source literals |
+| Row counts | Optimizer statistics or `SELECT COUNT(*)` | Scaling, small-table detection |
+| Distinct counts | Optimizer statistics or `SELECT COUNT(DISTINCT col)` | FK coverage, cardinality matching |
 | FK relationships | `information_schema.KEY_COLUMN_USAGE` | Reference graph, topological sort |
 
-**Histogram Structure (MySQL):**
+DataGenX does not treat TopN/MCV as a MySQL-specific feature. It normalizes
+engine-specific statistics into a common optimizer-statistics model:
+
+| Model Object | Meaning |
+|--------------|---------|
+| `ColumnOptimizerStats` | All optimizer-visible stats for one column |
+| `HistogramBucket` | Bucket ordinal, probability mass, cumulative probability, and optional NDV |
+| `TopNEntry` | Frequent-value ordinal, probability mass, and optional count |
+
+The key rule is that the neutral model uses ordinals and probabilities for
+generation. Source literal values are not exposed through `TopNEntry`; a backend
+adapter may read native values internally, but DataGenX should emit synthetic
+domain values.
+
+**Native MySQL histogram shape before normalization:**
 ```json
 {
   "histogram-type": "singleton" | "equi-height",
@@ -39,6 +54,13 @@ For implementation details, see [DATAGENX_IMPLEMENTATION.md](DATAGENX_IMPLEMENTA
   ]
 }
 ```
+
+For MySQL, singleton histograms are treated as TopN-like/MCV-like statistics:
+one bucket corresponds to one distinct/frequent value and cumulative
+probabilities are converted to per-value probability masses. TiDB can expose
+native TopN through its statistics tables, and the TiDB adapter maps those rows
+to `TopNEntry`. SingleStore can use its histogram metadata and can add a native
+TopN adapter when that metadata is available.
 
 ## 3. Output: Annotated DDL (.dbgen)
 
@@ -77,6 +99,7 @@ CREATE TABLE `table_name` (
 │    │                                                            │
 │    ├── PRIMARY KEY?                                             │
 │    │     ├── Single PK ──────────▶ rownum                       │
+│    │     ├── Parent+sequence PK ─▶ grouped child generation     │
 │    │     └── Composite PK ───────▶ div/mod cycling              │
 │    │                                                            │
 │    ├── FOREIGN KEY?                                             │
@@ -94,23 +117,40 @@ CREATE TABLE `table_name` (
 │    │                                                            │
 │    └── STRING?                                                  │
 │          ├── Low cardinality ─────▶ weighted CASE (synthetic)   │
-│          └── High cardinality ────▶ rand.regex('[a-z]{len}')    │
+│          └── High cardinality ────▶ bucket NDV synthetic cycling│
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+Parent-plus-sequence composite keys need special handling. In schemas such as
+TPC-H, `lineitem` has `PRIMARY KEY (l_orderkey, l_linenumber)`, where
+`l_orderkey` is a parent FK and `l_linenumber` is the child position within that
+order. Generating both columns independently keeps the key unique, but it makes
+`l_linenumber` uniform. DataGenX therefore learns the source child-counts per
+parent, for example how many orders have 1, 2, ..., 7 lineitems, and emits
+synthetic parent groups with sequence values `1..k` inside each group. This
+preserves the sequence-column histogram, the parent-child fanout distribution,
+referential integrity, and primary-key uniqueness.
 
 ## 5. Privacy Guarantees
 
 **Used (Statistical Patterns):**
 - Distribution shapes (histogram bucket weights)
+- TopN/MCV probability masses
+- Bucket distinct counts
 - Cardinality counts
 - Row counts
 - Column metadata (types, lengths)
 
-**Never Used (Data Values):**
-- Actual values from histograms (dates, numbers, strings)
+**Never Emitted Into Synthetic Data:**
+- Actual values from histograms or TopN/MCV catalogs
 - MIN/MAX from source data
 - Row samples from source tables
+
+Some database adapters may need to read native optimizer statistic values to
+decode histograms or estimate string lengths. Those values are treated as
+metadata inputs only. Generated values are mapped to synthetic ordinals such as
+`column_1`, `column_2`, or synthetic numeric/date ranges.
 
 **Example - Date Column:**
 ```
@@ -137,5 +177,5 @@ After generation, DataGenX validates synthetic data across 5 dimensions:
 | Database | Extractor | Histogram Source |
 |----------|-----------|------------------|
 | MySQL | `MySQLExtractor` | `information_schema.column_statistics` |
-| SingleStore | `SingleStoreExtractor` | `information_schema.column_statistics` |
-| TiDB | `TiDBExtractor` | `SHOW STATS_HISTOGRAMS` / `SHOW STATS_BUCKETS` |
+| SingleStore | `SingleStoreExtractor` | `information_schema.ADVANCED_HISTOGRAMS` or compatible column statistics |
+| TiDB | `TiDBExtractor` | `SHOW STATS_HISTOGRAMS` / `SHOW STATS_BUCKETS` / `SHOW STATS_TOPN` |

@@ -21,6 +21,7 @@ This document describes the implementation details of DataGenX. For the high-lev
 │ • MySQLExtractor  │ │               │ │ • ValidateTableStats  │
 │ • SingleStore...  │ │ • annotate()  │ │ • compare_plans       │
 │ • TiDBExtractor   │ │ • histogram() │ │ • validation_report   │
+│ • OptimizerStats  │ │ • topn/mcv    │ │                       │
 └───────────────────┘ │ • fk_expr()   │ └───────────────────────┘
                       └───────────────┘
 ```
@@ -30,27 +31,55 @@ This document describes the implementation details of DataGenX. For the high-lev
 **Abstract Interface:** `lib/schema_extractor.py`
 
 ```python
+@dataclass(frozen=True)
+class HistogramBucket:
+    ordinal: int
+    frequency: float
+    cumulative_frequency: float
+    num_distinct: Optional[int] = None
+
+@dataclass(frozen=True)
+class TopNEntry:
+    ordinal: int
+    frequency: float
+    count: Optional[int] = None
+
+@dataclass(frozen=True)
+class ColumnOptimizerStats:
+    database_type: str
+    table: str
+    column: str
+    row_count: Optional[int]
+    ndv: Optional[int]
+    histogram_type: Optional[str]
+    histogram_buckets: List[HistogramBucket]
+    topn: List[TopNEntry]
+
 class SchemaExtractor(ABC):
     @abstractmethod
-    def get_tables(self, schema: str) -> List[str]
+    def get_tables(self) -> List[str]
 
     @abstractmethod
-    def get_columns(self, schema: str, table: str) -> List[Tuple[str, str]]
+    def get_columns(self, table: str) -> Dict[str, str]
 
     @abstractmethod
-    def get_primary_keys(self, schema: str, table: str) -> List[str]
+    def get_primary_keys(self, table: str) -> Set[str]
 
     @abstractmethod
-    def get_foreign_keys(self, schema: str, table: str) -> Dict[str, Tuple[str, str]]
+    def get_foreign_keys(self, table: str) -> Dict[str, Tuple[str, str]]
 
     @abstractmethod
-    def get_table_ddl(self, schema: str, table: str) -> str
+    def get_table_ddl(self, table: str) -> str
 
     @abstractmethod
-    def get_column_histogram(self, schema: str, table: str, column: str) -> Optional[dict]
+    def get_column_histogram(self, table: str, column: str) -> Optional[dict]
+
+    def get_column_topn(self, table: str, column: str) -> List[TopNEntry]
+
+    def get_column_optimizer_stats(self, table: str, column: str) -> ColumnOptimizerStats
 
     @abstractmethod
-    def get_table_dependencies(self, schema: str) -> Dict[str, List[str]]
+    def get_table_dependencies(self) -> Dict[str, List[str]]
 ```
 
 **Data Flow:**
@@ -63,9 +92,24 @@ class SchemaExtractor(ABC):
    b. get_columns()       → Column names + types
    c. get_primary_keys()  → PK columns
    d. get_foreign_keys()  → FK relationships
-   e. get_column_histogram() → Per-column statistics
+   e. get_column_optimizer_stats() → Per-column histograms, TopN/MCV, NDV
 4. annotate_table_with_histogram() → Generate .dbgen
 ```
+
+The extractor layer is the adapter boundary for database-specific optimizer
+metadata. MySQL, TiDB, and SingleStore may expose different native catalogs, but
+generation and validation should consume the normalized `ColumnOptimizerStats`
+model where possible.
+
+| Engine | Native Input | DataGenX Mapping |
+|--------|--------------|------------------|
+| MySQL | Singleton histogram buckets | `TopNEntry` ordinals with bucket probability masses |
+| TiDB | `SHOW STATS_TOPN` | `TopNEntry` ordinals with native counts and probability masses |
+| SingleStore | Histogram metadata today | `HistogramBucket`; native MCV support can map to `TopNEntry` |
+
+`TopNEntry` intentionally does not contain the original literal value. It stores
+a synthetic ordinal plus frequency/count, so preserving frequent-value shape
+does not require preserving frequent-value text, dates, or numbers.
 
 ## 3. MySQL-Specific Layer
 
@@ -109,6 +153,12 @@ def get_distinct_count(self, schema, table, column):
     return cursor.fetchone()[0]
 ```
 
+Where supported, distinct counts should come from optimizer statistics instead
+of full table scans. TiDB maps `SHOW STATS_HISTOGRAMS.distinct_count`; MySQL can
+derive approximate NDV from histogram bucket metadata when a histogram exists,
+and falls back to exact counts only where the current generation decision
+requires it.
+
 ## 4. Expression Generation (GenerateDbgen.py)
 
 **Main Entry Point:**
@@ -136,6 +186,7 @@ def annotate_table_with_histogram(host, user, password, database, table,
 | `build_single_fk_expression()` | FK | sparse CASE or `rand.range()` |
 | `histogram_to_case()` | Numeric (equi-height) | Bucket-cycling CASE |
 | `string_values_to_case()` | String (low card) | Weighted CASE with synthetic values |
+| `string_histogram_to_case()` | String (high card) | Bucket NDV cycling with synthetic values |
 | `get_date_range_expression()` | Date | `TIMESTAMP + INTERVAL rand.range()` |
 
 **Histogram to CASE (Numeric):**
@@ -173,6 +224,16 @@ def string_values_to_case(value_counts, column_name, col_length):
     """
 ```
 
+**High-Cardinality String Histograms:**
+```python
+def string_histogram_to_case(histogram_info, column_name, max_length, row_count):
+    """
+    Use equi-height bucket probability and bucket num_distinct from optimizer
+    statistics to generate synthetic strings such as column_1, column_2, ...
+    without collapsing a high-NDV string column to one value per bucket.
+    """
+```
+
 ## 5. FK Expression Generation (MasterRun.py)
 
 **Pre-computation in MasterRun:**
@@ -206,6 +267,32 @@ def build_composite_fk_expression(columns, ref_table, ref_row_count):
     ps_suppkey = mod(rownum-1, 10000) + 1   # cycling
     """
 ```
+
+**Grouped Parent + Sequence Composite PK:**
+```python
+def build_grouped_parent_sequence_appendages():
+    """
+    Detect PRIMARY KEY(parent_fk, sequence_col), where parent_fk references a
+    parent table and sequence_col is an integer position inside each parent
+    group. Generate both columns from the source child-count-per-parent
+    distribution.
+
+    Example: TPC-H lineitem(l_orderkey, l_linenumber)
+      - preserve number of lineitems per order
+      - generate l_linenumber as 1..k within each order
+      - preserve PK uniqueness and FK validity
+    """
+```
+
+For TPC-H 0.01 this learns:
+
+```text
+1x2100, 2x2183, 3x2091, 4x2188, 5x2117, 6x2148, 7x2173
+```
+
+That means 2100 orders have one lineitem, 2183 orders have two lineitems, and
+so on. The generated target then matches both the `l_linenumber` histogram and
+the `orders -> lineitem` fanout distribution.
 
 ## 6. Processing Pipeline
 
