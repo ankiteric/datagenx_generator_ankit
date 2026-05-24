@@ -162,15 +162,26 @@ Output:          2000-01-01 to 2004-01-01 (synthetic range, same span)
 
 ## 6. Validation Dimensions
 
-After generation, DataGenX validates synthetic data across 5 dimensions:
+After generation, DataGenX validates synthetic data across data-level and
+optimizer-level dimensions:
 
-| Check | What It Measures | Pass Criteria |
-|-------|------------------|---------------|
-| **Row Counts** | Total rows per table | Exact match |
-| **Histograms** | Distribution shape (sorted bucket weights) | <5% total variation distance |
-| **Distinct Counts** | Cardinality per column | <5% difference |
-| **FK Integrity** | Orphan rows in child tables | 0 orphans |
-| **Privacy** | Exact row overlap (MD5 hash) | <1% overlap |
+| Check | What It Measures | Uses Actual Table Data? | Uses Optimizer Metadata? | Pass Criteria |
+|-------|------------------|--------------------------|---------------------------|---------------|
+| **Row Counts** | Total rows per table | Yes | No | Exact match |
+| **Distinct Counts** | Cardinality per column | Yes | No | <5% difference |
+| **Frequency Distributions** | Per-value counts for selected columns | Yes | No | Distribution-specific threshold |
+| **FK Integrity** | Orphan rows in child tables | Yes | Schema/FK metadata identifies relationships | 0 orphans |
+| **Privacy** | Exact row overlap (MD5 hash) | Yes | Schema metadata identifies columns | <1% overlap |
+| **Histograms** | Optimizer-visible distribution shape | No | Yes | <5% total variation distance |
+| **Query Plans** | Optimizer execution strategy | No | Yes | Same plan shape or acceptable drift |
+
+Index cardinality is optimizer metadata, not an actual data count. For an index
+such as `orders(o_custkey)`, the database may store an estimated cardinality
+that says how many distinct indexed values the optimizer believes exist. This is
+different from `COUNT(DISTINCT o_custkey)`, which scans the table data and
+returns the actual number of distinct values. DataGenX should use actual
+`COUNT(DISTINCT ...)` for data validation, and compare index cardinality only in
+explicit optimizer-statistics analysis.
 
 ## 7. Supported Databases
 
