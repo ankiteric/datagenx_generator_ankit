@@ -231,6 +231,20 @@ def build_single_fk_expression(
         description = f"cycling mod({cycle})+{ref_min} (estimated source cardinality)"
         return (expression, description)
 
+    exact_low_cardinality = _build_exact_low_cardinality_fk_expression(
+        cursor,
+        source_db,
+        target_db,
+        table,
+        col,
+        ref_table,
+        ref_col,
+        actual_distinct,
+        source_row_count,
+    )
+    if exact_low_cardinality:
+        return exact_low_cardinality
+
     # Decision based on coverage AND distinct_ratio:
     # - If distinct_ratio > 0.5: use mod() cycling (random would cause collisions)
     # - Else if coverage < 20%: try sparse weighted approach (preserves distribution shape)
@@ -272,6 +286,78 @@ def build_single_fk_expression(
 
     # High coverage (>=80%): use dense rand.range
     return _build_dense_fk_expression(cursor, target_db, ref_table, ref_col)
+
+
+def _dbgen_literal(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _build_exact_low_cardinality_fk_expression(
+    cursor,
+    source_db,
+    target_db,
+    table,
+    col,
+    ref_table,
+    ref_col,
+    actual_distinct,
+    source_row_count,
+):
+    """Build a deterministic FK expression from exact source frequencies.
+
+    This is for low-cardinality FKs where random range generation can preserve
+    referential integrity but distort histograms, especially in tiny dimension
+    tables such as TPC-H nation.n_regionkey. Source values are used only for
+    ordering frequency groups; generated literals come from the synthetic target
+    referenced table.
+    """
+    if not actual_distinct or actual_distinct > 100:
+        return None
+    if not source_row_count or source_row_count <= 0:
+        return None
+
+    cursor.execute(f"""
+        SELECT `{col}`, COUNT(*) AS cnt
+        FROM `{source_db}`.`{table}`
+        WHERE `{col}` IS NOT NULL
+        GROUP BY `{col}`
+        ORDER BY `{col}`
+    """)
+    source_frequencies = cursor.fetchall()
+    if not source_frequencies or len(source_frequencies) != actual_distinct:
+        return None
+
+    cursor.execute(f"""
+        SELECT `{ref_col}`
+        FROM `{target_db}`.`{ref_table}`
+        ORDER BY `{ref_col}`
+    """)
+    target_values = [row[0] for row in cursor.fetchall()]
+    if len(target_values) < actual_distinct:
+        return None
+
+    sampled_values = target_values[:actual_distinct]
+    case_lines = []
+    cumulative = 0
+    for target_value, (_source_value, count) in zip(sampled_values, source_frequencies):
+        if count <= 0:
+            continue
+        cumulative += int(count)
+        case_lines.append(f"when rownum <= {cumulative} then {_dbgen_literal(target_value)}")
+
+    if not case_lines:
+        return None
+
+    expression = f"""case
+    {' '.join(case_lines)}
+    else {_dbgen_literal(sampled_values[-1])}
+    end"""
+    description = f"exact low-cardinality FK frequencies ({actual_distinct} distinct)"
+    return (expression, description)
 
 
 def _try_sparse_fk_expression(
@@ -637,7 +723,13 @@ def get_string_generation_histogram(cursor, database, table, column):
     }
 
 
-def string_histogram_to_case(histogram_info, column_name, max_length=None, row_count=None):
+def string_histogram_to_case(
+    histogram_info,
+    column_name,
+    max_length=None,
+    row_count=None,
+    exact_distinct_count=None,
+):
     """Generate a string expression from histogram metadata.
 
     Equi-height histograms use optimizer bucket `num_distinct` to preserve
@@ -660,6 +752,8 @@ def string_histogram_to_case(histogram_info, column_name, max_length=None, row_c
 
     buckets = histogram_info.get("buckets") or []
     total_distinct = histogram_info.get("total_distinct") or 0
+    if exact_distinct_count and exact_distinct_count > 0:
+        total_distinct = min(int(exact_distinct_count), int(row_count))
     if not buckets or total_distinct <= 0:
         return ""
 
@@ -672,11 +766,37 @@ def string_histogram_to_case(histogram_info, column_name, max_length=None, row_c
     cumulative = 0
     distinct_offset = 0
 
-    for bucket, row_count_for_bucket in zip(buckets, raw_counts):
+    raw_distinct_counts = [max(1, int(bucket["distinct_count"])) for bucket in buckets]
+    if exact_distinct_count and exact_distinct_count > 0:
+        raw_total_distinct = sum(raw_distinct_counts)
+        if total_distinct <= len(raw_distinct_counts):
+            scaled_distinct_counts = [
+                1 if i < total_distinct else 0
+                for i, _count in enumerate(raw_distinct_counts)
+            ]
+        else:
+            scaled_distinct_counts = [
+                max(1, int(round(count * total_distinct / raw_total_distinct)))
+                for count in raw_distinct_counts
+            ]
+            distinct_diff = total_distinct - sum(scaled_distinct_counts)
+            adjust_index = len(scaled_distinct_counts) - 1
+            while distinct_diff != 0 and scaled_distinct_counts:
+                if distinct_diff > 0:
+                    scaled_distinct_counts[adjust_index] += 1
+                    distinct_diff -= 1
+                elif scaled_distinct_counts[adjust_index] > 1:
+                    scaled_distinct_counts[adjust_index] -= 1
+                    distinct_diff += 1
+                adjust_index = (adjust_index - 1) % len(scaled_distinct_counts)
+    else:
+        scaled_distinct_counts = raw_distinct_counts
+
+    for bucket_distinct_source, row_count_for_bucket in zip(scaled_distinct_counts, raw_counts):
         if row_count_for_bucket <= 0:
             continue
 
-        bucket_distinct = min(bucket["distinct_count"], row_count_for_bucket)
+        bucket_distinct = min(bucket_distinct_source, row_count_for_bucket)
         if bucket_distinct <= 0:
             continue
 
@@ -1464,13 +1584,14 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 histogram_info = get_string_generation_histogram(cursor, database, table, col)
                 col_max_length = get_string_column_length(line)
                 if histogram_info:
-                    cursor.execute(f"SELECT COUNT(*) FROM `{database}`.`{table}`")
-                    table_row_count = cursor.fetchone()[0]
+                    cursor.execute(f"SELECT COUNT(*), COUNT(DISTINCT `{col}`) FROM `{database}`.`{table}`")
+                    table_row_count, exact_distinct_count = cursor.fetchone()
                     synthetic = string_histogram_to_case(
                         histogram_info,
                         col,
                         max_length=col_max_length,
                         row_count=table_row_count,
+                        exact_distinct_count=exact_distinct_count,
                     )
                 else:
                     # High cardinality or empty — fall back to random strings
