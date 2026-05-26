@@ -1,0 +1,155 @@
+============================================================
+MASTER RUN — tpch_sf10 -> tpch_sf10_dbgenx
+============================================================
+Tables (8): part -> region -> nation -> customer -> orders -> supplier -> partsupp -> lineitem
+
+Created schema `tpch_sf10_dbgenx`.
+
+Regenerating histograms with full sampling...
+  region: OK
+  All 1 tables now have sampling_rate = 1.0
+
+[1/8] Table: part
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+  [A] Wrote generated/dbgen_files/part.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 2000000
+      Generating 2000000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/part.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`part`
+      Loading part.1.csv in 128MiB chunks (attempt 1/3)
+      Row count: 2000000 (matches source)
+      DDL match: OK
+
+[2/8] Table: region
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+  [A] Wrote generated/dbgen_files/region.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 5
+      Generating 5 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/region.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`region`
+      Row count: 5 (matches source)
+      DDL match: OK
+
+[3/8] Table: nation (depends on: region)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK N_REGIONKEY -> region.R_REGIONKEY: range [0, 4]
+  [A] Wrote generated/dbgen_files/nation.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 25
+      Generating 25 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/nation.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`nation`
+      Row count: 25 (matches source)
+      DDL match: OK
+
+📊 HISTOGRAM COMPARISON
+`N_REGIONKEY` (int) [idx]: distribution_diff = 0.16000, buckets 5->5, type singleton->singleton → DIVERGED
+
+[4/8] Table: customer (depends on: nation)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK C_NATIONKEY -> nation.N_NATIONKEY: range [0, 24]
+  [A] Wrote generated/dbgen_files/customer.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 1500000
+      Generating 1500000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/customer.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`customer`
+      Loading customer.1.csv in 128MiB chunks (attempt 1/3)
+      Row count: 1500000 (matches source)
+      DDL match: OK
+
+[5/8] Table: orders (depends on: customer)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK O_CUSTKEY -> customer.C_CUSTKEY: cycling mod(999982)+1 (66.7% coverage)
+  [A] Wrote generated/dbgen_files/orders.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 15000000
+      Generating 15000000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/orders.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`orders`
+      Loading orders.1.csv in 128MiB chunks (attempt 1/3)
+      Row count: 15000000 (matches source)
+      DDL match: OK
+
+[6/8] Table: supplier (depends on: nation)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK S_NATIONKEY -> nation.N_NATIONKEY: range [0, 24]
+  [A] Wrote generated/dbgen_files/supplier.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 100000
+      Generating 100000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/supplier.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`supplier`
+      Row count: 100000 (matches source)
+      DDL match: OK
+
+[7/8] Table: partsupp (depends on: supplier, part)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      FK+PK PS_PARTKEY -> part.P_PARTKEY: source=2000000, rows_per_value=4, min=1 -> div(rownum-1, 4)+1
+      FK+PK PS_SUPPKEY -> supplier.S_SUPPKEY: source=100000, cycling, min=1 -> mod(rownum-1, 100000)+1
+  [A] Wrote generated/dbgen_files/partsupp.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 8000000
+      Generating 8000000 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/partsupp.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`partsupp`
+      Loading partsupp.1.csv in 128MiB chunks (attempt 1/3)
+      Row count: 8000000 (matches source)
+      DDL match: OK
+
+[8/8] Table: lineitem (depends on: orders, partsupp)
+--------------------------------------------------
+  [A] Generating .dbgen template ...
+      PK L_LINENUMBER: cycling mod(7)+1
+      FK+PK L_ORDERKEY -> orders.O_ORDERKEY: cycling mod(15000000)+1
+      Composite FK L_PARTKEY -> partsupp.PS_PARTKEY: n-cycling 8000000 pairs, rows_per_value=4 -> div(mod(rownum-1, 8000000), 4)+1
+      Composite FK L_SUPPKEY -> partsupp.PS_SUPPKEY: n-cycling 8000000 pairs, cycling mod 100000 -> mod(mod(rownum-1, 8000000), 100000)+1
+  [A] Wrote generated/dbgen_files/lineitem.dbgen
+  [B] Running dbgen binary ...
+      Source row count = 59986052
+      Generating 59986052 rows (matches source)
+  [B] Generated generated/dbgen_tmp_out/lineitem.1.csv
+  [C] creating table, inserting data, validating ...
+      Created `tpch_sf10_dbgenx`.`lineitem`
+      Loading lineitem.1.csv in 128MiB chunks (attempt 1/3)
+      Row count: 59986052 (matches source)
+      DDL match: OK
+
+📊 HISTOGRAM COMPARISON
+`L_LINENUMBER` (int) [idx]: distribution_diff = 0.21387, buckets 7->7, type singleton->singleton → DIVERGED
+
+📊 INDEX CARDINALITY COMPARISON
+('PRIMARY', 'L_LINENUMBER'): diff=60.34% → DIVERGED
+('PRIMARY', 'L_ORDERKEY'): diff=54.96% → DIVERGED
+
+============================================================
+FINAL SUMMARY
+============================================================
+  part: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  region: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  nation: FAIL  [ddl=OK, rows=OK, histograms=FAIL, distinct=OK]
+  customer: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  orders: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  supplier: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  partsupp: PASS  [ddl=OK, rows=OK, histograms=OK, distinct=OK]
+  lineitem: FAIL  [ddl=OK, rows=OK, histograms=FAIL, distinct=OK]
+============================================================
+
+Total elapsed time: 289m 40.5s
+Some tables had validation failures.
