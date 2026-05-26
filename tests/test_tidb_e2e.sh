@@ -6,6 +6,7 @@
 #
 # Usage:
 #   bash tests/test_tidb_e2e.sh tpch-sf1 [rows|full]
+#   bash tests/test_tidb_e2e.sh tpch-sf5 [rows|full]
 #   bash tests/test_tidb_e2e.sh tpch-sf10 [rows|full]
 #   bash tests/test_tidb_e2e.sh tpcds-sf10 [rows|full]
 #   bash tests/test_tidb_e2e.sh all [rows|full]
@@ -18,6 +19,7 @@
 #
 # Source schema defaults:
 #   TPCH_SF1_SOURCE_SCHEMA=tpch_sf1_tidb
+#   TPCH_SF5_SOURCE_SCHEMA=tpch_sf5_tidb
 #   TPCH_SF10_SOURCE_SCHEMA=tpch_10gb
 #   TPCDS_SF10_SOURCE_SCHEMA=tpcds
 #
@@ -236,6 +238,13 @@ profile_config() {
             RESULT_FILE="${TPCH_SF1_RESULT_FILE:-$RESULTS_DIR/results_tpch_sf1_tidb.txt}"
             EXPECTED_TABLES=8
             ;;
+        tpch-sf5|tpch_sf5|sf5)
+            PROFILE_LABEL="TPC-H SF=5"
+            SOURCE_SCHEMA="${TPCH_SF5_SOURCE_SCHEMA:-tpch_sf5_tidb}"
+            TARGET_SCHEMA="${TPCH_SF5_TARGET_SCHEMA:-${SOURCE_SCHEMA}_test}"
+            RESULT_FILE="${TPCH_SF5_RESULT_FILE:-$RESULTS_DIR/results_tpch_sf5_tidb.txt}"
+            EXPECTED_TABLES=8
+            ;;
         tpch-sf10|tpch_sf10)
             PROFILE_LABEL="TPC-H SF=10"
             SOURCE_SCHEMA="${TPCH_SF10_SOURCE_SCHEMA:-tpch_10gb}"
@@ -343,6 +352,7 @@ fi
 case "$PROFILE" in
     all)
         run_profile tpch-sf1
+        run_profile tpch-sf5
         run_profile tpch-sf10
         run_profile tpcds-sf10
         ;;

@@ -13,6 +13,7 @@ VOLUME_SIZE_GIB="${VOLUME_SIZE_GIB:-300}"
 RUN_PROFILE="${RUN_PROFILE:-all}"
 TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-10}"
 TPCDS_SCALE_FACTOR="${TPCDS_SCALE_FACTOR:-10}"
+ARTIFACT_PREFIX="${ARTIFACT_PREFIX:-full-sf${TPCH_SCALE_FACTOR}}"
 TEMPLATE_FILE="${TEMPLATE_FILE:-tests/cloudformation/tidb-full-sf10.yml}"
 TIDB_ENV_FILE="${TIDB_ENV_FILE:-.env}"
 TIDB_ENV_PARAM_NAME="${TIDB_ENV_PARAM_NAME:-/datagenx/$STACK_NAME/tidb-env}"
@@ -39,6 +40,8 @@ package_repo() {
     tar -czf "$ARCHIVE" \
         --exclude=".git" \
         --exclude=".env" \
+        --exclude=".venv" \
+        --exclude="__pycache__" \
         --exclude=".DS_Store" \
         --exclude="*.DS_Store" \
         --exclude="generated" \
@@ -118,11 +121,11 @@ start_remote_run() {
     local bucket="$2"
     local tidb_env_param_name="$3"
 
-    python3 - "$SSM_PARAMS" "$bucket" "$AWS_REGION" "$RUN_PROFILE" "$TPCH_SCALE_FACTOR" "$TPCDS_SCALE_FACTOR" "$tidb_env_param_name" <<'PY'
+    python3 - "$SSM_PARAMS" "$bucket" "$AWS_REGION" "$RUN_PROFILE" "$TPCH_SCALE_FACTOR" "$TPCDS_SCALE_FACTOR" "$ARTIFACT_PREFIX" "$tidb_env_param_name" <<'PY'
 import json
 import sys
 
-path, bucket, region, profile, tpch_sf, tpcds_sf, tidb_env_param_name = sys.argv[1:]
+path, bucket, region, profile, tpch_sf, tpcds_sf, artifact_prefix, tidb_env_param_name = sys.argv[1:]
 commands = [
     "set -euo pipefail",
     "mkdir -p /opt/datagenx-run/work /opt/datagenx-run/logs /opt/datagenx-run/results",
@@ -142,10 +145,12 @@ commands = [
     "set -Eeuo pipefail\n"
     "cd /opt/datagenx-run/work/datagenx_generator\n"
     f"export ARTIFACT_BUCKET='{bucket}'\n"
-    "export ARTIFACT_PREFIX='full-sf10'\n"
+    f"export ARTIFACT_PREFIX='{artifact_prefix}'\n"
     f"export AWS_REGION='{region}'\n"
     "export BASE_DIR='/opt/datagenx-run'\n"
     "export REPO_DIR='/opt/datagenx-run/work/datagenx_generator'\n"
+    f"export RESULTS_DIR='/opt/datagenx-run/results/{artifact_prefix}'\n"
+    f"export LOG_DIR='/opt/datagenx-run/logs/{artifact_prefix}'\n"
     "export TIDB_ENV_FILE='/opt/datagenx-run/tidb-cloud.env'\n"
     "export START_LOCAL_TIDB='0'\n"
     "export ENABLE_TIFLASH='1'\n"
@@ -205,6 +210,7 @@ ArtifactBucket: $bucket
 TiDBEnvParam:   $TIDB_ENV_PARAM_NAME
 SSMCommandId:   $command_id
 RunProfile:     $RUN_PROFILE
+ArtifactPrefix: $ARTIFACT_PREFIX
 
 Check remote bootstrap command:
   aws ssm get-command-invocation --region $AWS_REGION --command-id $command_id --instance-id $instance_id
@@ -213,7 +219,7 @@ Tail the long-running job through SSM:
   aws ssm send-command --region $AWS_REGION --instance-ids $instance_id --document-name AWS-RunShellScript --parameters 'commands=["tail -n 200 /opt/datagenx-run/logs/driver_stdout.log"]'
 
 Download synced results after completion:
-  aws s3 sync s3://$bucket/full-sf10/results/ results/aws-full-sf10/
+  aws s3 sync s3://$bucket/$ARTIFACT_PREFIX/results/ results/$ARTIFACT_PREFIX/
 
 The stack is intentionally left running. Delete it only when you are done:
   aws cloudformation delete-stack --region $AWS_REGION --stack-name $STACK_NAME
