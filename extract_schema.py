@@ -15,7 +15,7 @@ from datetime import datetime
 # Import existing code
 from datagenx.generation.GenerateDbgen import (
     histogram_to_case, char_varchar_appendage, text_appendage,
-    string_values_to_case, get_string_column_length,
+    string_values_to_case, synthetic_string_expression, get_string_column_length,
     STRING_CARDINALITY_THRESHOLD,
     topological_sort, NUMERIC_TYPES, DATETIME_TYPES, CHAR_TYPES,
     TEXT_TYPES, YEAR, SYNTHETIC_BASE_DATETIME
@@ -246,21 +246,21 @@ def _build_composite_pk_appendages(
 def _get_string_value_weights(cursor, database, table, column, cardinality):
     """Get per-value frequency weights for a low-cardinality string column.
 
-    Queries GROUP BY to get actual frequency distribution. This is fast for
+    Queries GROUP BY to get only the frequency distribution. This is fast for
     low-cardinality columns (cardinality <= STRING_CARDINALITY_THRESHOLD).
-    Returns list of (synthetic_value, count) — actual values are NOT used (privacy).
+    Returns list of (synthetic_value, count); source literals are not selected.
     """
+    cardinality = _positive_int(cardinality) or 0
     try:
         cursor.execute(
-            f"SELECT `{column}`, COUNT(*) as cnt "
+            f"SELECT COUNT(*) AS cnt "
             f"FROM `{database}`.`{table}` "
+            f"WHERE `{column}` IS NOT NULL "
             f"GROUP BY `{column}` ORDER BY cnt DESC"
         )
         rows = cursor.fetchall()
         if rows:
-            # Return actual counts but with synthetic placeholder values
-            # (real values discarded, only frequency distribution preserved)
-            return [(f"val_{i}", cnt) for i, (_, cnt) in enumerate(rows, 1)]
+            return [(f"val_{i}", cnt) for i, (cnt,) in enumerate(rows, 1)]
     except Exception:
         pass
 
@@ -365,10 +365,19 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
                 synthetic = "rownum"
 
         elif col_type in CHAR_TYPES:
-            # Check cardinality — low-cardinality strings get weighted CASE expression
-            card = col_cardinality.get(col, 0)
+            # Use exact NDV for strings when engine stats are unavailable or
+            # incomplete. COUNT(DISTINCT) is privacy-safe and runs once while
+            # building this table's .dbgen template, not per generated row.
+            card = _column_distinct_count(
+                extractor,
+                table,
+                col,
+                col_cardinality,
+                exact_distinct_cache,
+                prefer_exact=True,
+            )
             col_max_length = get_string_column_length(line)
-            if 0 < card <= STRING_CARDINALITY_THRESHOLD:
+            if card and card <= STRING_CARDINALITY_THRESHOLD:
                 values = _get_string_value_weights(
                     extractor.cursor, database, table, col, card)
                 synthetic = string_values_to_case(
@@ -376,6 +385,14 @@ def annotate_table_with_statistics(extractor, database, table, generated_appenda
                     col,
                     max_length=col_max_length,
                     row_count=table_row_count,
+                )
+            elif card:
+                ordinal_expr = f"mod(rownum-1, {card}) + 1"
+                synthetic = synthetic_string_expression(
+                    col,
+                    ordinal_expr,
+                    card,
+                    max_length=col_max_length,
                 )
             else:
                 synthetic = char_varchar_appendage(line)

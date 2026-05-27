@@ -16,3 +16,12 @@ papers/
 .DS_Store
 
 messages.md
+
+# Generated validation/result artifacts. Keep the historical checked-in samples.
+results/*
+!results/tpch_validation_report_sf1.html
+!results/tpch_validation_report_sf10.html
+!results/tpch_validation_report_sf5.html
+!results/validation_output_tpch_10.log
+!results/validation_output_tpch_5.log
+!results/validation_output_tpch_sf1.log

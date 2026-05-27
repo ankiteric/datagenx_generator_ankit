@@ -16,10 +16,13 @@ LOG_DIR="${LOG_DIR:-$BASE_DIR/logs}"
 
 TPCH_SCALE_FACTOR="${TPCH_SCALE_FACTOR:-10}"
 TPCDS_SCALE_FACTOR="${TPCDS_SCALE_FACTOR:-10}"
+TPCH_SCALE_LABEL="${TPCH_SCALE_LABEL:-sf${TPCH_SCALE_FACTOR//./_}}"
+TPCDS_SCALE_LABEL="${TPCDS_SCALE_LABEL:-sf${TPCDS_SCALE_FACTOR//./_}}"
 TPCH_SOURCE_SCHEMA="${TPCH_SOURCE_SCHEMA:-}"
 TPCH_TARGET_SCHEMA="${TPCH_TARGET_SCHEMA:-}"
 TPCDS_SOURCE_SCHEMA="${TPCDS_SOURCE_SCHEMA:-}"
 TPCDS_TARGET_SCHEMA="${TPCDS_TARGET_SCHEMA:-}"
+RUN_ID="${RUN_ID:-$(date -u +%Y%m%d%H%M%S)}"
 
 START_LOCAL_TIDB="${START_LOCAL_TIDB:-0}"
 TIDB_IMAGE="${TIDB_IMAGE:-pingcap/tidb:v8.5.6}"
@@ -236,10 +239,10 @@ PY
     TIDB_PASSWORD="${TIDB_PASSWORD:-${DB_PASSWORD:-${DATAGENX_DB_PASSWORD:-}}}"
     TIDB_DATABASE="${TIDB_DATABASE:-${DB_DATABASE:-${DATAGENX_SOURCE_SCHEMA:-test}}}"
 
-    TPCH_SOURCE_SCHEMA="${TPCH_SOURCE_SCHEMA:-${TIDB_DATABASE}_tpch_sf10_source}"
-    TPCH_TARGET_SCHEMA="${TPCH_TARGET_SCHEMA:-${TIDB_DATABASE}_tpch_sf10_datagenx}"
-    TPCDS_SOURCE_SCHEMA="${TPCDS_SOURCE_SCHEMA:-${TIDB_DATABASE}_tpcds_sf10_source}"
-    TPCDS_TARGET_SCHEMA="${TPCDS_TARGET_SCHEMA:-${TIDB_DATABASE}_tpcds_sf10_datagenx}"
+    TPCH_SOURCE_SCHEMA="${TPCH_SOURCE_SCHEMA:-${TIDB_DATABASE}_tpch_${TPCH_SCALE_LABEL}_source}"
+    TPCH_TARGET_SCHEMA="${TPCH_TARGET_SCHEMA:-${TIDB_DATABASE}_tpch_${TPCH_SCALE_LABEL}_datagenx_${RUN_ID}}"
+    TPCDS_SOURCE_SCHEMA="${TPCDS_SOURCE_SCHEMA:-${TIDB_DATABASE}_tpcds_${TPCDS_SCALE_LABEL}_source}"
+    TPCDS_TARGET_SCHEMA="${TPCDS_TARGET_SCHEMA:-${TIDB_DATABASE}_tpcds_${TPCDS_SCALE_LABEL}_datagenx_${RUN_ID}}"
 
     if [[ -z "$TIDB_HOST" ]]; then
         echo "ERROR: TIDB_HOST is required" >&2
@@ -420,7 +423,7 @@ apply_tpch_constraints_and_analyze() {
     fi
 
     run_sql_with_retry "analyze TPC-H source tables" \
-        "ANALYZE TABLE \`$TPCH_SOURCE_SCHEMA\`.\`region\`, \`$TPCH_SOURCE_SCHEMA\`.\`nation\`, \`$TPCH_SOURCE_SCHEMA\`.\`part\`, \`$TPCH_SOURCE_SCHEMA\`.\`supplier\`, \`$TPCH_SOURCE_SCHEMA\`.\`customer\`, \`$TPCH_SOURCE_SCHEMA\`.\`partsupp\`, \`$TPCH_SOURCE_SCHEMA\`.\`orders\`, \`$TPCH_SOURCE_SCHEMA\`.\`lineitem\`"
+        "ANALYZE TABLE \`$TPCH_SOURCE_SCHEMA\`.\`region\`, \`$TPCH_SOURCE_SCHEMA\`.\`nation\`, \`$TPCH_SOURCE_SCHEMA\`.\`part\`, \`$TPCH_SOURCE_SCHEMA\`.\`supplier\`, \`$TPCH_SOURCE_SCHEMA\`.\`customer\`, \`$TPCH_SOURCE_SCHEMA\`.\`partsupp\`, \`$TPCH_SOURCE_SCHEMA\`.\`orders\`, \`$TPCH_SOURCE_SCHEMA\`.\`lineitem\` ALL COLUMNS"
 }
 
 record_tiflash_status() {
@@ -625,7 +628,7 @@ load_tpcds_source() {
     done
 
     run_sql_best_effort "DROP TABLE IF EXISTS \`$TPCDS_SOURCE_SCHEMA\`.\`dbgen_version\`"
-    run_sql "ANALYZE TABLE \`$TPCDS_SOURCE_SCHEMA\`.\`call_center\`, \`$TPCDS_SOURCE_SCHEMA\`.\`catalog_page\`, \`$TPCDS_SOURCE_SCHEMA\`.\`catalog_returns\`, \`$TPCDS_SOURCE_SCHEMA\`.\`catalog_sales\`, \`$TPCDS_SOURCE_SCHEMA\`.\`customer\`, \`$TPCDS_SOURCE_SCHEMA\`.\`customer_address\`, \`$TPCDS_SOURCE_SCHEMA\`.\`customer_demographics\`, \`$TPCDS_SOURCE_SCHEMA\`.\`date_dim\`, \`$TPCDS_SOURCE_SCHEMA\`.\`household_demographics\`, \`$TPCDS_SOURCE_SCHEMA\`.\`income_band\`, \`$TPCDS_SOURCE_SCHEMA\`.\`inventory\`, \`$TPCDS_SOURCE_SCHEMA\`.\`item\`, \`$TPCDS_SOURCE_SCHEMA\`.\`promotion\`, \`$TPCDS_SOURCE_SCHEMA\`.\`reason\`, \`$TPCDS_SOURCE_SCHEMA\`.\`ship_mode\`, \`$TPCDS_SOURCE_SCHEMA\`.\`store\`, \`$TPCDS_SOURCE_SCHEMA\`.\`store_returns\`, \`$TPCDS_SOURCE_SCHEMA\`.\`store_sales\`, \`$TPCDS_SOURCE_SCHEMA\`.\`time_dim\`, \`$TPCDS_SOURCE_SCHEMA\`.\`warehouse\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_page\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_returns\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_sales\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_site\`"
+    run_sql "ANALYZE TABLE \`$TPCDS_SOURCE_SCHEMA\`.\`call_center\`, \`$TPCDS_SOURCE_SCHEMA\`.\`catalog_page\`, \`$TPCDS_SOURCE_SCHEMA\`.\`catalog_returns\`, \`$TPCDS_SOURCE_SCHEMA\`.\`catalog_sales\`, \`$TPCDS_SOURCE_SCHEMA\`.\`customer\`, \`$TPCDS_SOURCE_SCHEMA\`.\`customer_address\`, \`$TPCDS_SOURCE_SCHEMA\`.\`customer_demographics\`, \`$TPCDS_SOURCE_SCHEMA\`.\`date_dim\`, \`$TPCDS_SOURCE_SCHEMA\`.\`household_demographics\`, \`$TPCDS_SOURCE_SCHEMA\`.\`income_band\`, \`$TPCDS_SOURCE_SCHEMA\`.\`inventory\`, \`$TPCDS_SOURCE_SCHEMA\`.\`item\`, \`$TPCDS_SOURCE_SCHEMA\`.\`promotion\`, \`$TPCDS_SOURCE_SCHEMA\`.\`reason\`, \`$TPCDS_SOURCE_SCHEMA\`.\`ship_mode\`, \`$TPCDS_SOURCE_SCHEMA\`.\`store\`, \`$TPCDS_SOURCE_SCHEMA\`.\`store_returns\`, \`$TPCDS_SOURCE_SCHEMA\`.\`store_sales\`, \`$TPCDS_SOURCE_SCHEMA\`.\`time_dim\`, \`$TPCDS_SOURCE_SCHEMA\`.\`warehouse\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_page\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_returns\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_sales\`, \`$TPCDS_SOURCE_SCHEMA\`.\`web_site\` ALL COLUMNS"
     apply_tiflash_replica "$TPCDS_SOURCE_SCHEMA"
 
     if [[ "$CLEAN_SOURCE_FILES_AFTER_LOAD" == "1" ]]; then
@@ -637,7 +640,7 @@ load_tpcds_source() {
 append_size_report() {
     local label="$1"
     shift
-    local report="$RESULTS_DIR/sizes_tidb_full_sf10.txt"
+    local report="$RESULTS_DIR/sizes_tidb_full_${TPCH_SCALE_LABEL}.txt"
 
     {
         echo "============================================================"
@@ -708,19 +711,41 @@ run_datagenx_tpch() {
     log "Running full-size DataGenX target generation for TPC-H SF=$TPCH_SCALE_FACTOR"
     cd "$REPO_DIR"
     local status=0
+    local result_file="$RESULTS_DIR/results_tpch_${TPCH_SCALE_LABEL}_tidb_full.txt"
+    local password_arg=()
+    if [[ -z "$TIDB_PASSWORD" ]]; then
+        password_arg=("--password=")
+    else
+        password_arg=("--password" "$TIDB_PASSWORD")
+    fi
     set +e
-    START_TIDB=0 \
-    TIDB_HOST="$TIDB_HOST" \
-    TIDB_PORT="$TIDB_PORT" \
-    TIDB_USER="$TIDB_USER" \
-    TIDB_PASSWORD="$TIDB_PASSWORD" \
-    DBGEN_BINARY="$DATAGENX_DBGEN_BINARY" \
-    DBGEN_FILES_DIR="$BASE_DIR/generated/tpch/dbgen_files" \
-    DBGEN_TMP_OUT_DIR="$BASE_DIR/generated/tpch/dbgen_tmp_out" \
-    TPCH_SF10_SOURCE_SCHEMA="$TPCH_SOURCE_SCHEMA" \
-    TPCH_SF10_TARGET_SCHEMA="$TPCH_TARGET_SCHEMA" \
-    TPCH_SF10_RESULT_FILE="$RESULTS_DIR/results_tpch_sf10_tidb_full.txt" \
-    bash tests/test_tidb_e2e.sh tpch-sf10 full
+    (
+        echo "DataGenX TiDB E2E verification"
+        echo "profile=tpch-${TPCH_SCALE_LABEL}"
+        echo "label=TPC-H SF=$TPCH_SCALE_FACTOR"
+        echo "host=$TIDB_HOST"
+        echo "port=$TIDB_PORT"
+        echo "source=$TPCH_SOURCE_SCHEMA"
+        echo "target=$TPCH_TARGET_SCHEMA"
+        echo "rows=match-source"
+        echo ""
+
+        PYTHONUNBUFFERED=1 \
+        DBGEN_BINARY="$DATAGENX_DBGEN_BINARY" \
+        DBGEN_FILES_DIR="$BASE_DIR/generated/tpch/dbgen_files" \
+        DBGEN_TMP_OUT_DIR="$BASE_DIR/generated/tpch/dbgen_tmp_out" \
+        python3 MasterRun.py \
+            --db-type tidb \
+            --host "$TIDB_HOST" \
+            --port "$TIDB_PORT" \
+            --user "$TIDB_USER" \
+            "${password_arg[@]}" \
+            --source-schema "$TPCH_SOURCE_SCHEMA" \
+            --target-schema "$TPCH_TARGET_SCHEMA" \
+            --run-validation \
+            --verbose \
+            --compare-histograms
+    ) 2>&1 | tee "$result_file"
     status=$?
     set -e
 
@@ -739,6 +764,133 @@ run_datagenx_tpch() {
         log "Cleaning TPC-H generated CSV files after load"
         rm -rf "$BASE_DIR/generated/tpch/dbgen_tmp_out"
     fi
+}
+
+generate_tpch_validation_report() {
+    local output="$RESULTS_DIR/TPCH_TIDB_${TPCH_SCALE_LABEL^^}.html"
+    local password_arg=()
+    if [[ -z "$TIDB_PASSWORD" ]]; then
+        password_arg=("--password=")
+    else
+        password_arg=("--password" "$TIDB_PASSWORD")
+    fi
+
+    log "Generating validation HTML report: $output"
+    cd "$REPO_DIR"
+    python3 validation_report.py \
+        --db-type tidb \
+        --host "$TIDB_HOST" \
+        --port "$TIDB_PORT" \
+        --user "$TIDB_USER" \
+        "${password_arg[@]}" \
+        --source-schema "$TPCH_SOURCE_SCHEMA" \
+        --target-schema "$TPCH_TARGET_SCHEMA" \
+        --output "$output" \
+        --tidb-overlap-strategy mpp \
+        --overlap-chunk-rows 500000
+}
+
+collect_tpch_topn_summary() {
+    local output="$RESULTS_DIR/topn_tpch_${TPCH_SCALE_LABEL}_tidb_summary.tsv"
+    local password_arg=()
+    if [[ -z "$TIDB_PASSWORD" ]]; then
+        password_arg=("--password=")
+    else
+        password_arg=("--password" "$TIDB_PASSWORD")
+    fi
+
+    log "Collecting TiDB TopN summary without literal values: $output"
+    cd "$REPO_DIR"
+    python3 - "$output" "$TIDB_HOST" "$TIDB_PORT" "$TIDB_USER" "$TIDB_PASSWORD" "$TPCH_SOURCE_SCHEMA" "$TPCH_TARGET_SCHEMA" <<'PY'
+import csv
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+import mysql.connector
+
+from lib.schema_extractor import connection_kwargs_for
+
+output, host, port, user, password, source_schema, target_schema = sys.argv[1:]
+kwargs = connection_kwargs_for("tidb", host, user, password, "INFORMATION_SCHEMA", int(port), autocommit=True)
+
+def pct_diff(source, target):
+    if source == 0 and target == 0:
+        return 0.0
+    if source is None or target is None:
+        return 1.0
+    return abs(source - target) / max(source, target)
+
+def frequency_shape_diff(source_counts, target_counts):
+    source_total = sum(source_counts)
+    target_total = sum(target_counts)
+    if source_total <= 0 or target_total <= 0:
+        return 1.0
+    source_probs = sorted((count / source_total for count in source_counts), reverse=True)
+    target_probs = sorted((count / target_total for count in target_counts), reverse=True)
+    n = max(len(source_probs), len(target_probs))
+    source_probs += [0.0] * (n - len(source_probs))
+    target_probs += [0.0] * (n - len(target_probs))
+    return 0.5 * sum(abs(source_probs[i] - target_probs[i]) for i in range(n))
+
+def fetch_topn(cursor, schema):
+    cursor.execute(
+        "SHOW STATS_TOPN WHERE Db_name = %s AND Is_index = 0",
+        (schema,),
+    )
+    names = [name.lower() for name in cursor.column_names]
+    rows = [dict(zip(names, row)) for row in cursor.fetchall()]
+    grouped = defaultdict(list)
+    for row in rows:
+        table = row.get("table_name")
+        column = row.get("column_name")
+        count = int(row.get("count") or 0)
+        if table and column and count > 0:
+            grouped[(table, column)].append(count)
+    return grouped
+
+conn = mysql.connector.connect(**kwargs)
+cursor = conn.cursor()
+try:
+    source = fetch_topn(cursor, source_schema)
+    target = fetch_topn(cursor, target_schema)
+finally:
+    cursor.close()
+    conn.close()
+
+keys = sorted(set(source) | set(target))
+Path(output).parent.mkdir(parents=True, exist_ok=True)
+with open(output, "w", newline="") as fp:
+    writer = csv.writer(fp, delimiter="\t")
+    writer.writerow([
+        "table",
+        "column",
+        "source_topn_entries",
+        "target_topn_entries",
+        "source_topn_total_count",
+        "target_topn_total_count",
+        "topn_total_diff_pct",
+        "frequency_shape_diff_pct",
+        "status",
+    ])
+    for table, column in keys:
+        source_counts = source.get((table, column), [])
+        target_counts = target.get((table, column), [])
+        total_diff = pct_diff(sum(source_counts), sum(target_counts)) * 100
+        shape_diff = frequency_shape_diff(source_counts, target_counts) * 100
+        status = "PASS" if total_diff < 5.0 and shape_diff < 5.0 else "NOTE"
+        writer.writerow([
+            table,
+            column,
+            len(source_counts),
+            len(target_counts),
+            sum(source_counts),
+            sum(target_counts),
+            f"{total_diff:.4f}",
+            f"{shape_diff:.4f}",
+            status,
+        ])
+PY
 }
 
 run_datagenx_tpcds() {
@@ -787,10 +939,12 @@ main() {
     prepare_tidb_bench
 
     case "$PROFILE" in
-        tpch|tpch-sf10|tpch_sf10)
+        tpch|tpch-sf*|tpch_sf*)
             load_tpch_source
             append_size_report "TPC-H SF=$TPCH_SCALE_FACTOR source loaded" "$TPCH_SOURCE_SCHEMA"
             run_datagenx_tpch
+            generate_tpch_validation_report
+            collect_tpch_topn_summary
             ;;
         tpcds|tpcds-sf10|tpcds_sf10)
             load_tpcds_source
@@ -801,6 +955,8 @@ main() {
             load_tpch_source
             append_size_report "TPC-H SF=$TPCH_SCALE_FACTOR source loaded" "$TPCH_SOURCE_SCHEMA"
             run_datagenx_tpch
+            generate_tpch_validation_report
+            collect_tpch_topn_summary
             load_tpcds_source
             append_size_report "TPC-DS SF=$TPCDS_SCALE_FACTOR source loaded" "$TPCDS_SOURCE_SCHEMA"
             run_datagenx_tpcds

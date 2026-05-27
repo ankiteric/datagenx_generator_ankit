@@ -606,7 +606,7 @@ class TiDBExtractor(SchemaExtractor):
 
     def analyze_table(self, table):
         """Run TiDB ANALYZE TABLE to collect optimizer statistics."""
-        self.cursor.execute(f"ANALYZE TABLE `{self.database}`.`{table}`")
+        self.cursor.execute(f"ANALYZE TABLE `{self.database}`.`{table}` ALL COLUMNS")
         self.cursor.fetchall()
 
     def get_column_histogram(self, table, column):

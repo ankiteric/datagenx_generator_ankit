@@ -1257,7 +1257,8 @@ def step_c_create_insert_validate(cursor, table):
     if DB_TYPE == 'mysql':
         cursor.execute(f"ANALYZE TABLE `{SOURCE_SCHEMA}`.`{table}`")
         cursor.fetchall()
-    cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}`")
+    analyze_suffix = " ALL COLUMNS" if DB_TYPE == 'tidb' else ""
+    cursor.execute(f"ANALYZE TABLE `{TARGET_SCHEMA}`.`{table}`{analyze_suffix}")
     cursor.fetchall()
 
     # --- DDL validation ---

@@ -21,15 +21,26 @@ from extract_schema import annotate_table_with_statistics
 
 
 class FakeCursor:
-    def __init__(self, row_count=100):
+    def __init__(self, row_count=100, string_group_counts=None):
         self.row_count = row_count
+        self.string_group_counts = string_group_counts or {}
         self.queries = []
         self._row = None
         self._rows = []
 
     def execute(self, sql, params=None):
         self.queries.append((sql, params))
-        if sql.startswith("SELECT COUNT(*)"):
+        if "GROUP BY" in sql and "COUNT(*) AS cnt" in sql:
+            matched = None
+            for column, counts in self.string_group_counts.items():
+                if f"`{column}`" in sql:
+                    matched = counts
+                    break
+            if matched is None:
+                raise AssertionError(f"Unexpected SQL: {sql}")
+            self._rows = [(count,) for count in matched]
+            self._row = self._rows[0] if self._rows else None
+        elif sql.startswith("SELECT COUNT(*)"):
             self._row = (self.row_count,)
             self._rows = [self._row]
         else:
@@ -52,6 +63,7 @@ class FakeExtractor:
         distinct_counts=None,
         row_count=100,
         histograms=None,
+        string_group_counts=None,
     ):
         self.ddl = ddl
         self.columns = columns
@@ -59,7 +71,10 @@ class FakeExtractor:
         self.foreign_keys = foreign_keys or {}
         self.distinct_counts = distinct_counts or {}
         self.histograms = histograms or {}
-        self.cursor = FakeCursor(row_count=row_count)
+        self.cursor = FakeCursor(
+            row_count=row_count,
+            string_group_counts=string_group_counts,
+        )
 
     def get_table_ddl(self, table):
         return self.ddl
@@ -201,6 +216,52 @@ class StatisticsAnnotationTest(unittest.TestCase):
             "mod(rownum-1, 2610) * 51000, 102000) + 1",
             annotated,
         )
+
+    def test_low_cardinality_string_uses_exact_ndv_and_frequency_counts(self):
+        ddl = """CREATE TABLE `lineitem` (
+  `l_shipmode` varchar(10) DEFAULT NULL
+)"""
+        extractor = FakeExtractor(
+            ddl,
+            {"l_shipmode": "varchar"},
+            distinct_counts={"l_shipmode": 3},
+            row_count=10,
+            string_group_counts={"l_shipmode": [5, 3, 2]},
+        )
+
+        annotated = annotate_table_with_statistics(extractor, "test", "lineitem")
+
+        self.assertIn("@l_shipmode := case", annotated)
+        self.assertIn("when rownum <= 5 then", annotated)
+        self.assertIn("when rownum <= 8 then", annotated)
+        self.assertNotIn("rand.regex", annotated)
+        group_queries = [
+            sql for sql, _params in extractor.cursor.queries
+            if "GROUP BY" in sql
+        ]
+        self.assertEqual(1, len(group_queries))
+        self.assertIn("SELECT COUNT(*) AS cnt", group_queries[0])
+        self.assertNotIn("SELECT `l_shipmode`", group_queries[0])
+
+    def test_high_cardinality_string_uses_bounded_synthetic_ndv(self):
+        ddl = """CREATE TABLE `lineitem` (
+  `l_comment` varchar(44) DEFAULT NULL
+)"""
+        extractor = FakeExtractor(
+            ddl,
+            {"l_comment": "varchar"},
+            distinct_counts={"l_comment": 33614597},
+            row_count=59986052,
+        )
+
+        annotated = annotate_table_with_statistics(extractor, "test", "lineitem")
+
+        self.assertIn(
+            "@l_comment := 'l_comment_' || (mod(rownum-1, 33614597) + 1)",
+            annotated,
+        )
+        self.assertNotIn("rand.regex", annotated)
+        self.assertFalse(any("GROUP BY" in sql for sql, _params in extractor.cursor.queries))
 
 
 if __name__ == "__main__":
