@@ -473,6 +473,26 @@ def build_fk_appendages(cursor, table, extractor=None):
         if sequence_type not in {"tinyint", "smallint", "mediumint", "int", "bigint"}:
             return None
 
+        # Check if sequence_col is truly a low-cardinality sequence column.
+        # True sequence columns (like l_linenumber) have few distinct values (~7).
+        # High-cardinality ID columns (like ss_ticket_number) should NOT use this logic.
+        cursor.execute(
+            f"SELECT COUNT(DISTINCT `{sequence_col}`) FROM `{SOURCE_SCHEMA}`.`{table}`"
+        )
+        sequence_distinct = cursor.fetchone()[0]
+
+        # Threshold: sequence columns have << 0.1% of row count distinct values
+        # l_linenumber: 7 distinct / 6M rows = 0.0001%
+        # ss_ticket_number: 240K distinct / 2.8M rows = 8.5%
+        max_sequence_threshold = max(100, source_row_count // 1000)
+        if sequence_distinct > max_sequence_threshold:
+            print(
+                f"      Grouped PK {parent_col},{sequence_col}: "
+                f"SKIPPED ({sequence_col} has {sequence_distinct} distinct values - "
+                f"not a sequence column)"
+            )
+            return None
+
         parent_fk = None
         for fk_cols in constraints.values():
             if len(fk_cols) == 1 and fk_cols[0][0] == parent_col:
@@ -671,18 +691,23 @@ def build_fk_appendages(cursor, table, extractor=None):
                     source_distinct = estimated_source_distinct(col)
                     fk_pk_cycle_length *= source_distinct
 
-        # Handle non-FK PK columns with mod() cycling
-        # MUST use mod() cycling (not frequency CASE) to ensure unique PK combinations
-        # when combined with FK+PK columns that also cycle
+        # Handle non-FK PK columns with div() grouping
+        # FK+PK columns use mod() (cycling), non-FK PK columns use div() (grouping)
+        # This combination avoids PK collisions:
+        #   Rows 1-12: ticket=1, item cycles 1->12
+        #   Rows 13-24: ticket=2, item cycles 1->12
         non_fk_pk_cols = pk_columns - pk_fk_columns
         for col in non_fk_pk_cols:
             if col in appendages:
                 continue
             source_distinct = estimated_source_distinct(col)
             min_val = synthetic_pk_base()
-            # Always use mod() for composite PK to ensure uniqueness
-            expr = f"mod(rownum-1, {source_distinct})+{min_val}"
-            print(f"      PK {col}: cycling mod({source_distinct})+{min_val}")
+            # Use div() grouping - consecutive rows share same value, then advance
+            # Use floor division to ensure full coverage of source distinct count
+            # May slightly over-generate (e.g., 240,033 vs 240,000) which is acceptable
+            rows_per_value = max(1, source_row_count // source_distinct)
+            expr = f"div(rownum-1, {rows_per_value})+{min_val}"
+            print(f"      PK {col}: grouped div(rownum-1, {rows_per_value})+{min_val} -> ~{source_distinct} distinct")
             appendages[col] = expr
 
         for constraint_name, fk_cols in constraints.items():
