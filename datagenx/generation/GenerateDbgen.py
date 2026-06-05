@@ -1077,13 +1077,14 @@ def _try_sparse_date_expression(cursor, database, table, column, col_type):
     """)
     row_count, actual_distinct = cursor.fetchone()
 
-    use_deterministic = False
+    use_uniform = False
     if row_count and actual_distinct:
         distinct_ratio = actual_distinct / row_count if row_count > 0 else 0
-        use_deterministic = (row_count < 100) or (distinct_ratio > 0.9)
+        # Only high distinct ratio (>90%) needs uniform distribution
+        use_uniform = distinct_ratio > 0.9
 
-    # For small tables, use deterministic mod() cycling
-    if use_deterministic:
+    # For nearly 1:1 columns, use deterministic mod() cycling
+    if use_uniform:
         if col_type == "date":
             return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL mod(rownum-1, {n_distinct}) DAY"
         elif col_type in ("datetime", "timestamp"):
@@ -1118,7 +1119,30 @@ def _try_sparse_date_expression(cursor, database, table, column, col_type):
         else:
             return None  # TIME columns use dense approach
 
-    # Generate weighted CASE expression
+    # For small tables, use deterministic weighted bands to guarantee all distinct
+    # values appear while preserving distribution shape. rand.weighted() can miss
+    # rare values with small row counts (birthday paradox).
+    if row_count and row_count <= n_distinct * 10:
+        counts = [max(1, int(round(w * row_count))) for w in weights]
+        # Adjust for rounding errors - subtract from largest to maintain total
+        diff = sum(counts) - row_count
+        if diff > 0 and counts:
+            max_idx = counts.index(max(counts))
+            counts[max_idx] = max(1, counts[max_idx] - diff)
+
+        cumulative = 0
+        case_lines = []
+        for date_val, count in zip(date_values, counts):
+            cumulative += count
+            case_lines.append(f"when rownum <= {cumulative} then {date_val}")
+
+        if case_lines:
+            return f"""case
+    {' '.join(case_lines)}
+    else {date_values[-1]}
+    end"""
+
+    # For larger tables, use rand.weighted() for random distribution
     case_lines = [f"when {i+1} then {val}" for i, val in enumerate(date_values)]
 
     return f"""case rand.weighted(array[{','.join(map(str, weights))}])
@@ -1167,11 +1191,11 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
     """)
     row_count, distinct_count = cursor.fetchone()
 
-    # Use deterministic generation if:
-    # 1. Small table (<100 rows) - histogram approach unsuitable
-    # 2. High distinct ratio (>90%) - birthday paradox would cause collisions
-    use_deterministic = (distinct_count and row_count and
-                         (row_count < 100 or distinct_count / row_count > 0.9))
+    # Use uniform distribution only for high distinct ratio (>90%)
+    # These are nearly 1:1 mappings where every value should appear ~equally
+    # Note: Small tables with skewed distributions should use rand.range()
+    use_uniform = (distinct_count and row_count and
+                   distinct_count / row_count > 0.9)
 
     # Calculate SPAN only - we don't use actual min/max values as base
     # Instead, we use synthetic base date + span for privacy
@@ -1180,7 +1204,7 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
         max_date = datetime.strptime(max_val[:10], "%Y-%m-%d").date()
         day_span = (max_date - min_date).days
 
-        if use_deterministic:
+        if use_uniform:
             # 1:1 column: use rownum for guaranteed unique dates
             # mod() ensures we stay within the span even if row_count > span
             return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL mod(rownum-1, {day_span + 1}) DAY"
@@ -1195,7 +1219,7 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
         max_ts = datetime.strptime(max_val, fmt)
         second_span = int((max_ts - min_ts).total_seconds())
 
-        if use_deterministic:
+        if use_uniform:
             # 1:1 column: use rownum for guaranteed unique timestamps
             return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL mod(rownum-1, {second_span + 1}) SECOND"
         else:
@@ -1215,7 +1239,7 @@ def _build_dense_date_expression(cursor, database, table, column, col_type):
         # Use span from 0 (midnight) for privacy
         time_span = max_secs - min_secs
 
-        if use_deterministic:
+        if use_uniform:
             return f"INTERVAL mod(rownum-1, {time_span + 1}) SECOND"
         else:
             return f"INTERVAL rand.range(0, {time_span + 1}) SECOND"
@@ -1276,18 +1300,19 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
     )
     scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
 
-    # Detect small tables or high distinct ratio (>90%)
-    # These need deterministic generation to avoid birthday paradox collisions
-    # See VALIDATION_ISSUES.md Section 5: "Small Table Histogram Issues"
-    use_deterministic = False
+    # Detect high distinct ratio (>90%) columns that need uniform distribution
+    # These are nearly 1:1 mappings where every value should appear ~equally
+    # Note: We do NOT use uniform mod() for small tables with skewed distributions
+    # (e.g., TPC-DS call_center.cc_mkt_id has [67%,17%,17%] distribution)
+    use_uniform = False
     if row_count and actual_distinct_count:
         distinct_ratio = actual_distinct_count / row_count if row_count > 0 else 0
-        # Small tables (<100 rows) OR high distinct ratio (>90%) need deterministic
-        use_deterministic = (row_count < 100) or (distinct_ratio > 0.9)
+        # Only high distinct ratio (>90%) needs uniform distribution
+        use_uniform = distinct_ratio > 0.9
 
-    # For small tables or 1:1 columns, use simple deterministic mod() cycling
-    # This guarantees all distinct values are used exactly once (or evenly distributed)
-    if use_deterministic and actual_distinct_count:
+    # For nearly 1:1 columns, use simple deterministic mod() cycling
+    # This guarantees all distinct values are used exactly once
+    if use_uniform and actual_distinct_count:
         if scale == 1:
             return f"mod(rownum-1, {actual_distinct_count}) + 1"
         else:
