@@ -702,12 +702,11 @@ def build_fk_appendages(cursor, table, extractor=None):
                 continue
             source_distinct = estimated_source_distinct(col)
             min_val = synthetic_pk_base()
-            # Use div() grouping - consecutive rows share same value, then advance
-            # Use floor division to ensure full coverage of source distinct count
-            # May slightly over-generate (e.g., 240,033 vs 240,000) which is acceptable
-            rows_per_value = max(1, source_row_count // source_distinct)
-            expr = f"div(rownum-1, {rows_per_value})+{min_val}"
-            print(f"      PK {col}: grouped div(rownum-1, {rows_per_value})+{min_val} -> ~{source_distinct} distinct")
+            # Use proportional scaling: div((rownum-1)*D, N) maps N rows to exactly D distinct values
+            # This distributes values evenly - some appear floor(N/D) times, others ceil(N/D) times
+            # dbgen uses i128 arithmetic, so (rownum-1)*source_distinct won't overflow
+            expr = f"div((rownum-1)*{source_distinct},{source_row_count})+{min_val}"
+            print(f"      PK {col}: proportional div((rownum-1)*{source_distinct},{source_row_count})+{min_val} -> {source_distinct} distinct")
             appendages[col] = expr
 
         for constraint_name, fk_cols in constraints.items():

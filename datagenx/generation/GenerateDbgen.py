@@ -201,16 +201,26 @@ def build_single_fk_expression(
             source_row_count = int(source_row_count_override)
         else:
             cursor.execute(
-                f"SELECT COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` IS NOT NULL"
+                f"SELECT COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` > 0"
             )
             source_row_count = cursor.fetchone()[0]
     else:
+        # Use col > 0 to exclude both NULL and 0 (NULLs converted during LOAD DATA)
+        # Integer FK surrogate keys are always > 0
         cursor.execute(f"""
-            SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` IS NOT NULL
+            SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` > 0
         """)
         actual_distinct, source_row_count = cursor.fetchone()
     actual_distinct = actual_distinct or 0
     source_row_count = source_row_count or 1
+
+    # Calculate NULL rate: parts per 10000 (0.01% precision) for rows with NULL/0 FK values
+    cursor.execute(f"""
+        SELECT COUNT(*) FROM `{source_db}`.`{table}`
+    """)
+    total_row_count = cursor.fetchone()[0] or 1
+    null_row_count = total_row_count - source_row_count
+    null_rate_per_10000 = (null_row_count * 10000) // total_row_count if total_row_count > 0 else 0
 
     # Get referenced table size and min value from target
     cursor.execute(f"SELECT COUNT(*), MIN(`{ref_col}`) FROM `{target_db}`.`{ref_table}`")
@@ -281,11 +291,31 @@ def build_single_fk_expression(
         # Moderate coverage: use mod() cycling to match exact distinct count
         # This generates values 1 to actual_distinct (assuming ref_min=1)
         expression = f"mod(rownum-1, {actual_distinct}) + {ref_min}"
-        description = f"cycling mod({actual_distinct})+{ref_min} ({coverage_ratio*100:.1f}% coverage)"
+        # Wrap with NULL handling if source has NULL/0 values
+        if null_rate_per_10000 > 0:
+            expression = f"case when rand.range(0, 10000) < {null_rate_per_10000} then NULL else {expression} end"
+            description = f"cycling mod({actual_distinct})+{ref_min} with {null_rate_per_10000/100:.1f}% NULL ({coverage_ratio*100:.1f}% coverage)"
+        else:
+            description = f"cycling mod({actual_distinct})+{ref_min} ({coverage_ratio*100:.1f}% coverage)"
         return (expression, description)
 
-    # High coverage (>=80%): use dense rand.range
-    return _build_dense_fk_expression(cursor, target_db, ref_table, ref_col)
+    # High coverage (>=80%): use mod() cycling if no orphans, else rand.range()
+    # Orphan case (actual_distinct > ref_table_size): source has NULL/invalid FK values
+    # that became 0 during loading - we can't replicate these, use rand.range()
+    if actual_distinct > ref_table_size:
+        return _build_dense_fk_expression(cursor, target_db, ref_table, ref_col)
+
+    # Partial coverage (actual_distinct <= ref_table_size): source uses subset of FK values
+    # Use mod() cycling to match exact source cardinality, avoiding birthday paradox
+    expression = f"mod(rownum-1, {actual_distinct}) + {ref_min}"
+
+    # Wrap with NULL handling if source has NULL/0 values
+    if null_rate_per_10000 > 0:
+        expression = f"case when rand.range(0, 10000) < {null_rate_per_10000} then NULL else {expression} end"
+        description = f"cycling mod({actual_distinct})+{ref_min} with {null_rate_per_10000/100:.1f}% NULL (dense {coverage_ratio*100:.0f}% coverage)"
+    else:
+        description = f"cycling mod({actual_distinct})+{ref_min} (dense {coverage_ratio*100:.0f}% coverage)"
+    return (expression, description)
 
 
 def _dbgen_literal(value):
