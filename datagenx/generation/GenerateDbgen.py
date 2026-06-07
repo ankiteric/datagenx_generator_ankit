@@ -24,6 +24,7 @@ ENUM_TYPES = {"enum", "set"}
 # Maximum distinct values to fetch for string columns.
 # Above this threshold, fall back to random string generation.
 STRING_CARDINALITY_THRESHOLD = 1000
+EXACT_LOW_CARDINALITY_THRESHOLD = 1000
 
 # Synthetic base date for generating date values.
 # We use a synthetic date range to avoid exposing actual source data dates.
@@ -192,6 +193,17 @@ def build_single_fk_expression(
         - expression: dbgen expression string
         - description: human-readable description for logging
     """
+    # Get referenced table size and min value from target. Some benchmarks, such
+    # as TPC-H, use zero-based keys, so 0 must be treated as a valid FK value
+    # whenever it exists in the referenced domain.
+    cursor.execute(f"SELECT COUNT(*), MIN(`{ref_col}`) FROM `{target_db}`.`{ref_table}`")
+    ref_table_size, ref_min = cursor.fetchone()
+    ref_table_size = ref_table_size or 1
+    ref_min = ref_min if ref_min is not None else 1
+    valid_fk_predicate = f"`{col}` IS NOT NULL"
+    if ref_min > 0:
+        valid_fk_predicate = f"`{col}` IS NOT NULL AND `{col}` > 0"
+
     # Get actual distinct count and row count from source (privacy-safe: just counts).
     # Large scaled TiDB replays may pass optimizer-stat estimates to avoid full
     # source-table COUNT(DISTINCT) scans.
@@ -201,14 +213,12 @@ def build_single_fk_expression(
             source_row_count = int(source_row_count_override)
         else:
             cursor.execute(
-                f"SELECT COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` > 0"
+                f"SELECT COUNT(*) FROM `{source_db}`.`{table}` WHERE {valid_fk_predicate}"
             )
             source_row_count = cursor.fetchone()[0]
     else:
-        # Use col > 0 to exclude both NULL and 0 (NULLs converted during LOAD DATA)
-        # Integer FK surrogate keys are always > 0
         cursor.execute(f"""
-            SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{source_db}`.`{table}` WHERE `{col}` > 0
+            SELECT COUNT(DISTINCT `{col}`), COUNT(*) FROM `{source_db}`.`{table}` WHERE {valid_fk_predicate}
         """)
         actual_distinct, source_row_count = cursor.fetchone()
     actual_distinct = actual_distinct or 0
@@ -221,12 +231,6 @@ def build_single_fk_expression(
     total_row_count = cursor.fetchone()[0] or 1
     null_row_count = total_row_count - source_row_count
     null_rate_per_10000 = (null_row_count * 10000) // total_row_count if total_row_count > 0 else 0
-
-    # Get referenced table size and min value from target
-    cursor.execute(f"SELECT COUNT(*), MIN(`{ref_col}`) FROM `{target_db}`.`{ref_table}`")
-    ref_table_size, ref_min = cursor.fetchone()
-    ref_table_size = ref_table_size or 1
-    ref_min = ref_min if ref_min is not None else 1
 
     # Calculate coverage ratio (how much of referenced table is used)
     coverage_ratio = actual_distinct / ref_table_size if ref_table_size > 0 else 1.0
@@ -251,6 +255,7 @@ def build_single_fk_expression(
         ref_col,
         actual_distinct,
         source_row_count,
+        valid_fk_predicate,
     )
     if exact_low_cardinality:
         return exact_low_cardinality
@@ -336,16 +341,17 @@ def _build_exact_low_cardinality_fk_expression(
     ref_col,
     actual_distinct,
     source_row_count,
+    valid_fk_predicate,
 ):
     """Build a deterministic FK expression from exact source frequencies.
 
-    This is for low-cardinality FKs where random range generation can preserve
+    This is for low- and mid-cardinality FKs where random range generation can preserve
     referential integrity but distort histograms, especially in tiny dimension
-    tables such as TPC-H nation.n_regionkey. Source values are used only for
+    tables or moderate reference domains. Source values are used only for
     ordering frequency groups; generated literals come from the synthetic target
     referenced table.
     """
-    if not actual_distinct or actual_distinct > 100:
+    if not actual_distinct or actual_distinct > EXACT_LOW_CARDINALITY_THRESHOLD:
         return None
     if not source_row_count or source_row_count <= 0:
         return None
@@ -353,7 +359,7 @@ def _build_exact_low_cardinality_fk_expression(
     cursor.execute(f"""
         SELECT `{col}`, COUNT(*) AS cnt
         FROM `{source_db}`.`{table}`
-        WHERE `{col}` IS NOT NULL
+        WHERE {valid_fk_predicate}
         GROUP BY `{col}`
         ORDER BY `{col}`
     """)
@@ -625,6 +631,81 @@ def _build_dense_fk_expression(cursor, target_db, ref_table, ref_col):
 
 def text_appendage():
     return "rand.regex('[a-zA-Z ]{100}')"
+
+
+def exact_low_cardinality_to_case(
+    cursor,
+    database,
+    table,
+    column,
+    col_type,
+    ddl_line=None,
+    max_distinct=EXACT_LOW_CARDINALITY_THRESHOLD,
+):
+    """Generate a deterministic CASE from exact low-cardinality frequencies.
+
+    This uses actual source counts, but not actual source values. Source values
+    are mapped to synthetic integers, decimals, or dates in frequency order.
+    It is intended for low-cardinality columns where optimizer histograms can
+    combine multiple values into a bucket and lose intra-bucket skew.
+    """
+    cursor.execute(f"""
+        SELECT COUNT(*), COUNT(DISTINCT `{column}`), SUM(`{column}` IS NULL)
+        FROM `{database}`.`{table}`
+    """)
+    row_count, distinct_count, null_count = cursor.fetchone()
+
+    if not row_count or not distinct_count:
+        return ""
+    if null_count:
+        return ""
+    if distinct_count > max_distinct:
+        return ""
+
+    cursor.execute(f"""
+        SELECT COUNT(*) AS cnt
+        FROM `{database}`.`{table}`
+        WHERE `{column}` IS NOT NULL
+        GROUP BY `{column}`
+        ORDER BY cnt DESC, MIN(`{column}`)
+    """)
+    counts = [int(row[0]) for row in cursor.fetchall()]
+    if not counts or len(counts) != distinct_count:
+        return ""
+
+    decimal_match = re.search(
+        r"decimal\(\s*\d+\s*,\s*(\d+)\s*\)",
+        ddl_line or "",
+        re.IGNORECASE,
+    )
+    scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
+
+    def synthetic_value(index):
+        if col_type == "date":
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATE} 00:00:00' + INTERVAL {index} DAY"
+        if col_type in ("datetime", "timestamp"):
+            return f"TIMESTAMP '{SYNTHETIC_BASE_DATETIME}' + INTERVAL {index} HOUR"
+        if col_type == "time":
+            return f"TIME '00:00:00' + INTERVAL {index} SECOND"
+        if scale > 1:
+            return f"{index}/{scale}"
+        return str(index)
+
+    cumulative = 0
+    case_lines = []
+    for index, count in enumerate(counts):
+        if count <= 0:
+            continue
+        cumulative += count
+        case_lines.append(f"when rownum <= {cumulative} then {synthetic_value(index)}")
+
+    if not case_lines:
+        return ""
+
+    return f"""case
+    {' '.join(case_lines)}
+    else {synthetic_value(len(counts) - 1)}
+    end"""
 
 
 def get_string_column_values(cursor, database, table, column):
@@ -1080,8 +1161,10 @@ def _try_sparse_date_expression(cursor, database, table, column, col_type):
     use_uniform = False
     if row_count and actual_distinct:
         distinct_ratio = actual_distinct / row_count if row_count > 0 else 0
-        # Only high distinct ratio (>90%) needs uniform distribution
-        use_uniform = distinct_ratio > 0.9
+        # Near-row-unique numeric columns need deterministic coverage. TPC-DS
+        # promotion date keys have ~80-85% NDV over only 300 rows; a bucketed
+        # histogram expression preserves shape but cannot realize enough values.
+        use_uniform = distinct_ratio >= 0.8
 
     # For nearly 1:1 columns, use deterministic mod() cycling
     if use_uniform:
@@ -1300,19 +1383,18 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
     )
     scale = 10 ** int(decimal_match.group(1)) if decimal_match else 1
 
-    # Detect high distinct ratio (>90%) columns that need uniform distribution
+    # Detect high distinct ratio columns that need deterministic coverage.
     # These are nearly 1:1 mappings where every value should appear ~equally
-    # Note: We do NOT use uniform mod() for small tables with skewed distributions
-    # (e.g., TPC-DS call_center.cc_mkt_id has [67%,17%,17%] distribution)
+    # for singleton histograms. Equi-height histograms still need weighted bucket
+    # bands, because they may encode MCVs or skewed singleton buckets.
     use_uniform = False
     if row_count and actual_distinct_count:
         distinct_ratio = actual_distinct_count / row_count if row_count > 0 else 0
-        # Only high distinct ratio (>90%) needs uniform distribution
-        use_uniform = distinct_ratio > 0.9
+        use_uniform = distinct_ratio >= 0.8
 
     # For nearly 1:1 columns, use simple deterministic mod() cycling
     # This guarantees all distinct values are used exactly once
-    if use_uniform and actual_distinct_count:
+    if hist_type == "singleton" and use_uniform and actual_distinct_count:
         if scale == 1:
             return f"mod(rownum-1, {actual_distinct_count}) + 1"
         else:
@@ -1373,68 +1455,126 @@ def histogram_to_case(hist, ddl_line, actual_distinct_count=None, row_count=None
     {' '.join(case_lines)}
     end"""
     else:
-        # For equi-height: use DETERMINISTIC bucket assignment to guarantee all distinct values
-        #
-        # Problem with rand.weighted: randomly assigns rows to buckets, causing collisions
-        # when we try to generate num_distinct values per bucket.
-        #
-        # Solution: Use mod(rownum, num_buckets) for bucket selection (equi-height = equal frequency)
-        # Then use div(rownum, num_buckets) as "local row number" to cycle through all values.
-        #
-        # This guarantees:
-        # 1. Equal distribution across buckets (matches equi-height histogram)
-        # 2. All distinct values are used (no random collisions)
-
         num_buckets = len(buckets)
+
+        def is_single_value_bucket(bucket):
+            if len(bucket) < 4 or int(bucket[3]) != 1:
+                return False
+            try:
+                return float(bucket[0]) == float(bucket[1])
+            except (TypeError, ValueError):
+                return bucket[0] == bucket[1]
 
         # Get raw num_distinct from each bucket
         raw_distinct_counts = []
+        frozen_singleton_indices = set()
         for b in buckets:
             num_distinct = int(b[3]) if len(b) > 3 else 1
             raw_distinct_counts.append(max(1, num_distinct))
+            if is_single_value_bucket(b):
+                frozen_singleton_indices.add(len(raw_distinct_counts) - 1)
 
         # If actual_distinct_count is provided, scale bucket counts proportionally
         # This fixes histogram extrapolation errors when sampling_rate < 1.0
         histogram_total = sum(raw_distinct_counts)
         if actual_distinct_count and histogram_total > 0:
-            scale_factor = actual_distinct_count / histogram_total
-            distinct_counts = [max(1, int(round(c * scale_factor))) for c in raw_distinct_counts]
-            # Adjust to match exact total (rounding may cause slight mismatch)
+            frozen_total = sum(raw_distinct_counts[i] for i in frozen_singleton_indices)
+            scalable_indices = [
+                i for i in range(len(raw_distinct_counts))
+                if i not in frozen_singleton_indices
+            ]
+            scalable_total = sum(raw_distinct_counts[i] for i in scalable_indices)
+            target_scalable_total = max(0, actual_distinct_count - frozen_total)
+
+            distinct_counts = list(raw_distinct_counts)
+            if scalable_indices and scalable_total > 0:
+                scale_factor = target_scalable_total / scalable_total
+                for i in scalable_indices:
+                    distinct_counts[i] = max(1, int(round(raw_distinct_counts[i] * scale_factor)))
+            elif not scalable_indices:
+                distinct_counts = list(raw_distinct_counts)
+
+            # Adjust to match exact total (rounding may cause slight mismatch),
+            # without expanding single-value buckets into multiple synthetic
+            # values. MySQL often encodes MCVs this way inside equi-height
+            # histograms, for example a dominant zero amount bucket.
             diff = actual_distinct_count - sum(distinct_counts)
-            if diff != 0:
-                # Add/subtract from largest bucket
-                max_idx = distinct_counts.index(max(distinct_counts))
-                distinct_counts[max_idx] = max(1, distinct_counts[max_idx] + diff)
+            adjust_candidates = scalable_indices or list(range(len(distinct_counts)))
+            while diff != 0 and adjust_candidates:
+                if diff > 0:
+                    max_idx = max(adjust_candidates, key=lambda idx: distinct_counts[idx])
+                    distinct_counts[max_idx] += 1
+                    diff -= 1
+                else:
+                    max_idx = max(adjust_candidates, key=lambda idx: distinct_counts[idx])
+                    if distinct_counts[max_idx] > 1:
+                        distinct_counts[max_idx] -= 1
+                        diff += 1
+                    else:
+                        adjust_candidates.remove(max_idx)
         else:
             distinct_counts = raw_distinct_counts
 
-        # Generate case expressions with deterministic cycling
-        # local_row = div(rownum-1, num_buckets) gives 0, 0, 0, ..., 1, 1, 1, ..., 2, 2, 2, ...
-        # mod(local_row, num_distinct) cycles through all distinct values
+        # Assign rows to buckets using cumulative probability mass from the
+        # histogram. This preserves skew and MCV-like singleton buckets. The
+        # previous mod(rownum, num_buckets) approach flattened buckets to equal
+        # frequency, which distorted columns such as coupon amounts and return
+        # quantities even when MySQL's histogram contained the right weights.
+        if row_count:
+            raw_counts = [w * row_count for w in weights]
+            bucket_counts = [int(c) for c in raw_counts]
+            remainder = row_count - sum(bucket_counts)
+            fractional_order = sorted(
+                range(len(raw_counts)),
+                key=lambda idx: raw_counts[idx] - bucket_counts[idx],
+                reverse=True,
+            )
+            for idx in fractional_order[:max(0, remainder)]:
+                bucket_counts[idx] += 1
+        else:
+            bucket_counts = None
+
         synthetic_start = 0
+        cumulative_rows = 0
+        deterministic_lines = []
         for i, num_distinct in enumerate(distinct_counts, start=1):
             synthetic_lo = synthetic_start
+            bucket_count = bucket_counts[i - 1] if bucket_counts else None
+            local_row = (
+                f"(rownum - {cumulative_rows} - 1)"
+                if bucket_count is not None
+                else f"div(rownum-1,{num_buckets})"
+            )
 
             if num_distinct == 1:
                 # Single value bucket - generate exactly 1 value
                 if scale == 1:
-                    case_lines.append(f"when {i} then {synthetic_lo}")
+                    value_expr = f"{synthetic_lo}"
                 else:
-                    case_lines.append(f"when {i} then {synthetic_lo}/{scale}")
+                    value_expr = f"{synthetic_lo}/{scale}"
                 synthetic_start = synthetic_lo + 1
             else:
-                # Multi-value bucket - use div/mod for deterministic cycling through all values
-                # div(rownum-1, num_buckets) = local row number (0, 1, 2, ... for each bucket)
-                # mod(local_row, num_distinct) = cycles through 0 to num_distinct-1
                 if scale == 1:
-                    case_lines.append(f"when {i} then mod(div(rownum-1,{num_buckets}),{num_distinct})+{synthetic_lo}")
+                    value_expr = f"mod({local_row},{num_distinct})+{synthetic_lo}"
                 else:
-                    case_lines.append(
-                        f"when {i} then (mod(div(rownum-1,{num_buckets}),{num_distinct})+{synthetic_lo})/{scale}"
-                    )
+                    value_expr = f"(mod({local_row},{num_distinct})+{synthetic_lo})/{scale}"
                 synthetic_start = synthetic_lo + num_distinct
 
-        # Use deterministic bucket selection: mod(rownum-1, num_buckets)+1 gives buckets 1,2,3,...,N,1,2,3,...
+            if bucket_count is not None:
+                if bucket_count <= 0:
+                    continue
+                cumulative_rows += bucket_count
+                deterministic_lines.append(f"when rownum <= {cumulative_rows} then {value_expr}")
+            else:
+                case_lines.append(f"when {i} then {value_expr}")
+
+        if deterministic_lines:
+            final_val = (synthetic_start - 1) / scale if scale > 1 else float(synthetic_start - 1)
+            return f"""case
+    {' '.join(deterministic_lines)}
+    else {final_val}
+    end"""
+
         return f"""case mod(rownum-1,{num_buckets})+1
     {' '.join(case_lines)}
     end"""
@@ -1472,8 +1612,10 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             WHERE TABLE_SCHEMA = %s
               AND TABLE_NAME = %s
               AND CONSTRAINT_NAME = 'PRIMARY'
+            ORDER BY ORDINAL_POSITION
         """, (database, table))
-        primary_key_columns = {r[0] for r in cursor.fetchall()}
+        primary_key_columns_ordered = [r[0] for r in cursor.fetchall()]
+        primary_key_columns = set(primary_key_columns_ordered)
 
         # FOREIGN KEY mappings: column -> (referenced_table, referenced_column)
         cursor.execute("""
@@ -1506,18 +1648,23 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             if hist
         }
 
-        # Pre-compute coordinated expressions for composite PKs (without FK info)
-        # This ensures unique PK combinations by having one column cycle and others group
+        # Pre-compute coordinated expressions for composite PKs (without FK info).
+        # Source schemas such as TPC-DS may not declare RI constraints even when
+        # composite keys encode sparse dimensional combinations, so this fallback
+        # must preserve both key uniqueness and per-column NDV.
         composite_pk_expressions = {}
         non_fk_pk_columns = primary_key_columns - set(foreign_keys.keys())
-        if len(non_fk_pk_columns) >= 2:
+        non_fk_pk_columns_ordered = [
+            col for col in primary_key_columns_ordered if col in non_fk_pk_columns
+        ]
+        if len(non_fk_pk_columns_ordered) >= 2:
             # Composite PK with multiple non-FK columns - need coordination
             cursor.execute(f"SELECT COUNT(*) FROM `{database}`.`{table}`")
             total_rows = cursor.fetchone()[0]
 
             # Get distinct counts for each non-FK PK column
             pk_info = []
-            for col in non_fk_pk_columns:
+            for col in non_fk_pk_columns_ordered:
                 cursor.execute(f"SELECT COUNT(DISTINCT `{col}`), MIN(`{col}`) FROM `{database}`.`{table}`")
                 distinct, min_val = cursor.fetchone()
                 min_val = min_val if min_val is not None else 1
@@ -1527,18 +1674,34 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                     min_val = 1
                 pk_info.append((col, distinct, min_val))
 
-            # Sort by distinct count ASCENDING (smallest first cycles, largest groups)
-            pk_info.sort(key=lambda x: x[1])
+            # Use the first PK column as the outer anchor, then map the row's
+            # anchor-local offset through a mixed-radix space for the remaining
+            # PK columns. This follows clustered-key order, which is much faster
+            # for InnoDB loads than randomizing the leading PK column, while still
+            # preserving each PK column's NDV across sparse composite-key spaces.
+            anchor_col, anchor_distinct, anchor_min = pk_info[0]
+            anchor_idx = f"div((rownum-1) * {anchor_distinct}, {total_rows})"
+            anchor_start = f"div(({anchor_idx}) * {total_rows}, {anchor_distinct})"
+            local_row = f"(rownum-1 - {anchor_start})"
+            max_rows_per_anchor = max(1, (total_rows + anchor_distinct - 1) // anchor_distinct)
+            composite_pk_expressions[anchor_col] = f"{anchor_idx} + {anchor_min}"
 
-            # First column (smallest distinct) uses mod() cycling
-            cycling_col, cycling_distinct, cycling_min = pk_info[0]
-            composite_pk_expressions[cycling_col] = f"mod(rownum-1, {cycling_distinct}) + {cycling_min}"
-
-            # Remaining columns use div() grouping, coordinated with cycling column
-            # Use ceiling division to avoid over-generating distinct values
-            for col, distinct, min_val in pk_info[1:]:
-                rows_per_value = max(1, (total_rows + distinct - 1) // distinct)  # ceiling division
-                composite_pk_expressions[col] = f"div(rownum-1, {rows_per_value}) + {min_val}"
+            stride = 1
+            for offset, (col, distinct, min_val) in enumerate(pk_info[1:], start=1):
+                base_digit = f"mod(div({local_row}, {stride}), {distinct})"
+                values_per_anchor = max(
+                    1,
+                    min(distinct, (max_rows_per_anchor + stride - 1) // stride),
+                )
+                # Shift each anchor group through the remaining domains. The
+                # shift is based on the number of values this dimension can
+                # exercise within one anchor group, which lets sparse grids cover
+                # the full domain without copying source key tuples.
+                multiplier = values_per_anchor
+                composite_pk_expressions[col] = (
+                    f"mod({base_digit} + ({anchor_idx} * {multiplier}), {distinct}) + {min_val}"
+                )
+                stride *= max(1, distinct)
 
         new_lines = []
 
@@ -1656,15 +1819,26 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
                 synthetic = text_appendage()
 
             elif col_type in DATETIME_TYPES:
-                # Get min/max from histogram metadata to generate dates within range
-                date_expr = get_date_range_expression(
-                    cursor, database, table, col, col_type
+                synthetic = exact_low_cardinality_to_case(
+                    cursor,
+                    database,
+                    table,
+                    col,
+                    col_type,
+                    ddl_line=line,
                 )
-                if date_expr:
-                    synthetic = date_expr
+                if synthetic:
+                    pass
+                # Get min/max from histogram metadata to generate dates within range
                 else:
-                    # Fallback if column is empty or all NULL
-                    synthetic = "rand.u31_timestamp()"
+                    date_expr = get_date_range_expression(
+                        cursor, database, table, col, col_type
+                    )
+                    if date_expr:
+                        synthetic = date_expr
+                    else:
+                        # Fallback if column is empty or all NULL
+                        synthetic = "rand.u31_timestamp()"
 
             elif col_type in YEAR:
                 synthetic = year_to_case(cursor, database, table, col)
@@ -1675,7 +1849,17 @@ def annotate_table_with_histogram(host, user, password, database, table, target_
             elif col_type in NUMERIC_TYPES:
                 # Use histogram-based generation for numeric columns
                 # Note: We only treat columns as FKs if declared in DDL - no guessing based on names
-                if col in histograms:
+                synthetic = exact_low_cardinality_to_case(
+                    cursor,
+                    database,
+                    table,
+                    col,
+                    col_type,
+                    ddl_line=line,
+                )
+                if synthetic:
+                    pass
+                elif col in histograms:
                     # Query actual distinct count AND row count
                     # - actual_distinct: avoids histogram extrapolation errors (HISTOGRAM_SAMPLING_EXPLAINED.md)
                     # - row_count: detects small tables needing deterministic generation (VALIDATION_ISSUES.md #5)

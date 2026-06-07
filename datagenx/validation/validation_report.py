@@ -243,6 +243,13 @@ def histogram_diff(source_hist, target_hist):
     )
 
 
+def histogram_is_sampled(hist):
+    try:
+        return float(hist.get("sampling-rate", 1.0)) < 1.0
+    except (TypeError, ValueError):
+        return False
+
+
 def frequency_shape_diff(source_counts, target_counts):
     source_total = sum(source_counts)
     target_total = sum(target_counts)
@@ -334,6 +341,24 @@ def get_histogram_summary(cursor, args, source_schema, target_schema, tables, ro
                     target_histogram_type,
                 ) = histogram_diff(source_hist[col], target_hist[col])
                 reason = "distribution compared"
+                source_distinct = lookup_metric(distinct_df, table, col, "source_distinct")
+                target_distinct = lookup_metric(distinct_df, table, col, "target_distinct")
+                max_distinct = max(value for value in (source_distinct, target_distinct, 0) if value is not None)
+                if (
+                    max_distinct <= args.sampled_histogram_fallback_max_distinct
+                    and (
+                        histogram_is_sampled(source_hist[col])
+                        or histogram_is_sampled(target_hist[col])
+                    )
+                ):
+                    source_counts = get_frequency_counts(cursor, source_schema, table, col)
+                    target_counts = get_frequency_counts(cursor, target_schema, table, col)
+                    diff = frequency_shape_diff(source_counts, target_counts)
+                    source_buckets = len(source_counts)
+                    target_buckets = len(target_counts)
+                    source_histogram_type = "frequency-shape"
+                    target_histogram_type = "frequency-shape"
+                    reason = "sampled histogram; exact frequency shape fallback"
             if col not in source_hist:
                 source_buckets = 0
                 target_buckets = len(target_hist[col].get("buckets", []))
@@ -1245,6 +1270,12 @@ def parse_args():
         type=int,
         default=10000,
         help="Maximum column NDV for exact frequency-shape fallback when backend histograms are missing.",
+    )
+    parser.add_argument(
+        "--sampled-histogram-fallback-max-distinct",
+        type=int,
+        default=1000,
+        help="Maximum column NDV for exact frequency-shape fallback when backend histograms are sampled.",
     )
     parser.add_argument(
         "--tidb-mem-quota-query",
