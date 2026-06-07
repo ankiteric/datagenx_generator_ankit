@@ -50,6 +50,7 @@ from datagenx.validation.PopulateNewTableAndValidate import (
     report_rowcount_mismatch,
     report_table_stats,
 )
+from datagenx.validation.validation_report import TPCH_FK_FALLBACKS, TPCDS_FK_FALLBACKS
 
 # ----------------------------------------------------------------
 # Configuration - imported from central config.py
@@ -171,6 +172,37 @@ def discover_tables_and_dependencies(cursor, database):
             dependencies[table] = set()
         if referenced_table and referenced_table != table:
             dependencies[table].add(referenced_table)
+
+    if not dependencies:
+        fallback_candidates = []
+        table_set = set(all_tables)
+        lower_tables = {t.lower() for t in table_set}
+        if {"lineitem", "orders", "partsupp"}.issubset(lower_tables):
+            fallback_candidates.extend(TPCH_FK_FALLBACKS)
+        if {"date_dim", "item", "customer", "store_sales"}.issubset(lower_tables):
+            fallback_candidates.extend(TPCDS_FK_FALLBACKS)
+
+        cursor.execute("""
+            SELECT TABLE_NAME, COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+        """, (database,))
+        columns = {}
+        for table_name, column_name in cursor.fetchall():
+            table_name = canonical.get(table_name.lower(), table_name)
+            columns.setdefault(table_name, set()).add(column_name)
+
+        for _name, child_table, parent_table, child_cols, parent_cols in fallback_candidates:
+            child_table = canonical.get(child_table.lower(), child_table)
+            parent_table = canonical.get(parent_table.lower(), parent_table)
+            if child_table not in columns or parent_table not in columns:
+                continue
+            if not all(col in columns[child_table] for col in child_cols):
+                continue
+            if not all(col in columns[parent_table] for col in parent_cols):
+                continue
+            if child_table != parent_table:
+                dependencies.setdefault(child_table, set()).add(parent_table)
 
     dependencies = {k: list(v) for k, v in dependencies.items()}
     return all_tables, dependencies
@@ -301,6 +333,51 @@ def build_fk_appendages(cursor, table, extractor=None):
     3. Single-column FKs: Uses rand.range() for uniform distribution.
     """
 
+    def schema_columns(schema):
+        cursor.execute("""
+            SELECT TABLE_NAME, COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+        """, (schema,))
+        columns = {}
+        for table_name, column_name in cursor.fetchall():
+            columns.setdefault(table_name, set()).add(column_name)
+        return columns
+
+    def fallback_fk_rows():
+        source_columns = schema_columns(SOURCE_SCHEMA)
+        target_columns = schema_columns(TARGET_SCHEMA)
+        tables = set(source_columns) | set(target_columns)
+        candidates = []
+        if {"lineitem", "orders", "partsupp"}.issubset(tables):
+            candidates.extend(TPCH_FK_FALLBACKS)
+        if {"date_dim", "item", "customer", "store_sales"}.issubset(tables):
+            candidates.extend(TPCDS_FK_FALLBACKS)
+
+        rows = []
+        seen = set()
+        for name, child_table, ref_table, child_cols, ref_cols in candidates:
+            if child_table != table:
+                continue
+            if child_table not in source_columns or ref_table not in source_columns:
+                continue
+            if child_table not in target_columns or ref_table not in target_columns:
+                continue
+            if not all(col in source_columns[child_table] for col in child_cols):
+                continue
+            if not all(col in source_columns[ref_table] for col in ref_cols):
+                continue
+            if not all(col in target_columns[child_table] for col in child_cols):
+                continue
+            if not all(col in target_columns[ref_table] for col in ref_cols):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+            for child_col, ref_col in zip(child_cols, ref_cols):
+                rows.append((name, child_col, ref_table, ref_col))
+        return rows
+
     # Build canonical name map for target schema (handles case mismatches)
     cursor.execute("""
         SELECT TABLE_NAME
@@ -319,6 +396,10 @@ def build_fk_appendages(cursor, table, extractor=None):
         ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION
     """, (SOURCE_SCHEMA, table))
     fk_rows = cursor.fetchall()
+    if not fk_rows:
+        fk_rows = fallback_fk_rows()
+        if fk_rows:
+            print(f"      Using {len(set(row[0] for row in fk_rows))} fallback FK relationship(s)")
     if not fk_rows:
         return {}
 

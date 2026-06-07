@@ -543,11 +543,28 @@ dashboard health cards
 table-level validation matrix
 top drift columns
 histogram-difference heatmap
-TPC-H referential-integrity graph and orphan checks
+referential-integrity graph and orphan checks
 exact source-vs-synthetic row overlap checks
 selected source-vs-target frequency distributions
 distinct-count differences
 ```
+
+Referential-integrity checks are schema driven. The report first discovers
+physical foreign keys from `information_schema.KEY_COLUMN_USAGE`. If a benchmark
+schema was loaded without physical FK constraints, it falls back to built-in
+TPC-H/TPC-DS relationship definitions and runs orphan checks against both source
+and target schemas.
+
+To attach physical TPC-DS FK metadata after loading a MySQL TPC-DS schema, run:
+
+```bash
+mysql -u root -p tpcds < scripts/tpcds_fk.sql
+mysql -u root -p tpcds_dbgenx < scripts/tpcds_fk.sql
+```
+
+The script disables `FOREIGN_KEY_CHECKS` while adding constraints because loaded
+TPC-DS data may contain `0` sentinel values for unknown/not-applicable dimension
+references.
 
 ## Important Behavior
 

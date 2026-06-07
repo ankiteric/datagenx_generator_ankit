@@ -256,6 +256,7 @@ def build_single_fk_expression(
         actual_distinct,
         source_row_count,
         valid_fk_predicate,
+        null_row_count,
     )
     if exact_low_cardinality:
         return exact_low_cardinality
@@ -342,6 +343,7 @@ def _build_exact_low_cardinality_fk_expression(
     actual_distinct,
     source_row_count,
     valid_fk_predicate,
+    null_row_count=0,
 ):
     """Build a deterministic FK expression from exact source frequencies.
 
@@ -378,7 +380,9 @@ def _build_exact_low_cardinality_fk_expression(
 
     sampled_values = target_values[:actual_distinct]
     case_lines = []
-    cumulative = 0
+    cumulative = int(null_row_count or 0)
+    if cumulative > 0:
+        case_lines.append(f"when rownum <= {cumulative} then NULL")
     for target_value, (_source_value, count) in zip(sampled_values, source_frequencies):
         if count <= 0:
             continue
